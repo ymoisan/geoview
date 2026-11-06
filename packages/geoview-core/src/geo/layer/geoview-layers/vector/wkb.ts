@@ -1,0 +1,423 @@
+﻿import type { Feature } from 'ol';
+import type { ReadOptions } from 'ol/format/Feature';
+import type { Options as SourceOptions } from 'ol/source/Vector';
+import type { Projection as OLProjection } from 'ol/proj';
+
+import { AbstractGeoViewVector } from '@/geo/layer/geoview-layers/vector/abstract-geoview-vector';
+import type { TypeGeoviewLayerConfig, TypeMetadataGeoJSON } from '@/api/types/layer-schema-types';
+import { CONST_LAYER_TYPES } from '@/api/types/layer-schema-types';
+import { WkbLayerEntryConfig } from '@/api/config/validation-classes/vector-validation-classes/wkb-layer-entry-config';
+import type { VectorLayerEntryConfig, VectorLayerEntryConfigProps } from '@/api/config/validation-classes/vector-layer-entry-config';
+import { Fetch } from '@/core/utils/fetch-helper';
+import { logger } from '@/core/utils/logger';
+import {
+  LayerEntryConfigInvalidLayerEntryConfigError,
+  LayerEntryConfigLayerIdNotFoundError,
+} from '@/core/exceptions/layer-entry-config-exceptions';
+import { GVWKB } from '@/geo/layer/gv-layers/vector/gv-wkb';
+import type { ConfigBaseClass, TypeLayerEntryShell } from '@/api/config/validation-classes/config-base-class';
+import { LayerServiceMetadataUnableToFetchError } from '@/core/exceptions/layer-exceptions';
+import { formatError } from '@/core/exceptions/core-exceptions';
+import { EMPTY_FETCH_RESULT, GeoUtilities, type FetchWithProxyResult, type SourceFeaturesInfo } from '@/geo/utils/utilities';
+import type { DisplayDateMode } from '@/api/types/map-schema-types';
+
+export interface TypeWkbLayerConfig extends Omit<TypeGeoviewLayerConfig, 'listOfLayerEntryConfig'> {
+  geoviewLayerType: typeof CONST_LAYER_TYPES.WKB;
+  listOfLayerEntryConfig: WkbLayerEntryConfig[];
+}
+
+/**
+ * Class used to add WKB layer to the map.
+ */
+export class WKB extends AbstractGeoViewVector {
+  /**
+   * Constructs a WKB Layer configuration processor.
+   *
+   * @param layerConfig - The layer configuration
+   */
+  // The constructor is not useless, it narrows down the accepted parameter type.
+  // eslint-disable-next-line @typescript-eslint/no-useless-constructor
+  constructor(layerConfig: TypeWkbLayerConfig) {
+    super(layerConfig);
+  }
+
+  // #region OVERRIDES
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer configuration specific to this layer
+   */
+  override getGeoviewLayerConfig(): TypeWkbLayerConfig {
+    return super.getGeoviewLayerConfig() as TypeWkbLayerConfig;
+  }
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed metadata specific to this layer
+   */
+  override getMetadata(): TypeMetadataGeoJSON | undefined {
+    return super.getMetadata() as TypeMetadataGeoJSON | undefined;
+  }
+
+  /**
+   * Overrides the way the metadata is fetched.
+   *
+   * @param abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process
+   * @returns A promise that resolves with the fetched metadata and proxy information
+   * @throws {LayerServiceMetadataUnableToFetchError} When the metadata fetch fails or contains an error
+   */
+  protected override async onFetchServiceMetadata(abortSignal?: AbortSignal): Promise<FetchWithProxyResult<unknown>> {
+    // If metadataAccessPath ends with .meta or .json
+    if (
+      this.getMetadataAccessPathIfExists()?.toLowerCase().endsWith('.meta') ||
+      this.getMetadataAccessPathIfExists()?.toLowerCase().endsWith('.json')
+    ) {
+      try {
+        // Fetch it and return
+        return { data: await WKB.fetchMetadata(this.getMetadataAccessPath(), abortSignal) };
+      } catch (error: unknown) {
+        // Throw
+        throw new LayerServiceMetadataUnableToFetchError(
+          this.getGeoviewLayerId(),
+          this.getLayerEntryNameOrGeoviewLayerName(),
+          formatError(error)
+        );
+      }
+    }
+
+    // The metadataAccessPath didn't seem like it was containing actual metadata, so it was skipped
+    logger.logWarning(
+      `The metadataAccessPath '${this.getMetadataAccessPathIfExists()}' didn't seem like it was containing actual metadata, so it was skipped`
+    );
+
+    // None
+    return EMPTY_FETCH_RESULT;
+  }
+
+  /**
+   * Overrides the way a geoview layer config initializes its layer entries.
+   *
+   * @returns A promise that resolves once the layer entries have been initialized
+   */
+  protected override async onInitLayerEntries(): Promise<TypeGeoviewLayerConfig> {
+    // Get the folder url
+    const idx = this.getMetadataAccessPath().lastIndexOf('/');
+    const rootUrl = this.getMetadataAccessPath().substring(0, idx);
+    const id = this.getMetadataAccessPath().substring(idx + 1);
+
+    // Calls fetchServiceMetadata which delegates to this class's overridden onFetchServiceMetadata (may use a proxy fallback and store the proxyUrl on the instance)
+    await this.fetchServiceMetadata();
+
+    // Redirect
+    return Promise.resolve(
+      WKB.createGeoviewLayerConfig(
+        this.getGeoviewLayerId(),
+        this.getGeoviewLayerName(),
+        rootUrl,
+        this.getGeoviewLayerConfig().isTimeAware,
+        [{ id }]
+      )
+    );
+  }
+
+  /**
+   * Overrides the validation of a layer entry config.
+   *
+   * @param layerConfig - The layer entry config to validate
+   */
+  protected override onValidateLayerEntryConfig(layerConfig: ConfigBaseClass): void {
+    if (Array.isArray(this.getMetadata()?.listOfLayerEntryConfig)) {
+      const foundEntry = WKB.#recursiveSearch(layerConfig.layerId, this.getMetadata()?.listOfLayerEntryConfig || []);
+      if (!foundEntry) {
+        // Add a layer load error
+        this.addLayerLoadError(new LayerEntryConfigLayerIdNotFoundError(layerConfig), layerConfig);
+      }
+      return;
+    }
+
+    // Throw an invalid layer entry config error
+    throw new LayerEntryConfigInvalidLayerEntryConfigError(layerConfig);
+  }
+
+  /**
+   * Overrides the way the layer metadata is processed.
+   *
+   * @param layerConfig - The layer entry configuration to process
+   * @param displayDateMode - The display date mode to use for processing time dimensions in the metadata
+   * @param mapProjection - Optional map projection
+   * @param abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process
+   * @returns A promise that resolves once the layer entry configuration has gotten its metadata processed
+   */
+  protected override onProcessLayerMetadata(
+    layerConfig: VectorLayerEntryConfig,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    displayDateMode: DisplayDateMode,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    mapProjection?: OLProjection,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    abortSignal?: AbortSignal
+  ): Promise<VectorLayerEntryConfig> {
+    // Get the metadata
+    const metadata = this.getMetadata();
+
+    // Initialize the layer metadata from the service metadata
+    WKB.initLayerMetadata(layerConfig, metadata);
+
+    // Return the layer config
+    return Promise.resolve(layerConfig);
+  }
+
+  /**
+   * Overrides the loading of the vector features for the layer by reading WKB data and converting it
+   * into OpenLayers {@link Feature} feature instances.
+   *
+   * @param layerConfig - The configuration object for the vector layer, containing source and data access information
+   * @param sourceOptions - The OpenLayers vector source options associated with the layer
+   * @param readOptions - Options controlling how features are read, including the target `featureProjection`
+   * @returns A promise that resolves to an array of OpenLayers features
+   */
+  protected override async onCreateVectorSourceLoadFeatures(
+    layerConfig: VectorLayerEntryConfig,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    sourceOptions: SourceOptions<Feature>,
+    readOptions: ReadOptions
+  ): Promise<SourceFeaturesInfo> {
+    // Cast it to proper type
+    const layerConfigWKB = layerConfig as WkbLayerEntryConfig;
+
+    // Read the data projection
+    // eslint-disable-next-line no-param-reassign
+    readOptions.dataProjection ??= layerConfig.getSource().dataProjection;
+
+    // If we have a feature package
+    let sourceFeaturesInfo: SourceFeaturesInfo = { features: [], dataProjection: '' };
+    if (layerConfigWKB.getSource().geoPackageFeatures?.length) {
+      const { geoPackageFeatures } = layerConfigWKB.getSource();
+      const subResults = await Promise.all(
+        geoPackageFeatures!.map(({ geom, properties }) => {
+          return GeoUtilities.readFeaturesFromWKB(geom, readOptions.dataProjection, readOptions.featureProjection).then((subResult) => {
+            const subResultFeature = subResult.features[0];
+            if (properties) subResultFeature.setProperties(properties);
+            return { feature: subResultFeature, dataProjection: subResult.dataProjection };
+          });
+        })
+      );
+      sourceFeaturesInfo.features = subResults.map((r) => r.feature);
+      sourceFeaturesInfo.dataProjection = subResults[subResults.length - 1].dataProjection;
+    } else {
+      // Fallback to using default read method; surface a specific message if the source can't be loaded (e.g. unreachable/404)
+      const dataAccessPath = layerConfigWKB.getDataAccessPath();
+      sourceFeaturesInfo = await AbstractGeoViewVector.fetchSourceForLayer(layerConfigWKB, () =>
+        GeoUtilities.readFeaturesFromWKB(dataAccessPath, readOptions.dataProjection, readOptions.featureProjection)
+      );
+    }
+
+    // Return them
+    return Promise.resolve(sourceFeaturesInfo);
+  }
+
+  /**
+   * Overrides the creation of the GV Layer.
+   *
+   * @param layerConfig - The layer entry configuration
+   * @returns The GV Layer
+   */
+  protected override onCreateGVLayer(layerConfig: WkbLayerEntryConfig): GVWKB {
+    // Create the source
+    const source = this.createVectorSource(layerConfig);
+    // Create the GV Layer
+    const gvLayer = new GVWKB(source, layerConfig);
+    // Return it
+    return gvLayer;
+  }
+
+  // #endregion OVERRIDES
+
+  // #region STATIC PUBLIC METHODS
+
+  /**
+   * Creates a configuration object for a WKB Feature layer.
+   *
+   * This function constructs a `TypeWkbLayerConfig` object that describes an WKB Feature layer
+   * and its associated entry configurations based on the provided parameters.
+   *
+   * @param geoviewLayerId - A unique identifier for the GeoView layer
+   * @param geoviewLayerName - The display name of the GeoView layer
+   * @param metadataAccessPath - The full service URL to the layer endpoint
+   * @param isTimeAware - Indicates whether the layer supports time-based filtering
+   * @param layerEntries - An array of layer entries objects to be included in the configuration
+   * @returns The constructed configuration object for the WKB Feature layer
+   */
+  static createGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string | undefined,
+    metadataAccessPath: string,
+    isTimeAware: boolean | undefined,
+    layerEntries: TypeLayerEntryShell[]
+  ): TypeWkbLayerConfig {
+    const geoviewLayerConfig: TypeWkbLayerConfig = {
+      geoviewLayerId,
+      geoviewLayerName,
+      metadataAccessPath,
+      geoviewLayerType: CONST_LAYER_TYPES.WKB,
+      isTimeAware,
+      listOfLayerEntryConfig: [],
+    };
+    geoviewLayerConfig.listOfLayerEntryConfig = layerEntries.map((layerEntry) => {
+      // TODO: REFACTOR IMPORTANT - This spreading should be rewritten like explained in GeoJSON file. Search id : 59026aa9
+
+      const layerEntryConfig = new WkbLayerEntryConfig({
+        geoviewLayerConfig,
+        layerId: `${layerEntry.id}`,
+        ...(layerEntry.layerName && { layerName: `${layerEntry.layerName}` }),
+        source: {
+          dataAccessPath: layerEntry.source?.dataAccessPath,
+        },
+      });
+      return layerEntryConfig;
+    });
+
+    // Return it
+    return geoviewLayerConfig;
+  }
+
+  /**
+   * Initializes a GeoView layer configuration for a WKB layer.
+   *
+   * This method creates a basic TypeGeoviewLayerConfig using the provided
+   * ID, name, and metadata access path URL. It then initializes the layer entries by calling
+   * `initGeoViewLayerEntries`, which may involve fetching metadata or sublayer info.
+   *
+   * @param geoviewLayerId - A unique identifier for the layer
+   * @param geoviewLayerName - The display name of the layer
+   * @param metadataAccessPath - The full service URL to the layer endpoint
+   * @param isTimeAware - Indicates whether the layer supports time-based filtering
+   * @returns A promise that resolves to an initialized GeoView layer configuration with layer entries
+   */
+  static initGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string,
+    metadataAccessPath: string,
+    isTimeAware?: boolean
+  ): Promise<TypeGeoviewLayerConfig> {
+    // Create the Layer config
+    const myLayer = new WKB({ geoviewLayerId, geoviewLayerName, metadataAccessPath, isTimeAware } as TypeWkbLayerConfig);
+    return myLayer.initGeoViewLayerEntries();
+  }
+
+  /**
+   * Initializes the layer metadata from the provided service metadata.
+   *
+   * This method searches for the corresponding metadata entry in the provided metadata object based on the layer ID.
+   * If a matching metadata entry is found, it sets the layer metadata on the configuration and initializes the source,
+   * initial settings, layer style, and scale range using the metadata.
+   *
+   * @param layerConfig - The WKB layer entry configuration to initialize with metadata
+   * @param metadata - The metadata object containing information about the layers, which may include a list of layer entry configurations
+   */
+  static initLayerMetadata(layerConfig: VectorLayerEntryConfig, metadata: TypeMetadataGeoJSON | undefined): void {
+    // If metadata was previously found
+    if (metadata) {
+      // Search for the layer metadata
+      const layerMetadataFound = WKB.#recursiveSearch(layerConfig.layerId, metadata.listOfLayerEntryConfig) as VectorLayerEntryConfigProps;
+
+      // If the layer metadata was found
+      if (layerMetadataFound) {
+        // Initialize the layer name by filling the blanks with the name from the metadata
+        layerConfig.initLayerNameFromMetadata(layerMetadataFound.layerName);
+
+        // Initialize the source by filling the blanks with the information from the metadata
+        layerConfig.initSourceFromMetadata(layerMetadataFound.source);
+
+        // Initialize the initial settings by filling the blanks with the information from the metadata
+        layerConfig.initInitialSettingsFromMetadata(layerMetadataFound.initialSettings);
+
+        // Initialize the layer style by filling the blanks with the information from the metadata
+        layerConfig.initLayerStyleFromMetadata(layerMetadataFound.layerStyle);
+
+        // Initialize the layer text by filling the blanks with the information from the metadata
+        layerConfig.initLayerTextFromMetadata(layerMetadataFound.layerText);
+
+        // Init min and max scales
+        layerConfig.initMinScaleFromMetadata(layerMetadataFound.minScale);
+        layerConfig.initMaxScaleFromMetadata(layerMetadataFound.maxScale);
+      }
+    }
+
+    // Setting the layer metadata now with the updated config values. Setting the layer metadata with the config, directly, like it's done in CSV
+    layerConfig.setLayerMetadata(layerConfig);
+  }
+
+  /**
+   * Processes a WKB GeoviewLayerConfig and returns a promise
+   * that resolves to an array of `ConfigBaseClass` layer entry configurations.
+   *
+   * This method:
+   * 1. Creates a Geoview layer configuration using the provided parameters.
+   * 2. Instantiates a layer with that configuration.
+   * 3. Processes the layer configuration and returns the result.
+   *
+   * @param geoviewLayerId - The unique identifier for the GeoView layer
+   * @param geoviewLayerName - The display name for the GeoView layer
+   * @param url - The URL of the service endpoint
+   * @param layerEntries - An array of layer entry shells to include in the configuration
+   * @param isTimeAware - Indicates if the layer is time aware
+   * @returns A promise that resolves to an array of layer configurations
+   */
+  static processGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string,
+    url: string,
+    layerEntries: TypeLayerEntryShell[],
+    isTimeAware: boolean
+  ): Promise<ConfigBaseClass[]> {
+    // Create the Layer config
+    const layerConfig = WKB.createGeoviewLayerConfig(geoviewLayerId, geoviewLayerName, url, isTimeAware, layerEntries);
+
+    // Create the class from geoview-layers package
+    const myLayer = new WKB(layerConfig);
+
+    // Process it
+    return AbstractGeoViewVector.processConfig(myLayer);
+  }
+
+  /**
+   * Fetches the metadata for a typical GeoJson class.
+   *
+   * @param url - The url to query the metadata from
+   * @throws {RequestTimeoutError} When the request exceeds the timeout duration
+   * @throws {RequestAbortedError} When the request was aborted by the caller's signal
+   * @throws {ResponseError} When the response is not OK (non-2xx)
+   * @throws {ResponseEmptyError} When the JSON response is empty
+   */
+  static fetchMetadata(url: string, abortSignal?: AbortSignal): Promise<TypeMetadataGeoJSON> {
+    // Return it
+    return Fetch.fetchJson<TypeMetadataGeoJSON>(url, { signal: abortSignal });
+  }
+
+  // #endregion STATIC PUBLIC METHODS
+
+  // #region STATIC PRIVATE METHODS
+
+  /**
+   * This method is used to do a recursive search in the array of layer entry config.
+   *
+   * @param searchKey - The layer list to search
+   * @param metadataLayerList - The layer list to search
+   * @returns The found layer or undefined if not found
+   */
+  static #recursiveSearch(searchKey: string, metadataLayerList: TypeLayerEntryShell[]): TypeLayerEntryShell | undefined {
+    for (const layerMetadata of metadataLayerList) {
+      if (searchKey === layerMetadata.layerId) return layerMetadata;
+      if ('isLayerGroup' in layerMetadata && (layerMetadata.isLayerGroup as boolean) && layerMetadata.listOfLayerEntryConfig) {
+        const foundLayer = this.#recursiveSearch(searchKey, layerMetadata.listOfLayerEntryConfig);
+        if (foundLayer) return foundLayer;
+      }
+    }
+    return undefined;
+  }
+
+  // #endregion STATIC PRIVATE METHODS
+}

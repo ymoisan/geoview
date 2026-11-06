@@ -1,0 +1,118 @@
+import type { Theme } from '@mui/material/styles';
+import type { SxStyles } from '@/ui/style/types';
+
+/**
+ * Gets custom sx classes for the app-bar.
+ *
+ * @param theme - The MUI theme object
+ * @returns The sx classes for app-bar styling
+ */
+export const getSxClasses = (theme: Theme): SxStyles => ({
+  appBar: {
+    display: 'flex',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    zIndex: theme.zIndex.appBar,
+    pointerEvents: 'all',
+    backgroundColor: theme.palette.geoViewColor?.bgColor.main,
+
+    '&.interaction-static': {
+      position: 'absolute',
+      left: 0,
+      top: 0,
+      height: '100%',
+      backgroundColor: 'unset',
+      border: 'unset',
+      paddingBottom: theme.spacing(0),
+      '&>nav': {
+        border: 'unset !important',
+        '&>div>ul>li': {
+          backgroundColor: theme.palette.geoViewColor?.grey.lighten(0.8, 0.8),
+          padding: theme.spacing(0),
+          borderRadius: '50%',
+        },
+        '&>div>ul>li::before': {
+          display: 'none',
+        },
+      },
+    },
+  },
+  appBarList: {
+    height: '100%',
+    display: 'flex',
+    flexDirection: 'column',
+    minHeight: 0,
+    overflowY: 'auto',
+    overflowX: 'hidden',
+    scrollbarWidth: 'none',
+    msOverflowStyle: 'none',
+    '&::-webkit-scrollbar': {
+      display: 'none',
+    },
+    '& li': {
+      backgroundColor: 'transparent',
+      justifyContent: 'center',
+    },
+  },
+  appBarButtons: {
+    height: '100%',
+    display: 'flex',
+    flexDirection: 'column',
+    minHeight: 0,
+    position: 'relative',
+    borderRight: `1px solid ${theme.palette.geoViewColor?.primary.light[100] ?? theme.palette.divider}`,
+    width: 48,
+    '& button': {
+      height: '48px',
+      width: '48px',
+      alignContent: 'center',
+      padding: theme.spacing(0),
+      borderRadius: 0,
+      backgroundColor: 'transparent',
+      color: theme.palette.geoViewColor?.primary.main,
+      transition: 'background-color 0.3s ease-in-out',
+      '& span': {
+        margin: theme.spacing(0),
+      },
+      '& .MuiSvgIcon-root': {
+        height: 25,
+        width: 25,
+      },
+      '& .MuiTouchRipple-root': {
+        maxWidth: '48px',
+      },
+      '&[aria-disabled="true"]': {
+        color: theme.palette.geoViewColor?.bgColor.dark[450],
+        cursor: 'not-allowed',
+      },
+      // Override global focus indicator for AppBar buttons
+      '&.Mui-focusVisible': {
+        outlineColor: 'transparent',
+        boxShadow: 'none',
+      },
+    },
+  },
+  appBarSeparator: {
+    position: 'relative',
+    marginTop: theme.spacing(1),
+    paddingTop: theme.spacing(1),
+    '&::before': {
+      content: '""',
+      position: 'absolute',
+      top: 0,
+      left: '4px',
+      right: '4px',
+      borderTop: `1px solid ${theme.palette.geoViewColor?.grey.light[100] ?? theme.palette.divider}`,
+    },
+  },
+  appBarBottomSection: {
+    marginTop: 'auto',
+  },
+  scrollButtonUp: {
+    borderBottom: `1px solid ${theme.palette.divider}`,
+  },
+  scrollButtonDown: {
+    borderTop: `1px solid ${theme.palette.divider}`,
+  },
+  appBarPanels: {},
+});

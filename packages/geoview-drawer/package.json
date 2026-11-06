@@ -1,0 +1,37 @@
+{
+  "name": "geoview-drawer",
+  "version": "1.0.0",
+  "description": "A tool for drawing shapes in a Geoview map",
+  "main": "src/index.tsx",
+  "keywords": [
+    "react",
+    "drawer"
+  ],
+  "author": "Matthew Muehlhauser",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc --build",
+    "build-dev": "tsc --build"
+  },
+  "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@mui/material": "^9.1.2",
+    "mui-color-input": "^9.0.0",
+    "ol": "10.9.0"
+  },
+  "peerDependencies": {
+    "geoview-core": "workspace:^2.0.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "zustand": "~5.0.12"
+  },
+  "devDependencies": {
+    "geoview-core": "workspace:^2.0.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "typescript": "^6.0.3"
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/rush/v5/command-line.schema.json",
+  "commands": [
+    {
+      "commandKind": "global",
+      "name": "serve",
+      "summary": "Serves the page locally with hot-reload.",
+      "shellCommand": "npm run --prefix packages/geoview-core serve"
+    },
+    {
+      "commandKind": "global",
+      "name": "host",
+      "summary": "Deploys the geoview project to github pages.",
+      "shellCommand": "npm run --prefix packages/geoview-core deploy"
+    },
+    {
+      "commandKind": "global",
+      "name": "build:core",
+      "summary": "Build the packages and move them to the dist directory",
+      "shellCommand": "npm run --prefix packages/geoview-core build"
+    },
+    {
+      "commandKind": "bulk",
+      "name": "build",
+      "summary": "Build the packages and move them to the dist directory",
+      "enableParallelism": true,
+      "ignoreMissingScript": true,
+      "allowWarningsInSuccessfulBuild": true
+    },
+    {
+      "commandKind": "bulk",
+      "name": "build-dev",
+      "summary": "Fast development build: skips formatting, linting, typedoc, minification, bundle analysis, and compression",
+      "enableParallelism": true,
+      "ignoreMissingScript": true,
+      "allowWarningsInSuccessfulBuild": true
+    }
+  ]
+}

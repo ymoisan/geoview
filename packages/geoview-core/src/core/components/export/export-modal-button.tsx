@@ -1,0 +1,51 @@
+import { useTranslation } from 'react-i18next';
+
+import type { SxProps, Theme } from '@mui/material/styles';
+
+import { IconButton } from '@/ui/icon-button/icon-button';
+import { DownloadIcon } from '@/ui/icons';
+import { useUIController } from '@/core/controllers/use-controllers';
+import { useStoreLayerAreLayersLoading } from '@/core/stores/states/layer-state';
+import { logger } from '@/core/utils/logger';
+
+/** Props for the ExportButton component. */
+interface ExportProps {
+  /** The button element id. */
+  id: string;
+  /** Optional CSS class name. */
+  className?: string;
+  /** Optional additional sx styles. */
+  sxDetails?: SxProps<Theme>;
+}
+
+/**
+ * Creates the export PNG button component.
+ *
+ * @param props - Properties defined in ExportProps interface
+ * @returns The export button
+ */
+export default function ExportButton({ id, className = '', sxDetails }: ExportProps): JSX.Element {
+  logger.logTraceRender('components/export/export-modal-button');
+
+  // Hooks
+  const { t } = useTranslation<string>();
+
+  // get store function
+  const uiController = useUIController();
+  const layersAreLoading = useStoreLayerAreLayersLoading();
+
+  return (
+    <IconButton
+      id={id}
+      aria-label={t('appbar.export')}
+      aria-haspopup="dialog"
+      tooltipPlacement="right"
+      onClick={() => uiController.enableFocusTrap({ activeElementId: 'export', callbackElementId: id })}
+      sx={sxDetails}
+      className={className}
+      disabled={layersAreLoading}
+    >
+      <DownloadIcon />
+    </IconButton>
+  );
+}

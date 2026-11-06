@@ -1,0 +1,217 @@
+import WebGLTile from 'ol/layer/WebGLTile';
+import type GeoTIFFSource from 'ol/source/GeoTIFF';
+import type { Extent } from 'ol/extent';
+import type { Projection as OLProjection } from 'ol/proj';
+
+import { CONST_LAYER_TYPES, type TypeLegend } from '@/api/types/layer-schema-types';
+import type { GeoTIFFLayerEntryConfig } from '@/api/config/validation-classes/raster-validation-classes/geotiff-layer-entry-config';
+import { logger } from '@/core/utils/logger';
+import { Fetch } from '@/core/utils/fetch-helper';
+import type { GeoViewError } from '@/core/exceptions/geoview-exceptions';
+import { LayerSourceFailedToLoadError } from '@/core/exceptions/layer-exceptions';
+import { formatError } from '@/core/exceptions/core-exceptions';
+import type { RGBA } from '@/core/utils/utilities';
+import { AbstractGVTile } from '@/geo/layer/gv-layers/tile/abstract-gv-tile';
+import { GeoUtilities } from '@/geo/utils/utilities';
+import { Projection } from '@/geo/utils/projection';
+import { GeoviewRenderer } from '@/geo/utils/renderer/geoview-renderer';
+
+/**
+ * Manages a GeoTIFF layer.
+ */
+export class GVGeoTIFF extends AbstractGVTile {
+  /**
+   * Constructs a GVGeoTIFF layer to manage an OpenLayer layer.
+   *
+   * @param olSource - The OpenLayer source
+   * @param layerConfig - The layer configuration
+   */
+  constructor(olSource: GeoTIFFSource, layerConfig: GeoTIFFLayerEntryConfig) {
+    // Call parent constructor with source
+    super(olSource, layerConfig);
+
+    // Create WebGLTile layer
+    const olLayer = new WebGLTile({
+      source: olSource,
+      properties: { layerConfig },
+      className: `ol-layer-${layerConfig.layerId}`,
+    });
+
+    // Set the OpenLayer layer
+    this.setOLLayer(olLayer);
+
+    // If the layer config has an embedded color map, apply the palette style
+    if (layerConfig.hasEmbeddedColorMap()) {
+      this.#applyColorMapStyle(layerConfig.getEmbeddedColorMap()!);
+    }
+  }
+
+  // #region OVERRIDES
+
+  /**
+   * Overrides the parent method to return a more specific OpenLayers layer type (covariant return).
+   *
+   * @returns The strongly-typed OpenLayers type.
+   */
+  override getOLLayer(): WebGLTile {
+    // Call parent and cast
+    return super.getOLLayer() as WebGLTile;
+  }
+
+  /**
+   * Overrides the parent class's method to return a more specific OpenLayers source type (covariant return).
+   *
+   * @returns The GeoTIFF source instance associated with this layer.
+   */
+  protected override getOLSource(): GeoTIFFSource {
+    // Get source from OL
+    return super.getOLSource() as GeoTIFFSource;
+  }
+
+  /**
+   * Overrides the generic tile-error decipher to surface a specific source-load message.
+   *
+   * A GeoTIFF (COG) failing means the whole source could not be read - not one tile of a tiled service -
+   * so this reports the access path that couldn't be loaded instead of a generic "a tile" error.
+   *
+   * @param event - The event which is being triggered
+   * @returns A LayerSourceFailedToLoadError naming the GeoTIFF access path
+   */
+  protected override onErrorDecipherError(event: Event): GeoViewError {
+    // Read the source error, if any, to keep as the dev-facing cause
+    // eslint-disable-next-line no-underscore-dangle, @typescript-eslint/no-explicit-any
+    const sourceError = (this.getOLSource() as any).error_;
+    const cause = sourceError ? formatError(sourceError) : undefined;
+
+    // Surface a specific source-load error; the underlying error is kept as the cause for developers
+    return new LayerSourceFailedToLoadError(this.getLayerName(), cause);
+  }
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer configuration specific to this layer.
+   */
+  override getLayerConfig(): GeoTIFFLayerEntryConfig {
+    // Call parent and cast
+    return super.getLayerConfig() as GeoTIFFLayerEntryConfig;
+  }
+
+  /**
+   * Overrides the way to initialize the bounds for this layer type.
+   *
+   * @param projection - The projection to initialize the bounds into
+   * @param stops - The number of stops to use to generate the extent
+   * @returns A promise that resolves with the layer bounding box or undefined when not found
+   */
+  override async onInitBounds(projection: OLProjection, stops: number): Promise<Extent | undefined> {
+    // Wait for the source to be ready, just in case the caller is early
+    await this.waitForSourceReady();
+
+    // Get the OpenLayers source (not the configured source property)
+    const source = this.getOLSource();
+
+    // Get the source projection
+    const sourceProjection = source.getProjection() ?? undefined;
+
+    // Get the layer bounds
+    let sourceExtent = source.getTileGrid()?.getExtent();
+
+    // If both found
+    if (sourceExtent && sourceProjection) {
+      // Transform extent to given projection
+      sourceExtent = Projection.transformExtentFromProj(sourceExtent, sourceProjection, projection, stops);
+      sourceExtent = GeoUtilities.validateExtent(sourceExtent, projection.getCode());
+    }
+
+    // Return the calculated layer bounds
+    return sourceExtent;
+  }
+
+  /**
+   * Applies an embedded color palette as a WebGLTile style.
+   *
+   * Makes the nodata index (0) transparent so that pixels outside
+   * the data extent do not render as a solid color.
+   *
+   * @param palette - Array of RGBA color tuples from the GeoTIFF color map.
+   */
+  #applyColorMapStyle(palette: RGBA[]): void {
+    // Make nodata index (0) fully transparent
+    const adjustedPalette = [...palette];
+    adjustedPalette[0] = [0, 0, 0, 0];
+
+    // Convert RGBA tuples to CSS color strings as expected by the OpenLayers palette expression
+    const colorStrings = adjustedPalette.map(([r, g, b, a]) => `rgba(${r},${g},${b},${a / 255})`);
+
+    // Apply the palette style to the WebGLTile layer
+    this.getOLLayer().setStyle({
+      color: ['palette', ['band', 1], colorStrings],
+    });
+  }
+
+  /**
+   * Gets the legend image of a layer.
+   *
+   * @param layerConfig - The layer configuration
+   * @returns A promise that resolves with the image data or null
+   */
+  static #getLegendImage(layerConfig: GeoTIFFLayerEntryConfig): Promise<string | null> {
+    const promisedImage = new Promise<string | null>((resolve) => {
+      const metadata = layerConfig.getServiceMetadata();
+      // If there is a thumbnail asset in the metadata, use it as legend
+      if (metadata?.assets?.thumbnail?.href) {
+        const legendUrl = metadata.assets.thumbnail.href;
+
+        // Fetch the blob
+        Fetch.fetchBlob(legendUrl, { credentials: 'omit' })
+          .then((blob) => GeoviewRenderer.readBlobAsDataUrl(blob))
+          .then((dataUrl) => resolve(dataUrl))
+          .catch(() => resolve(null));
+      } else resolve(null);
+    });
+    return promisedImage;
+  }
+
+  /**
+   * Overrides the fetching of the legend for a geotiff layer.
+   *
+   * @returns A promise that resolves with the legend of the layer or null
+   */
+  override async onFetchLegend(): Promise<TypeLegend | null> {
+    // Get the config
+    const layerConfig = this.getLayerConfig();
+
+    try {
+      // Get legend image
+      const legendImage = await GVGeoTIFF.#getLegendImage(layerConfig);
+
+      // If legend image was read
+      if (legendImage) {
+        // Create image element directly to avoid recursion
+        // GV: use direct Image constructor to avoid errors using GeoviewRenderer.loadImage
+        const loadedImage = await GeoviewRenderer.loadImageFromDataUrl(legendImage);
+
+        // If image was loaded successfully
+        if (loadedImage.width > 0 && loadedImage.height > 0) {
+          // Return legend information
+          return {
+            type: CONST_LAYER_TYPES.GEOTIFF,
+            legend: GeoviewRenderer.createCanvasFromImage(loadedImage),
+          };
+        }
+      }
+
+      // No good
+      return {
+        type: CONST_LAYER_TYPES.GEOTIFF,
+        legend: null,
+      };
+    } catch (error: unknown) {
+      logger.logError(`Error getting legend for ${layerConfig.layerPath}`, error);
+      return null;
+    }
+  }
+
+  // #endregion OVERRIDES
+}

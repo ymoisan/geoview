@@ -1,0 +1,47 @@
+/*
+Hold viewer specific css not inside theme
+*/
+
+.geoview-map {
+  box-sizing: border-box;
+  position: relative !important;
+}
+
+/* specifiv style for icon alignement in guide component */
+.guideBox h3 img {
+  vertical-align: bottom;
+}
+.guideBox h4 img {
+  vertical-align: bottom;
+}
+.guideBox p img {
+  vertical-align: bottom;
+}
+
+/* smooth data table scrolling */
+.MuiTableContainer-root {
+  contain: paint;
+  will-change: transform;
+}
+
+/*
+ * Accessibility: Visually hidden content for screen readers
+ * 
+ * This CSS class is required for HTML string contexts where sanitizeHtmlContent()
+ * processes user-generated content.
+ * 
+ * Usage:
+ * - CSS class: For HTML string manipulation (e.g., linkified content from external sources)
+ * - JS object: For React components using sx prop (e.g., <Box sx={visuallyHidden}>)
+ */
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip-path: inset(50%) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}

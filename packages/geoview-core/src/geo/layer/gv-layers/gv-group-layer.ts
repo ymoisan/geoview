@@ -1,0 +1,380 @@
+import LayerGroup from 'ol/layer/Group';
+import type { Options as LayerGroupOptions } from 'ol/layer/Group';
+import type { Projection as OLProjection } from 'ol/proj';
+import type { Extent } from 'ol/extent';
+
+import EventHelper, { type EventDelegateBase } from '@/api/events/event-helper';
+import type { GroupLayerEntryConfig } from '@/api/config/validation-classes/group-layer-entry-config';
+import { LayerNotFoundError } from '@/core/exceptions/layer-exceptions';
+import { AbstractBaseGVLayer, type LayerBaseEvent } from '@/geo/layer/gv-layers/abstract-base-layer';
+import { AbstractGVLayer } from '@/geo/layer/gv-layers/abstract-gv-layer';
+import { GeoUtilities } from '@/geo/utils/utilities';
+
+/**
+ * Manages a Group Layer.
+ */
+export class GVGroupLayer extends AbstractBaseGVLayer {
+  /** The layers in the group */
+  #layers: AbstractBaseGVLayer[] = [];
+
+  /** Callback delegates for the layer added event */
+  #onLayerAddedHandlers: LayerGroupChildrenUpdatedDelegate[] = [];
+
+  /** Callback delegates for the layer removed event */
+  #onLayerRemovedHandlers: LayerGroupChildrenUpdatedDelegate[] = [];
+
+  /**
+   * Constructs a Group layer to manage an OpenLayer Group Layer.
+   *
+   * @param layerGroupOptions - The OpenLayer group layer
+   * @param layerConfig - The layer configuration
+   */
+  constructor(layerGroupOptions: LayerGroupOptions, layerConfig: GroupLayerEntryConfig) {
+    super(layerConfig);
+
+    // Create the OpenLayer layer
+    this.setOLLayer(new LayerGroup(layerGroupOptions));
+
+    // Register an event for when the group layer turns loaded for the first time only
+    layerConfig.onLayerStatusChanged((config) => {
+      if (config.layerStatus === 'loaded' && !this.loadedOnce) {
+        this.loadedOnce = true;
+        this.setVisible(layerConfig.getInitialSettings()?.states?.visible ?? true); // default: true
+      }
+    });
+  }
+
+  // #region OVERRIDES
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer configuration specific to this group layer.
+   */
+  override getLayerConfig(): GroupLayerEntryConfig {
+    return super.getLayerConfig() as GroupLayerEntryConfig;
+  }
+
+  /**
+   * Overrides the parent method to return a more specific OpenLayers layer type (covariant return).
+   *
+   * @returns The OpenLayers generic type for groups.
+   */
+  override getOLLayer(): LayerGroup {
+    // Call parent and cast
+    return super.getOLLayer() as LayerGroup;
+  }
+
+  /**
+   * Overrides the way the attributions are retrieved.
+   *
+   * @returns The layer attributions
+   */
+  override onGetAttributions(): string[] {
+    // For each layer in the group
+    const totalAttributions: string[] = [];
+    this.getLayers().forEach((layer) => {
+      // Compile the attributions
+      totalAttributions.push(...layer.getAttributions());
+    });
+
+    // Return the total attributions
+    return totalAttributions;
+  }
+
+  /**
+   * Overrides the way to initialize the bounds for this layer type.
+   *
+   * @param projection - The projection to initialize the bounds into
+   * @param stops - The number of stops to use to generate the extent
+   * @returns A promise that resolves with the layer bounding box or undefined when not found
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  override onInitBounds(projection: OLProjection, stops: number): Promise<Extent | undefined> {
+    // Current bounds
+    const boundsArray = [] as Extent[];
+
+    // Redirect
+    this.#gatherAllBoundsRec(boundsArray, this);
+
+    // For each bounds found
+    let boundsUnion: Extent | undefined;
+    boundsArray.forEach((bounds) => {
+      // Union the bounds with each other
+      boundsUnion = GeoUtilities.getExtentUnion(boundsUnion, bounds);
+    });
+
+    // Return the unioned bounds
+    return Promise.resolve(boundsUnion);
+  }
+
+  /**
+   * Overrides the refresh function to refresh each layer in the group.
+   *
+   * @param projection - Optional projection to refresh to
+   */
+  override onRefresh(projection: OLProjection | undefined): void {
+    // Loops on each layer in the group
+    this.getLayers().forEach((layer) => {
+      // Refresh it
+      layer.refresh(projection);
+    });
+  }
+
+  /**
+   * Overrides the set opacity function to set the opacity to all the children as well.
+   *
+   * @param opacity - The desired opacity for the layer, typically between `0` (fully transparent)
+   * and `1` (fully opaque).
+   * @param emitOpacityChanged - Optional, whether to emit a layer opacity change event after
+   * updating the opacity. Defaults to true.
+   */
+  protected override onSetOpacity(opacity: number, emitOpacityChanged = true): void {
+    // Sure
+    super.onSetOpacity(opacity, emitOpacityChanged);
+
+    // Recursively set the opacity of the children layers as well
+    this.getLayers().forEach((child) => child.setOpacity(opacity, emitOpacityChanged));
+  }
+
+  /**
+   * Overrides visible-range evaluation for group layers.
+   *
+   * A group layer is considered in range when at least one descendant leaf layer
+   * is in visible range for the provided resolution and effective scale context.
+   *
+   * @param currentResolution - The current map resolution
+   * @returns True when at least one leaf child layer is in visible range
+   */
+  protected override onIsInVisibleRange(currentResolution: number | undefined): boolean {
+    // A group layer is in visible range if any of its child leaf layers are in visible range
+    return this.getLayersAllLeafs().some((child) => child.isInVisibleRange(currentResolution));
+  }
+
+  /**
+   * Overrides the way to wait for the layer to be loaded at least once.
+   *
+   * A group layer resolves once every leaf layer nested within it (including sub-groups) has loaded at least once.
+   *
+   * @returns A promise that resolves once all leaf layers in the group hierarchy have loaded at least once
+   * @throws {LayerStatusErrorError} When a leaf layer enters the `error` state before loading (propagated from `waitForLoadedOnce()`)
+   */
+  protected override async onWaitForLoadedOnce(): Promise<void> {
+    await Promise.all(this.getLayersAllLeafs().map((layer) => layer.waitForLoadedOnce()));
+  }
+
+  // #endregion OVERRIDES
+
+  // #region PUBLIC METHODS
+
+  /**
+   * Gets the immediate layers in the group.
+   *
+   * @returns The layers in the group
+   */
+  getLayers(): AbstractBaseGVLayer[] {
+    return this.#layers;
+  }
+
+  /**
+   * Returns all leaf layers (non-group layers) contained within this group,
+   * including those nested in child groups.
+   *
+   * This is a convenience method that retrieves all descendant layers and
+   * filters them to include only concrete `AbstractGVLayer` instances
+   * (i.e., excluding `GVGroupLayer` containers).
+   * The returned collection is flattened and traversed depth-first.
+   *
+   * @returns An array of `AbstractGVLayer` instances representing all
+   * leaf layers in the group hierarchy
+   */
+  getLayersAllLeafs(): AbstractGVLayer[] {
+    // Redirect
+    return this.getLayersAll((l) => l instanceof AbstractGVLayer) as AbstractGVLayer[];
+  }
+
+  /**
+   * Returns all layers contained within this group, including nested layers.
+   *
+   * This method performs a depth-first traversal of the group hierarchy,
+   * collecting all child layers recursively. If a `filter` function is provided,
+   * it is applied to each layer before inclusion in the result.
+   * Both `GVGroupLayer` instances and concrete layer types may be returned,
+   * depending on the filter criteria.
+   *
+   * @param filter - Optional predicate function used to filter the returned layers
+   * @returns A flattened array of all descendant layers (including group layers),
+   * optionally filtered
+   */
+  getLayersAll(filter?: (layer: AbstractBaseGVLayer) => boolean): AbstractBaseGVLayer[] {
+    // To hold the results
+    const result: AbstractBaseGVLayer[] = [];
+
+    // Inside function to recurse
+    const traverse = (layers: AbstractBaseGVLayer[]): void => {
+      for (const layer of layers) {
+        if (!filter || filter(layer)) {
+          result.push(layer);
+        }
+
+        // If the layer is a group, recurse into it
+        if (layer instanceof GVGroupLayer) {
+          traverse(layer.getLayers());
+        }
+      }
+    };
+
+    // Start
+    traverse(this.getLayers());
+
+    // Return the results
+    return result;
+  }
+
+  /**
+   * Adds a layer to the group layer.
+   *
+   * @param layer - The layer to add
+   */
+  addLayer(layer: AbstractBaseGVLayer): void {
+    // Officially add it to the OL object
+    this.getOLLayer().getLayers().push(layer.getOLLayer());
+
+    // Set its parent right away
+    layer.setParent(this);
+
+    // Ensure the child respects the parent opacity cap as soon as it joins the group.
+    if (layer.getOpacity() > this.getOpacity()) layer.setOpacity(this.getOpacity(), false);
+
+    // Add the layer to our list
+    this.#layers.push(layer);
+
+    // Emit
+    this.#emitLayerAdded({ child: layer });
+  }
+
+  /**
+   * Removes a layer from the group layer.
+   *
+   * @param layer - The layer to remove
+   * @throws {LayerNotFoundError} When the layer is not found in the group
+   */
+  removeLayer(layer: AbstractBaseGVLayer): void {
+    // Try to find it
+    const idx = this.#layers.findIndex((lyr) => lyr === layer);
+
+    // If not found
+    if (idx < 0) throw new LayerNotFoundError(layer.getLayerPath());
+
+    // Officially remove it from the OL object
+    this.getOLLayer().getLayers().remove(layer.getOLLayer());
+
+    // Clear its parent right away
+    layer.setParent(undefined);
+
+    // Remove it from our list
+    this.#layers.splice(idx, 1);
+
+    // Emit
+    this.#emitLayerRemoved({ child: layer });
+  }
+
+  // #endregion PUBLIC METHODS
+
+  // #region PRIVATE METHODS
+
+  /**
+   * Recursively gathers all bounds on the layers associated with the given layer path and store them in the bounds parameter.
+   *
+   * @param bounds - The currently gathered bounds during the recursion
+   * @param layer - The layer being processed
+   * @param projection - The projection to get the bounds into
+   * @param stops - The number of stops to use to generate the extent
+   * @returns A promise that resolves when all bounds have been gathered and stored in the bounds parameter
+   */
+  #gatherAllBoundsRec(bounds: Extent[], layer: AbstractBaseGVLayer): void {
+    // If a leaf
+    if (layer instanceof AbstractGVLayer) {
+      // Get the bounds of the layer
+      const calculatedBounds = layer.getBounds();
+      if (calculatedBounds) bounds.push(calculatedBounds);
+    } else if (layer instanceof GVGroupLayer) {
+      // Recursively get all bounds for all children layers
+      layer.getLayers().forEach((childLayer) => this.#gatherAllBoundsRec(bounds, childLayer));
+    }
+  }
+
+  // #endregion PRIVATE METHODS
+
+  // #region EVENTS
+
+  /**
+   * Emits an event to all handlers.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerAdded(event: LayerGroupChildrenUpdatedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerAddedHandlers, event);
+  }
+
+  /**
+   * Registers a layer added event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   */
+  onLayerAdded(callback: LayerGroupChildrenUpdatedDelegate): void {
+    // Register the event handler
+    EventHelper.onEvent(this.#onLayerAddedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer added event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerAdded(callback: LayerGroupChildrenUpdatedDelegate): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerAddedHandlers, callback);
+  }
+
+  /**
+   * Emits an event to all handlers.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerRemoved(event: LayerGroupChildrenUpdatedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerRemovedHandlers, event);
+  }
+
+  /**
+   * Registers a layer removed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   */
+  onLayerRemoved(callback: LayerGroupChildrenUpdatedDelegate): void {
+    // Register the event handler
+    EventHelper.onEvent(this.#onLayerRemovedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer removed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerRemoved(callback: LayerGroupChildrenUpdatedDelegate): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerRemovedHandlers, callback);
+  }
+
+  // #endregion EVENTS
+}
+
+/** Defines an event for the delegate. */
+export interface LayerGroupChildrenUpdatedEvent<T extends AbstractBaseGVLayer = AbstractBaseGVLayer> extends LayerBaseEvent {
+  child: T;
+}
+
+/** Defines a delegate for the event handler function signature. */
+export type LayerGroupChildrenUpdatedDelegate = EventDelegateBase<GVGroupLayer, LayerGroupChildrenUpdatedEvent, void>;

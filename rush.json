@@ -1,0 +1,70 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/rush/v5/rush.schema.json",
+  "rushVersion": "5.113.4",
+  "pnpmVersion": "8.15.2",
+  "nodeSupportedVersionRange": ">=20.11.0",
+  "pnpmOptions": {
+    "useWorkspaces": true
+  },
+  "ensureConsistentVersions": true,
+  "eventHooks": {
+    "preRushInstall": [],
+    "postRushInstall": [],
+    "preRushBuild": [],
+    "postRushBuild": []
+  },
+  "telemetryEnabled": false,
+  "repository": {
+    "url": "https://github.com/Canadian-Geospatial-Platform/geoview"
+  },
+  "projects": [
+    {
+      "packageName": "geoview-about-panel",
+      "projectFolder": "packages/geoview-about-panel"
+    },
+    {
+      "packageName": "geoview-aoi-panel",
+      "projectFolder": "packages/geoview-aoi-panel"
+    },
+    {
+      "packageName": "geoview-core",
+      "projectFolder": "packages/geoview-core"
+    },
+    {
+      "packageName": "geoview-custom-legend",
+      "projectFolder": "packages/geoview-custom-legend"
+    },
+    {
+      "packageName": "geoview-drawer",
+      "projectFolder": "packages/geoview-drawer"
+    },
+    {
+      "packageName": "geoview-filter-panel",
+      "projectFolder": "packages/geoview-filter-panel"
+    },
+    {
+      "packageName": "geoview-geochart",
+      "projectFolder": "packages/geoview-geochart"
+    },
+    {
+      "packageName": "geoview-swiper",
+      "projectFolder": "packages/geoview-swiper"
+    },
+    {
+      "packageName": "geoview-test-suite",
+      "projectFolder": "packages/geoview-test-suite"
+    },
+    {
+      "packageName": "geoview-time-slider",
+      "projectFolder": "packages/geoview-time-slider"
+    },
+    {
+      "packageName": "geoview-stac-browser",
+      "projectFolder": "packages/geoview-stac-browser"
+    },
+    {
+      "packageName": "eslint-and-prettier-config",
+      "projectFolder": "packages"
+    }
+  ]
+}

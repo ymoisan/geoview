@@ -1,0 +1,21 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    // Override base config for geoview-core specific needs
+    "baseUrl": ".",
+    "noEmit": false,
+    "declaration": true,
+    "declarationMap": true,
+    "emitDeclarationOnly": true,
+    "composite": true,
+    "verbatimModuleSyntax": true,
+    "outDir": "lib",
+    "lib": ["esnext", "dom", "dom.iterable", "scripthost", "webworker"],
+    "paths": {
+      "@/*": ["./src/*"],
+      "@public/*": ["./public/*"]
+    }
+  },
+  "include": ["src", "public/locales/**/*.json", "schema.json"],
+  "exclude": ["node_modules"]
+}

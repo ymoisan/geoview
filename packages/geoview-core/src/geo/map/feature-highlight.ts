@@ -1,0 +1,300 @@
+import VectorLayer from 'ol/layer/Vector';
+import VectorSource from 'ol/source/Vector';
+import { Circle as CircleStyle, Fill, Stroke, Style } from 'ol/style';
+import Feature from 'ol/Feature';
+import { GeometryCollection, Point, MultiPoint, LineString, MultiLineString, Polygon, MultiPolygon } from 'ol/geom';
+import type { Extent } from 'ol/extent';
+import { getCenter } from 'ol/extent';
+import { fromExtent } from 'ol/geom/Polygon';
+import type { Coordinate } from 'ol/coordinate';
+import type { Color } from 'ol/color';
+
+import { type TypeHighlightColors, type TypeFeatureInfoEntry, DEFAULT_HIGHLIGHT_COLOR } from '@/api/types/map-schema-types';
+import { logger } from '@/core/utils/logger';
+import { getStoreMapFeatureHighlightColor } from '@/core/stores/states/map-state';
+import { TIMEOUT } from '@/core/utils/constant';
+import { GeometryApi } from '@/geo/layer/geometry/geometry';
+import type { MapController } from '@/core/controllers/map-controller';
+import type { MapViewer } from '@/geo/map/map-viewer';
+import { PointMarkers } from './point-markers';
+
+/**
+ * A class to handle highlighting of features.
+ */
+export class FeatureHighlight {
+  /** Reference on the map viewer */
+  mapViewer: MapViewer;
+
+  /** Reference on the map controller */
+  mapController: MapController;
+
+  /** The vector source to use for the highlight features */
+  highlightSource: VectorSource = new VectorSource();
+
+  /** The hidden layer to display highlight. */
+  // GV It's public, to save an eslint warning, because even if it's not read in this class, it's actually important to instanciate per OpenLayer design.
+  overlayLayer?: VectorLayer;
+
+  // Used to access point markers
+  pointMarkers?: PointMarkers;
+
+  /** The fill for the highlight */
+  #highlightColor: TypeHighlightColors = DEFAULT_HIGHLIGHT_COLOR;
+
+  /** The fill for the highlight */
+  #highlightFill = new Fill({ color: [0, 230, 242, 0.3] }); // aqua
+
+  /** The style for the highlight */
+  #highlightStyle = new Style({ stroke: new Stroke({ color: 'aqua', width: 3 }), fill: this.#highlightFill });
+
+  /** The style for the bbox highlight */
+  #darkOutlineStyle = new Style({ stroke: new Stroke({ color: 'black', width: 1.25 }) });
+
+  /** The ID's of currently highlighted features */
+  #highlightedFeatureIds: string[] = [];
+
+  /** The ID's of features already warned about being too complex to highlight, to avoid repeating the notification. */
+  #complexGeometryWarnedIds: Set<string> = new Set();
+
+  /** Timeout of the bounding box highlight */
+  #bboxTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * Constructor.
+   *
+   * @param mapViewer - A reference to the map viewer
+   */
+  constructor(mapViewer: MapViewer, mapController: MapController) {
+    // Keep the reference
+    this.mapViewer = mapViewer;
+    this.mapController = mapController;
+  }
+
+  /**
+   * Initializes the FeatureHighlight with the MapViewer, now that the map is accessible inside the MapViewer.
+   */
+  init(): void {
+    // Initialize the Feature Highlight (adding the map option sets zIndex to infinity because it is undefined)
+    this.overlayLayer = new VectorLayer({ source: this.highlightSource, map: this.mapViewer.map });
+    this.pointMarkers = new PointMarkers(this.mapViewer, this.mapController, this);
+    if (getStoreMapFeatureHighlightColor(this.mapViewer.mapId) !== DEFAULT_HIGHLIGHT_COLOR)
+      this.changeHighlightColor(getStoreMapFeatureHighlightColor(this.mapViewer.mapId));
+  }
+
+  /**
+   * Changes the highlight color.
+   *
+   * @param color - New color
+   */
+  changeHighlightColor(color: TypeHighlightColors): void {
+    this.#highlightColor = color;
+
+    // set default value to aqua then check if valid color
+    let stroke: Stroke = new Stroke({ color: 'aqua', width: 2 });
+    let featureColor: Color = [0, 230, 242, 0.3];
+    switch (color) {
+      case 'white': {
+        featureColor = [255, 255, 255, 0.3];
+        stroke = new Stroke({ color: 'white', width: 2 });
+        break;
+      }
+      case 'red': {
+        featureColor = [255, 0, 0, 0.3];
+        stroke = new Stroke({ color: 'red', width: 2 });
+        break;
+      }
+      case 'green': {
+        featureColor = [0, 255, 255, 0.3];
+        stroke = new Stroke({ color: 'green', width: 2 });
+        break;
+      }
+      case 'black': {
+        featureColor = [0, 0, 0, 0.3];
+        stroke = new Stroke({ color: 'black', width: 2 });
+        break;
+      }
+      case 'aqua': {
+        break;
+      }
+      default: {
+        logger.logWarning('Ineligible color - defaulted to black');
+        break;
+      }
+    }
+
+    // set color
+    this.#highlightFill.setColor(featureColor);
+    this.#highlightStyle.setStroke(stroke);
+    this.#highlightStyle.setFill(this.#highlightFill);
+  }
+
+  /**
+   * Styles and registers feature for highlighting.
+   *
+   * @param feature - Feature to add
+   * @param id - Id of the feature
+   */
+  #styleHighlightedFeature(feature: Feature, id: string): void {
+    feature.setStyle(this.#highlightStyle);
+    feature.setId(id);
+    this.#highlightedFeatureIds.push(id);
+    this.highlightSource.addFeature(feature);
+  }
+
+  /**
+   * Applies the circle marker style on a point highlight feature.
+   *
+   * @param feature - Point feature to style
+   */
+  #stylePointHighlightFeature(feature: Feature): void {
+    const radStyle = new Style({
+      image: new CircleStyle({
+        radius: 10,
+        stroke: new Stroke({ color: this.#highlightColor, width: 1.25 }),
+        fill: this.#highlightFill,
+      }),
+    });
+    feature.setStyle(radStyle);
+  }
+
+  /**
+   * Highlights a geometry by type and returns the number of highlighted features.
+   *
+   * @param geometry - Geometry to highlight
+   * @param id - Base id to assign to highlighted feature(s)
+   * @returns Number of highlighted features created
+   */
+  #highlightGeometry(geometry: unknown, id: string): number {
+    if (geometry instanceof Polygon || geometry instanceof LineString || geometry instanceof MultiLineString) {
+      const newFeature = new Feature(geometry);
+      this.#styleHighlightedFeature(newFeature, id);
+      return 1;
+    }
+
+    if (geometry instanceof Point) {
+      const newFeature = new Feature(geometry);
+      this.#styleHighlightedFeature(newFeature, id);
+      this.#stylePointHighlightFeature(newFeature);
+      return 1;
+    }
+
+    if (geometry instanceof MultiPoint) {
+      const coordinates: Coordinate[] = geometry.getCoordinates();
+      for (let i = 0; i < coordinates.length; i++) {
+        const newPoint = new Point(coordinates[i]);
+        const newFeature = new Feature(newPoint);
+        const pointId = `${id}-${i}`;
+        this.#styleHighlightedFeature(newFeature, pointId);
+        this.#stylePointHighlightFeature(newFeature);
+      }
+      return coordinates.length;
+    }
+
+    if (geometry instanceof MultiPolygon) {
+      const polygons = geometry.getPolygons();
+      for (let i = 0; i < polygons.length; i++) {
+        const newPolygon = polygons[i];
+        const newFeature = new Feature(newPolygon);
+        const polygonId = `${id}-${i}`;
+        this.#styleHighlightedFeature(newFeature, polygonId);
+      }
+      return polygons.length;
+    }
+
+    if (geometry instanceof GeometryCollection) {
+      const geometries = geometry.getGeometriesArray();
+      let highlightedCount = 0;
+      for (let i = 0; i < geometries.length; i++) {
+        highlightedCount += this.#highlightGeometry(geometries[i], `${id}-${i}`);
+      }
+      return highlightedCount;
+    }
+
+    return 0;
+  }
+
+  /**
+   * Removes feature highlight(s).
+   *
+   * @param id - Uid of the feature to deselect, or 'all' to clear all
+   */
+  removeHighlight(id: string): void {
+    if (id === 'all' && this.#highlightedFeatureIds.length) {
+      for (let i = 0; i < this.#highlightedFeatureIds.length; i++) {
+        this.highlightSource.removeFeature(this.highlightSource.getFeatureById(this.#highlightedFeatureIds[i]) as Feature);
+      }
+      this.#highlightedFeatureIds = [];
+    } else if (this.#highlightedFeatureIds.length) {
+      for (let i = this.#highlightedFeatureIds.length - 1; i >= 0; i--) {
+        if (this.#highlightedFeatureIds[i] === id || this.#highlightedFeatureIds[i].startsWith(`${id}-`)) {
+          const featureToRemove = this.highlightSource.getFeatureById(this.#highlightedFeatureIds[i]);
+          if (featureToRemove) this.highlightSource.removeFeature(featureToRemove);
+          this.#highlightedFeatureIds.splice(i, 1);
+        }
+      }
+    }
+  }
+
+  /**
+   * Highlights a feature with a plain overlay.
+   *
+   * Pathologically complex geometries (e.g. an ESRI feature whose polygon has thousands of holes) are not highlighted,
+   * because re-rendering them every frame freezes the UI. The user is notified once per such feature.
+   *
+   * @param feature - Feature to highlight
+   */
+  highlightFeature(feature: TypeFeatureInfoEntry): void {
+    const { geometry } = feature;
+
+    // Skip geometries too complex to render every frame without freezing the UI, and warn the user once per feature
+    if (geometry && !GeometryApi.canRenderGeometry(geometry)) {
+      if (feature.uid && !this.#complexGeometryWarnedIds.has(feature.uid)) {
+        this.#complexGeometryWarnedIds.add(feature.uid);
+        this.mapViewer.notifications.showWarning('warning.layer.geometryTooComplexToHighlight');
+      }
+      return;
+    }
+
+    const highlightedCount = this.#highlightGeometry(geometry, feature.uid!);
+
+    if (!highlightedCount && feature.extent) {
+      const center = getCenter(feature.extent);
+      const newPoint = new Point(center);
+      const newFeature = new Feature(newPoint);
+      this.#styleHighlightedFeature(newFeature, feature.uid!);
+      this.#stylePointHighlightFeature(newFeature);
+    }
+    this.overlayLayer?.changed();
+  }
+
+  /**
+   * Highlights a bounding box.
+   *
+   * @param extent - Extent to highlight
+   * @param isLayerHighlight - Optional if it is a layer highlight
+   */
+  highlightGeolocatorBBox(extent: Extent, isLayerHighlight = false): void {
+    if (this.highlightSource.getFeatureById('geoLocatorFeature')) {
+      this.highlightSource.removeFeature(this.highlightSource.getFeatureById('geoLocatorFeature') as Feature);
+      clearTimeout(this.#bboxTimeout as ReturnType<typeof setTimeout>);
+    }
+    const bboxPoly = fromExtent(extent);
+    const bboxFeature = new Feature(bboxPoly);
+    const style = this.#darkOutlineStyle;
+    bboxFeature.setStyle(style);
+    bboxFeature.setId('geoLocatorFeature');
+    this.highlightSource.addFeature(bboxFeature);
+    if (!isLayerHighlight)
+      this.#bboxTimeout = setTimeout(
+        () => this.highlightSource.removeFeature(this.highlightSource.getFeatureById('geoLocatorFeature') as Feature),
+        TIMEOUT.featureHighlight
+      );
+  }
+
+  /**
+   * Removes bounding box highlight
+   */
+  removeBBoxHighlight(): void {
+    this.highlightSource.removeFeature(this.highlightSource.getFeatureById('geoLocatorFeature') as Feature);
+  }
+}

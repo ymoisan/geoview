@@ -1,0 +1,79 @@
+import type { VectorLayerEntryConfigProps } from '@/api/config/validation-classes/vector-layer-entry-config';
+import { VectorLayerEntryConfig } from '@/api/config/validation-classes/vector-layer-entry-config';
+import type { TypeCSVLayerConfig } from '@/geo/layer/geoview-layers/vector/csv';
+import type { ConfigClassOrType, TypeGeoviewLayerConfig, TypeSourceCSVInitialConfig } from '@/api/types/layer-schema-types';
+import { CONST_LAYER_TYPES } from '@/api/types/layer-schema-types';
+
+export interface CsvLayerEntryConfigProps extends VectorLayerEntryConfigProps {
+  /** Source settings to apply to the GeoView layer source at creation time. */
+  source?: TypeSourceCSVInitialConfig;
+}
+
+export class CsvLayerEntryConfig extends VectorLayerEntryConfig {
+  /**
+   * Creates an instance of CsvLayerEntryConfig.
+   *
+   * @param layerConfig - The layer configuration we want to instantiate
+   */
+  constructor(layerConfig: CsvLayerEntryConfigProps) {
+    super(layerConfig, CONST_LAYER_TYPES.CSV);
+
+    // Write the default properties when not specified
+    this.getSource().separator ??= ',';
+
+    // Normalize dataAccessPath if needed
+    const path = this.getDataAccessPath();
+    const isBlob = path.startsWith('blob') && !path.endsWith('/');
+    const isCsvFile = path.toUpperCase().endsWith('.CSV');
+    const hasCsvQuery = path.toUpperCase().includes('.CSV?');
+
+    if (!isBlob && !isCsvFile && !hasCsvQuery) {
+      const endsWithSlash = path.endsWith('/');
+      let normalizedPath = endsWithSlash ? `${path}${this.layerId}` : `${path}/${this.layerId}`;
+
+      if (!normalizedPath.toUpperCase().endsWith('.CSV')) {
+        normalizedPath += '.csv';
+      }
+      this.setDataAccessPath(normalizedPath);
+    }
+  }
+
+  // #region OVERRIDES
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer configuration specific to this layer.
+   */
+  override getGeoviewLayerConfig(): TypeCSVLayerConfig {
+    return super.getGeoviewLayerConfig() as TypeCSVLayerConfig;
+  }
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed source configuration specific to this layer entry config.
+   */
+  override getSource(): TypeSourceCSVInitialConfig {
+    return super.getSource();
+  }
+
+  // #endregion OVERRIDES
+
+  // #region STATIC METHODS
+
+  /**
+   * Type guard that checks whether the given configuration (class instance or plain object) represents a CSV layer type.
+   *
+   * Supports `ConfigClassOrType` (class instance or plain object) and plain layer config objects (`TypeGeoviewLayerConfig`).
+   *
+   * @param layerConfig - The layer config to check. Can be an instance of a config class or a raw config object
+   * @returns `true` if the config is for a CSV layer; otherwise `false`
+   */
+  static isClassOrTypeCSV(layerConfig: ConfigClassOrType | TypeGeoviewLayerConfig): layerConfig is TypeCSVLayerConfig {
+    // Redirect
+    return this.isClassOrTypeSchemaTag(layerConfig, CONST_LAYER_TYPES.CSV);
+  }
+
+  // #endregion STATIC METHODS
+}

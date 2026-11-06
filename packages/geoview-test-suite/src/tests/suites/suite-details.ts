@@ -1,0 +1,115 @@
+import type { API } from 'geoview-core/api/api';
+import type { MapViewer } from 'geoview-core/geo/map/map-viewer';
+import { TestSuiteCannotExecuteError } from '../core/exceptions';
+import { GVAbstractTester } from '../testers/abstract-gv-tester';
+import { DetailsTester } from '../testers/details-tester';
+import { GVAbstractTestSuite } from './abstract-gv-test-suite';
+import type { ControllerRegistry } from 'geoview-core/core/controllers/base/controller-registry';
+
+/**
+ * The GeoView Test Suite.
+ */
+export class GVTestSuiteDetails extends GVAbstractTestSuite {
+  /** The Geochart Tester used in this Test Suite */
+  #detailsTester: DetailsTester;
+
+  /**
+   * Constructs the Test Suite.
+   *
+   * @param api - The shared api
+   * @param mapViewer - The map viewer
+   * @param controllerRegistry - The controller registry
+   */
+  constructor(api: API, mapViewer: MapViewer, controllerRegistry: ControllerRegistry) {
+    super(api, mapViewer, controllerRegistry);
+
+    // Create the Geochart tester
+    this.#detailsTester = new DetailsTester(api, mapViewer, controllerRegistry);
+    this.addTester(this.#detailsTester);
+  }
+
+  /**
+   * Returns the name of the Test Suite.
+   *
+   * @returns The name of the Test Suite
+   */
+  override getName(): string {
+    return 'Details Test Suite';
+  }
+
+  /**
+   * Returns the description of the Test Suite.
+   *
+   * @returns The description of the Test Suite
+   */
+  override getDescriptionAsHtml(): string {
+    return `Tests the Details panel feature info display and interaction:<br/>
+      <b>Feature info</b> — Query GeoJSON layer at Ontario/Alberta extent<br/>
+      <b>Highlight</b> — Clear all highlights after selection<br/>
+      <b>Navigation</b> — Zoom to feature from details panel<br/>
+      <b>Config overrides</b> — nameField as label, summary:false hides field, field alias renaming`;
+  }
+
+  /**
+   * Gets the number of active tests launched by the full suite.
+   *
+   * @returns The number of active full-suite tester calls, excluding debug-only calls
+   */
+  override getTestsTotalFinal(): number {
+    return 6;
+  }
+
+  /**
+   * Overrides the check if the Test Suite can be executed.
+   *
+   * @returns A promise that resolves to true when the Test Suite can be launched for the given map
+   */
+  protected override onCanExecuteTestSuite(): Promise<boolean> {
+    // Check if the geochart plugin is part of the corePackage on the testing map
+    if (!this.getMapViewer().hasAppbarTab('details'))
+      throw new TestSuiteCannotExecuteError('To run this Test Suite, the details tab has to be loaded in the appBar tabs core array.');
+
+    // All good
+    return Promise.resolve(true);
+  }
+
+  /**
+   * Overrides the debug hook for running a subset of tests during development.
+   *
+   * GV DEBUG SECTION TO NOT HAVE TO TEST EVERYTHING EVERYTIME, search for DEBUG_RUN_ONLY_DEBUG_FUNCTION for the flag.
+   *
+   * @returns A promise that resolves when the debug tests are completed
+   */
+  protected override async onLaunchTestSuiteDEBUG(): Promise<unknown> {
+    await this.#detailsTester.testClearAllHighlights(GVAbstractTester.ONTARIO_CENTER_LONLAT);
+    return Promise.resolve();
+  }
+
+  /**
+   * Overrides the implementation to perform the tests for this Test Suite.
+   *
+   * @returns A promise that resolves when tests are completed
+   */
+  protected override async onLaunchTestSuite(): Promise<unknown> {
+    // Test Details with polygons (visibility toggling)
+    await this.#detailsTester.testDetailsForGeoJSONOntarioAlberta(
+      'geojsonLYR5/polygons.json',
+      GVAbstractTester.ONTARIO_CENTER_LONLAT,
+      GVAbstractTester.ALBERTA_CENTER_LONLAT
+    );
+
+    // Test clear all highlights
+    await this.#detailsTester.testClearAllHighlights(GVAbstractTester.ONTARIO_CENTER_LONLAT);
+
+    // Test zoom to feature
+    await this.#detailsTester.testZoomToFeature('geojsonLYR5/polygons.json', GVAbstractTester.ONTARIO_CENTER_LONLAT);
+
+    // Tests that recreate the map with custom featureInfo config (sequential)
+    await this.#detailsTester.testNameFieldAsLabel();
+    await this.#detailsTester.testSummaryFalseHidesField();
+    await this.#detailsTester.testFieldAliasRenamesField();
+
+    // Resolve when all done
+    return Promise.resolve();
+  }
+}

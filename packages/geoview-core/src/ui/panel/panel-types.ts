@@ -1,0 +1,150 @@
+import type { ReactNode, AriaRole } from 'react';
+import type { TooltipProps, ButtonProps, TextFieldProps } from '@mui/material';
+
+import type { IconButtonPropsExtend } from '@/ui/icon-button/icon-button';
+import type { TypeDisplayLanguage } from '@/api/types/map-schema-types';
+
+/** Interface used to initialize a button panel. */
+export type TypeButtonPanelProps = {
+  /** Panel properties. */
+  panel: TypePanelProps;
+  /** Button properties. */
+  button: TypeButtonProps;
+};
+
+/** Configuration for button groups. */
+export type TypeButtonGroupConfig = {
+  /** Group name */
+  groupName: string;
+  /** Threshold for accordion expansion (default: 10) */
+  accordionThreshold?: number;
+  /** Optional display name for the group. Can be a single string or a partial localized record (allows any combination of languages). */
+  displayName?: string | Partial<Record<TypeDisplayLanguage, string>>;
+};
+
+/** Type for the panel properties used when creating a new panel. */
+export type TypePanelProps = {
+  /** Panel id. */
+  panelId?: string;
+  /** Panel group name. */
+  panelGroupName?: string;
+  /** Panel type (app-bar, nav-bar). */
+  type?: string;
+  /** Panel open status (open/closed). */
+  status?: boolean;
+  /**
+   * Width of the panel (optional).
+   *
+   * Behavior depends on container type:
+   * - **App-bar/footer-bar panels**: Percentage of viewport width (default 100). Example: `30` = 30% width.
+   * - **Nav-bar panels**: Fixed width in pixels or CSS string. If not provided, defaults to auto-sizing (`width: auto`, `minWidth: 180px`, `maxWidth: 70vw`).
+   */
+  width?: string | number;
+  /** Panel header icon. */
+  icon: ReactNode;
+  /** Panel header title. */
+  title: string;
+  /** Panel body content. */
+  content?: ReactNode;
+  /** Convert panel body content from HTML. */
+  convertHtmlContent?: boolean;
+  /** Custom panel styles */
+  panelStyles?: PanelStyles;
+  /** is focus trapped for panel */
+  isFocusTrapped?: boolean;
+};
+
+export interface PanelStyles {
+  /** Panel/Card Container style object */
+  panelContainer?: { [key: string]: string };
+  /** Panel/Card Wrapper style object */
+  panelCard?: { [key: string]: string };
+  /** Panel/Card header style object */
+  panelCardHeader?: { [key: string]: string };
+  /** Panel/Card content style object */
+  panelCardContent?: { [key: string]: string };
+}
+
+/**
+ * Interface for the button properties used when creating a new button.
+ */
+
+export interface TypeButtonProps extends Omit<ButtonProps, 'type'> {
+  /** Button id */
+  id?: string;
+  /** Button tooltip. */
+  tooltip?: string;
+  /** Location for tooltip. */
+  tooltipPlacement?: TooltipProps['placement'];
+  /** Button icon. */
+  icon?: ReactNode;
+  /** Optional class names */
+  iconClassName?: string;
+  /** Optional class names. */
+  textClassName?: string;
+  /** Button state. */
+  state?: 'expanded' | 'collapsed';
+  /** Button type. */
+  type: 'text' | 'textWithIcon' | 'icon';
+  /** Button visibility. */
+  visible?: boolean;
+  /** Accessible label for screen readers */
+  'aria-label'?: string;
+  /** Indicates if the button is in a pressed state */
+  'aria-pressed'?: boolean | 'mixed';
+  /** Indicates if the element controls an expandable region */
+  'aria-expanded'?: boolean;
+  /** Indicates the checked state of the button when used as a checkbox/radio */
+  'aria-checked'?: boolean | 'mixed';
+  /** Identifies the element(s) controlled by this button */
+  'aria-controls'?: string;
+  /** Indicates the element has a popup context menu or sub-level menu */
+  'aria-haspopup'?: boolean | 'menu' | 'listbox' | 'tree' | 'grid' | 'dialog';
+  /** Indicates whether the element is hidden from accessibility API */
+  'aria-hidden'?: boolean;
+  /** Defines the ARIA role for the element. */
+  role?: AriaRole;
+}
+
+/**
+ * Interface for the text properties used when creating a new text field.
+ */
+export interface TypeTextFieldProps extends Omit<TextFieldProps, 'type'> {
+  /** Text tooltip. */
+  tooltip?: string;
+  /** Location for tooltip. */
+  tooltipPlacement?: TooltipProps['placement'];
+}
+
+// GV Check if it must be deleted.
+// TODO: used in layer-panel packages... check if we can merge
+/**
+ * Interface for the button properties used when creating a new button.
+ */
+export interface ButtonPropsLayerPanel {
+  isFirst?: boolean;
+  isLast?: boolean;
+  handleNext: () => void;
+}
+
+/**
+ * Interface used when creating a new button panel.
+ */
+export type TypeButtonPanel = {
+  /** Panel identifier. */
+  buttonPanelId: string;
+  /** Panel props. */
+  panel?: TypePanelProps;
+  /** Button used by the panel. */
+  button: IconButtonPropsExtend;
+  /** Group name. */
+  groupName?: string;
+};
+
+/**
+ * constant that defines the panel types.
+ */
+export const CONST_PANEL_TYPES = {
+  APPBAR: 'app-bar',
+  NAVBAR: 'nav-bar',
+};

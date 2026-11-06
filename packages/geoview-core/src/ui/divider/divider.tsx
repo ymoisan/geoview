@@ -1,0 +1,69 @@
+import { useMemo } from 'react';
+import type { SxProps, Theme } from '@mui/material/styles';
+import { useTheme } from '@mui/material/styles';
+import type { DividerProps } from '@mui/material';
+import { Divider as MaterialDivider } from '@mui/material';
+
+import { getSxClasses } from '@/ui/divider/divider-style';
+import { composeSxProps } from '@/ui/style/types';
+import { logger } from '@/core/utils/logger';
+
+/**
+ * Properties for the Divider component extending Material-UI's DividerProps
+ */
+export interface DividerPropsExtend extends DividerProps {
+  orientation?: 'horizontal' | 'vertical';
+  grow?: boolean;
+  sx?: SxProps<Theme>;
+}
+
+/**
+ * Material-UI Divider component with orientation and growth options.
+ *
+ * Wraps Material-UI's Divider to provide flexible visual separation between content.
+ * Supports horizontal/vertical orientation with optional flex-grow behavior for
+ * layout spacing. All Material-UI Divider props are supported and passed through directly.
+ *
+ * @param props - Divider configuration (see DividerPropsExtend interface)
+ * @returns Divider component with theme-aware styling
+ *
+ * @example
+ * ```tsx
+ * // Basic usage
+ * <Divider />
+ *
+ * // Vertical divider
+ * <Divider orientation="vertical" />
+ *
+ * // Growing divider
+ * <Divider grow />
+ *
+ * // With custom styling
+ * <Divider
+ *   sx={{
+ *     borderColor: 'primary.main',
+ *     margin: 2
+ *   }}
+ * />
+ * ```
+ *
+ * @see {@link https://mui.com/material-ui/react-divider/}
+ */
+function DividerUI(props: DividerPropsExtend): JSX.Element {
+  logger.logTraceRenderDetailed('ui/divider/divider');
+
+  // Get constant from props
+  const { className = '', style, grow, orientation = 'horizontal', sx, ...rest } = props;
+
+  // Hooks
+  const theme = useTheme();
+  const sxClasses = useMemo(() => getSxClasses(theme), [theme]);
+
+  // Style - compose internal and caller sx props without nesting array-form sx.
+  const dividerOrientation = orientation === 'horizontal' ? sxClasses.horizontal : sxClasses.vertical;
+  const sxMerged = composeSxProps(grow && sxClasses.grow, dividerOrientation, sx);
+
+  return <MaterialDivider sx={sxMerged} className={className} style={style} {...rest} />;
+}
+
+export const Divider = DividerUI;

@@ -1,0 +1,99 @@
+import TileLayer from 'ol/layer/Tile';
+import type { Options as TileOptions } from 'ol/layer/BaseTile';
+import type XYZ from 'ol/source/XYZ';
+import type { Extent } from 'ol/extent';
+import type { Projection as OLProjection } from 'ol/proj';
+
+import type { XYZTilesLayerEntryConfig } from '@/api/config/validation-classes/raster-validation-classes/xyz-layer-entry-config';
+import { AbstractGVTile } from '@/geo/layer/gv-layers/tile/abstract-gv-tile';
+import { GeoUtilities } from '@/geo/utils/utilities';
+import { Projection } from '@/geo/utils/projection';
+
+/**
+ * Manages a Tile<XYZ> layer.
+ */
+export class GVXYZTiles extends AbstractGVTile {
+  /**
+   * Constructs a GVXYZTiles layer to manage an OpenLayer layer.
+   *
+   * @param olSource - The OpenLayer source.
+   * @param layerConfig - The layer configuration.
+   */
+  constructor(olSource: XYZ, layerConfig: XYZTilesLayerEntryConfig) {
+    super(olSource, layerConfig);
+
+    // Create the tile layer options.
+    const tileLayerOptions: TileOptions<XYZ> = { source: olSource };
+
+    // Init the layer options with initial settings
+    AbstractGVTile.initOptionsWithInitialSettings(tileLayerOptions, layerConfig);
+
+    // Create and set the OpenLayer layer
+    this.setOLLayer(new TileLayer(tileLayerOptions));
+  }
+
+  // #region OVERRIDES
+
+  /**
+   * Overrides the parent method to return a more specific OpenLayers layer type (covariant return).
+   *
+   * @returns The strongly-typed OpenLayers type.
+   */
+  override getOLLayer(): TileLayer<XYZ> {
+    // Call parent and cast
+    return super.getOLLayer() as TileLayer<XYZ>;
+  }
+
+  /**
+   * Overrides the parent class's method to return a more specific OpenLayers source type (covariant return).
+   *
+   * @returns The XYZ source instance associated with this layer.
+   */
+  protected override getOLSource(): XYZ {
+    // Get source from OL
+    return super.getOLSource() as XYZ;
+  }
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer configuration specific to this layer.
+   */
+  override getLayerConfig(): XYZTilesLayerEntryConfig {
+    // Call parent and cast
+    return super.getLayerConfig() as XYZTilesLayerEntryConfig;
+  }
+
+  /**
+   * Overrides the way to initialize the bounds for this layer type.
+   *
+   * @param projection - The projection to initialize the bounds into
+   * @param stops - The number of stops to use to generate the extent
+   * @returns A promise that resolves with the layer bounding box or undefined when not found
+   */
+  override async onInitBounds(projection: OLProjection, stops: number): Promise<Extent | undefined> {
+    // Wait for the source to be ready, just in case the caller is early
+    await this.waitForSourceReady();
+
+    // Get the OpenLayers source (not the configured source property)
+    const source = this.getOLSource();
+
+    // Get the source projection
+    const sourceProjection = source.getProjection() ?? undefined;
+
+    // Get the layer bounds
+    let sourceExtent = source.getTileGrid()?.getExtent();
+
+    // If both found
+    if (sourceExtent && sourceProjection) {
+      // Transform extent to given projection
+      sourceExtent = Projection.transformExtentFromProj(sourceExtent, sourceProjection, projection, stops);
+      sourceExtent = GeoUtilities.validateExtent(sourceExtent, projection.getCode());
+    }
+
+    // Return the calculated layer bounds
+    return sourceExtent;
+  }
+
+  // #endregion OVERRIDES
+}

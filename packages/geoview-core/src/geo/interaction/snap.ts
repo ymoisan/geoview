@@ -1,0 +1,66 @@
+import { Snap as OLSnap } from 'ol/interaction';
+import type { Options as OLSnapOptions } from 'ol/interaction/Snap';
+import type Collection from 'ol/Collection';
+import type Feature from 'ol/Feature';
+
+import type { InteractionOptions } from './interaction';
+import { Interaction } from './interaction';
+import type { GeometryApi } from '@/geo/layer/geometry/geometry';
+
+/**
+ * Supported options for snapping interactions
+ */
+export type SnapOptions = InteractionOptions & {
+  geometryGroupKey?: string;
+  features?: Collection<Feature>;
+};
+
+/**
+ * Class used for snapping features on a map.
+ */
+export class Snap extends Interaction {
+  /** The embedded OpenLayers Snap component */
+  #olSnap: OLSnap;
+
+  /**
+   * Initializes a Snap component.
+   *
+   * @param options - Object to configure the initialization of the Snap interaction
+   * @param geometryApi - The geometry API used to retrieve geometry groups if a geometry group key is provided in the options
+   */
+  constructor(options: SnapOptions, geometryApi: GeometryApi) {
+    super(options);
+
+    // The OpenLayers Snap options
+    // TODO: Enhancements - Add support for more snapping options
+    const olOptions: OLSnapOptions = {};
+
+    // If a list of features is specified, set the features to snap to
+    if (options.features) {
+      olOptions.features = options.features;
+    } else if (options.geometryGroupKey) {
+      // If a geometry group key is set, get the vector source for the geometry group
+      const geomGroup = geometryApi.createGeometryGroup(options.geometryGroupKey);
+      olOptions.source = geomGroup.vectorSource;
+    }
+
+    // Instantiate the OpenLayers Snap interaction
+    this.#olSnap = new OLSnap(olOptions);
+  }
+
+  /**
+   * Starts the interaction on the map.
+   */
+  override startInteraction(): void {
+    // Redirect to super method to start interaction
+    super.startInteraction(this.#olSnap);
+  }
+
+  /**
+   * Stops the interaction on the map.
+   */
+  override stopInteraction(): void {
+    // Redirect to super method to stop interaction
+    super.stopInteraction(this.#olSnap);
+  }
+}

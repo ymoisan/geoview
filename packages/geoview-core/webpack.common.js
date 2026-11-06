@@ -1,0 +1,350 @@
+// all lines below (3-10) needs the eslint escape no-var-requires.
+// It is a file for the buid and constant, they are reuse later in the file. It is the reason why we keep it global...
+const webpack = require('webpack');
+const path = require('path');
+const HtmlWebpackPlugin = require('html-webpack-plugin');
+const CopyWebpackPlugin = require('copy-webpack-plugin');
+const { globSync } = require('glob');
+const childProcess = require('child_process');
+const packageJSON = require('./package.json');
+
+// get date, version numbers and the hash of the current commit
+const date = new Date().toISOString();
+const [major, minor, patch] = packageJSON.version.split('.');
+const hashRaw = childProcess.execSync('git rev-parse HEAD').toString().trim();
+const hash = JSON.stringify(hashRaw);
+const shortHash = hashRaw.substring(0, 7);
+
+// Development builds (serve, build-dev, gh-pages preview) are tagged with a '-dev.<shortHash>' suffix so users
+// can tell them apart from official releases. Only webpack.prod.js sets GEOVIEW_BUILD_IS_DEV to 'false'.
+const isDevBuild = process.env.GEOVIEW_BUILD_IS_DEV !== 'false';
+const versionSuffix = isDevBuild ? `dev.${shortHash}` : '';
+
+console.log(`Build CGP Viewer: ${major}.${minor}.${patch}${versionSuffix ? `-${versionSuffix}` : ''} - ${date}`);
+
+// inject all sample files
+const multipleHtmlPluginsSamples = globSync('./public/templates/*.html')
+  .filter((name) => !name.includes('release-navigator.html')) // Exclude release-navigator
+  .map((name) => {
+    const filename = path.basename(name);
+    return new HtmlWebpackPlugin({
+      template: `${name}`,
+      filename: filename,
+      title: 'Canadian Geospatial Platform Viewer',
+      inject: 'head',
+      scriptLoading: 'blocking',
+      chunks: ['cgpv-main'],
+    });
+  });
+
+// Special handling for release-navigator.html (no script injection)
+const releaseNavigatorPlugin = new HtmlWebpackPlugin({
+  template: './public/templates/release-navigator.html',
+  filename: 'release-navigator.html',
+  title: 'Release Navigator - Canadian Geospatial Platform Viewer',
+  inject: false, // Don't inject any scripts
+});
+
+// inject all demos specific files
+const multipleHtmlPluginsDemos = globSync('./public/templates/demos/*.html').map((name) => {
+  const filename = path.basename(name);
+  return new HtmlWebpackPlugin({
+    template: `${name}`,
+    filename: filename,
+    title: 'Canadian Geospatial Platform Viewer',
+    inject: 'head',
+    scriptLoading: 'blocking',
+    chunks: ['cgpv-main'],
+  });
+});
+
+// inject all demos specific files
+const multipleHtmlPluginsDemosSpecific = globSync('./public/templates/demos-specific/*.html').map((name) => {
+  const filename = path.basename(name);
+  return new HtmlWebpackPlugin({
+    template: `${name}`,
+    filename: filename,
+    title: 'Canadian Geospatial Platform Viewer',
+    inject: 'head',
+    scriptLoading: 'blocking',
+    chunks: ['cgpv-main'],
+  });
+});
+
+// inject all test and outlier files
+const multipleHtmlPluginsOutliersTests = globSync('./public/templates/tests/*.html').map((name) => {
+  const filename = path.basename(name);
+  return new HtmlWebpackPlugin({
+    template: `${name}`,
+    filename: filename,
+    title: 'Canadian Geospatial Platform Viewer',
+    inject: 'head',
+    scriptLoading: 'blocking',
+    chunks: ['cgpv-main'],
+  });
+});
+
+// inject all release testing files
+const multipleHtmlPluginsReleaseTesting = globSync('./public/templates/release-testing/*.html').map((name) => {
+  const filename = path.basename(name);
+  return new HtmlWebpackPlugin({
+    template: `${name}`,
+    filename: filename,
+    title: 'Release Testing - Canadian Geospatial Platform Viewer',
+    inject: 'head',
+    scriptLoading: 'blocking',
+    chunks: ['cgpv-main'],
+  });
+});
+
+const config = {
+  cache: {
+    type: 'filesystem',
+    buildDependencies: {
+      config: [path.resolve(__dirname, 'webpack.common.js')],
+    },
+  },
+  entry: {
+    'cgpv-main': './src/app.tsx',
+    'geoview-custom-legend': {
+      import: '../geoview-custom-legend/src/index.tsx',
+      dependOn: 'cgpv-main',
+      filename: 'corePackages/[name].js',
+    },
+    'geoview-about-panel': {
+      import: '../geoview-about-panel/src/index.tsx',
+      dependOn: 'cgpv-main',
+      filename: 'corePackages/[name].js',
+    },
+    'geoview-aoi-panel': {
+      import: '../geoview-aoi-panel/src/index.tsx',
+      dependOn: 'cgpv-main',
+      filename: 'corePackages/[name].js',
+    },
+    'geoview-geochart': {
+      import: '../geoview-geochart/src/index.tsx',
+      dependOn: 'cgpv-main',
+      filename: 'corePackages/[name].js',
+    },
+    'geoview-swiper': {
+      import: '../geoview-swiper/src/index.tsx',
+      dependOn: 'cgpv-main',
+      filename: 'corePackages/[name].js',
+    },
+    'geoview-test-suite': {
+      import: '../geoview-test-suite/src/index.tsx',
+      dependOn: 'cgpv-main',
+      filename: 'corePackages/[name].js',
+    },
+    'geoview-time-slider': {
+      import: '../geoview-time-slider/src/index.tsx',
+      dependOn: 'cgpv-main',
+      filename: 'corePackages/[name].js',
+    },
+    'geoview-drawer': {
+      import: '../geoview-drawer/src/index.tsx',
+      dependOn: 'cgpv-main',
+      filename: 'corePackages/[name].js',
+    },
+    'geoview-stac-browser': {
+      import: '../geoview-stac-browser/src/index.tsx',
+      dependOn: 'cgpv-main',
+      filename: 'corePackages/[name].js',
+    },
+    'geoview-filter-panel': {
+      import: '../geoview-filter-panel/src/index.tsx',
+      dependOn: 'cgpv-main',
+      filename: 'corePackages/[name].js',
+    },
+  },
+  output: {
+    globalObject: 'self',
+    path: path.resolve(__dirname, 'dist'),
+    filename: '[name].js',
+    chunkFilename: '[name].js',
+  },
+  resolve: {
+    extensions: ['.mjs', '.ts', '.tsx', '.js', '.jsx'],
+    fallback: {
+      crypto: false,
+      path: false,
+      stream: false,
+      events: false,
+      buffer: false,
+      fs: false,
+    },
+    alias: {
+      '@': path.resolve(__dirname, 'src'),
+      'geoview-core': path.resolve(__dirname, 'src'),
+      '@public': path.resolve(__dirname, 'public'),
+    },
+  },
+  module: {
+    rules: [
+      {
+        test: /\.m?js$/,
+        resolve: {
+          fullySpecified: false,
+        },
+      },
+      {
+        test: /\.s?[ac]ss$/,
+        use: ['style-loader', 'css-loader'],
+      },
+      {
+        test: /\.(png|svg|jpg|gif)$/,
+        type: 'asset/resource',
+      },
+      {
+        test: /\.(ts|tsx|js|jsx)$/,
+        exclude: /node_modules/,
+        use: [
+          {
+            loader: 'swc-loader',
+            options: {
+              jsc: {
+                parser: {
+                  syntax: 'typescript',
+                  tsx: true,
+                  decorators: false,
+                },
+                transform: {
+                  react: {
+                    runtime: 'automatic',
+                  },
+                },
+                externalHelpers: false,
+                target: 'es2021',
+              },
+              module: {
+                type: 'es6',
+              },
+            },
+          },
+        ],
+      },
+      {
+        test: /github.com\+Canadian-Geospatial-Platform\+geochart(.*)\.(ts|tsx|js|jsx)$/,
+        use: [
+          {
+            loader: 'swc-loader',
+            options: {
+              jsc: {
+                parser: {
+                  syntax: 'typescript',
+                  tsx: true,
+                  decorators: false,
+                },
+                transform: {
+                  react: {
+                    runtime: 'automatic',
+                  },
+                },
+                externalHelpers: false,
+                target: 'es2021',
+              },
+              module: {
+                type: 'es6',
+              },
+            },
+          },
+        ],
+      },
+      {
+        test: /\.md$/,
+        use: ['html-loader', 'markdown-loader'],
+      },
+      {
+        test: /-worker-script\.(js|ts)$/,
+        exclude: /node_modules/,
+        use: [
+          {
+            loader: 'worker-loader',
+            options: {
+              inline: 'fallback',
+              filename: 'workers/[name].worker.js',
+            },
+          },
+          {
+            loader: 'swc-loader',
+            options: {
+              jsc: {
+                parser: {
+                  syntax: 'typescript',
+                  tsx: false,
+                },
+                externalHelpers: false,
+                target: 'es2021',
+              },
+              module: {
+                type: 'es6',
+              },
+            },
+          },
+        ],
+        type: 'javascript/auto',
+      },
+    ],
+  },
+  plugins: [
+    new HtmlWebpackPlugin({
+      template: './public/index.html',
+      title: 'Canadian Geospatial Platform Viewer',
+      inject: 'head',
+      scriptLoading: 'blocking',
+    }),
+    new CopyWebpackPlugin({
+      patterns: [
+        { from: '../../docs', to: 'docs' },
+        { from: './public/typeDocAPI', to: 'docs/typedoc', noErrorOnMissing: true }, // TypeDoc generated API docs
+        { from: './public/img', to: 'img' },
+        { from: './public/configs', to: 'configs' },
+        { from: './public/locales', to: 'locales', noErrorOnMissing: true },
+        { from: './public/css', to: 'css' },
+        { from: './public/js', to: 'js' },
+        { from: './public/builds', to: 'builds', noErrorOnMissing: true }, // Release builds
+        { from: './public/locales', to: 'builds/locales', noErrorOnMissing: true }, // Copy locales to builds folder for old versions
+        { from: './public/img', to: 'builds/img', noErrorOnMissing: true }, // Copy img to builds folder for old versions
+        { from: './public/markers', to: 'markers' },
+        { from: './public/datasets/geojson', to: 'datasets/geojson' },
+        { from: './public/datasets/csv-files', to: 'datasets/csv-files' },
+        { from: './public/datasets/shapefiles', to: 'datasets/shapefiles' },
+        { from: './public/datasets/geopackages', to: 'datasets/geopackages' },
+        { from: './public/datasets/kml-files', to: 'datasets/kml-files' },
+        { from: './public/datasets/wms', to: 'datasets/wms' },
+        { from: './public/plugins', to: 'plugins', noErrorOnMissing: true },
+        { from: './public/favicon.ico' },
+        { from: './public/templates/codedoc.js' },
+      ],
+    }),
+    new webpack.BannerPlugin({
+      banner: `Package:[name]: ${major}.${minor}.${patch}${versionSuffix ? `-${versionSuffix}` : ''} - ${hash} - ${date}`,
+      raw: false,
+      entryOnly: true,
+      include: /\.js$/,
+    }),
+    new webpack.DefinePlugin({
+      'process.env.DRAGGABLE_DEBUG': JSON.stringify(undefined),
+      __VERSION__: {
+        major,
+        minor,
+        patch,
+        timestamp: Date.now(),
+        suffix: JSON.stringify(versionSuffix),
+      },
+    }),
+  ]
+    .concat(releaseNavigatorPlugin)
+    .concat(multipleHtmlPluginsSamples)
+    .concat(multipleHtmlPluginsDemos)
+    .concat(multipleHtmlPluginsDemosSpecific)
+    .concat(multipleHtmlPluginsOutliersTests)
+    .concat(multipleHtmlPluginsReleaseTesting),
+
+  performance: {
+    maxEntrypointSize: 7 * 1024 * 1024, // 7 MiB
+    maxAssetSize: 40 * 1024 * 1024, // 40 MiB, because of big files, notably datasets/geojson/historical_flood_0.geojson (35.1 MiB)
+  },
+};
+
+module.exports = config;

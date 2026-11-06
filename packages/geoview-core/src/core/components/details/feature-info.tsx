@@ -1,0 +1,367 @@
+import { useCallback, useEffect, useState, useMemo, memo } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useTheme } from '@mui/material/styles';
+import {
+  Box,
+  BrowserNotSupportedIcon,
+  ChartIcon,
+  HighlightIcon,
+  HighlightOutlinedIcon,
+  IconButton,
+  Paper,
+  Typography,
+  ZoomInSearchIcon,
+} from '@/ui';
+import { useStoreDetailsCheckedFeatures } from '@/core/stores/states/feature-info-state';
+import { useStoreGeochartChartsConfig, useStoreGeochartLayerDataArrayBatch } from '@/core/stores/states/geochart-state';
+import { useNavigateToTab } from '@/core/components/common/hooks/use-navigate-to-tab';
+import { logger } from '@/core/utils/logger';
+import type { TypeFeatureInfoEntry, TypeFieldEntry } from '@/api/types/map-schema-types';
+import type { TypeContainerBox } from '@/core/types/global-types';
+import { FeatureInfoTable } from './feature-info-table';
+import { getSxClasses } from './details-style';
+import { useStoreUIActiveTrapGeoView } from '@/core/stores/states/ui-state';
+import { useStoreAppDisplayLanguage } from '@/core/stores/states/app-state';
+import {
+  useStoreLayerDateTemporalMode,
+  useStoreLayerDisplayDateFormat,
+  useStoreLayerDisplayDateTimezone,
+} from '@/core/stores/states/layer-state';
+import { useDetailsController, useGeoChartControllerIfExists, useLayerController } from '@/core/controllers/use-controllers';
+import { DateMgt } from '@/core/utils/date-mgt';
+import { GeometryApi } from '@/geo/layer/geometry/geometry';
+
+/** Properties for the FeatureInfo component. */
+interface FeatureInfoProps {
+  /** The feature info entry to display. */
+  feature: TypeFeatureInfoEntry;
+  /** The container type (appBar or footerBar). */
+  containerType: TypeContainerBox;
+}
+
+/** Properties for the FeatureHeader component. */
+interface FeatureHeaderProps {
+  /** The feature icon source URL. */
+  iconSrc: string | undefined;
+  /** The feature name. */
+  name: string;
+  /** Whether the feature geometry can be highlighted (present and not too complex to render). */
+  canHighlight: boolean;
+  /** Whether the feature has an extent to zoom to. */
+  hasExtent: boolean;
+  /** Whether the feature has a geochart. */
+  hasGeochart: boolean;
+  /** Whether the feature is checked. */
+  checked: boolean;
+  /** Callback when checked state changes. */
+  onCheckChange: (checked: boolean) => void;
+  /** Callback when zoom in is clicked. */
+  onZoomIn: (event: React.MouseEvent<HTMLButtonElement>) => void;
+  /** Callback when geochart is clicked. */
+  onGeochart: (event: React.MouseEvent<HTMLButtonElement>) => void;
+}
+
+/**
+ * Creates the feature header component.
+ *
+ * Memoized to avoid re-rendering unchanged headers in the feature list.
+ *
+ * @param props - Properties defined in FeatureHeaderProps interface
+ * @returns The feature header component
+ */
+const FeatureHeader = memo(
+  ({
+    iconSrc,
+    name,
+    canHighlight,
+    hasExtent,
+    hasGeochart,
+    checked,
+    onCheckChange,
+    onZoomIn,
+    onGeochart,
+  }: FeatureHeaderProps): JSX.Element => {
+    // Log
+    logger.logTraceRender('components/details/feature-info > FeatureHeader');
+
+    // Hooks
+    const { t } = useTranslation<string>();
+    const theme = useTheme();
+
+    /**
+     * Memoizes the style classes for the feature header.
+     */
+    const memoSxClasses = useMemo(() => {
+      logger.logTraceUseMemo('FEATURE-INFO - FeatureHeader - memoSxClasses', theme);
+      return getSxClasses(theme);
+    }, [theme]);
+    const isFocusTrap = useStoreUIActiveTrapGeoView();
+
+    // #region Handlers
+
+    /**
+     * Handles when the checked button is toggled.
+     */
+    const handleChecked = useCallback((): void => {
+      // Callback about the checked state providing the checked information
+      onCheckChange(!checked);
+    }, [checked, onCheckChange]);
+
+    // #endregion
+
+    return (
+      <Box sx={memoSxClasses.featureHeaderContainer}>
+        <Box sx={memoSxClasses.flexBoxAlignCenter}>
+          {iconSrc ? (
+            <Box component="img" src={iconSrc} alt="" className="layer-icon" />
+          ) : (
+            <Box component="div" aria-label={name} className="layer-icon">
+              <BrowserNotSupportedIcon />
+            </Box>
+          )}
+          <Typography component="h4" variant="body1">
+            {iconSrc ? (
+              (name ?? t('details.nullValue'))
+            ) : (
+              <>
+                {`(${name}) `}
+                <Typography component="span" sx={{ fontStyle: 'italic' }}>
+                  {t('details.notSymbolized')}
+                </Typography>
+              </>
+            )}
+          </Typography>
+        </Box>
+        <Box
+          role="group"
+          sx={{
+            ...memoSxClasses.flexBoxAlignCenter,
+            [theme.breakpoints.down('sm')]: { display: 'none' },
+          }}
+          aria-label={t('details.featureActions')}
+        >
+          {/* Hidden in WCAG mode - keyboard users can Tab to layer panel instead */}
+          {hasGeochart && !isFocusTrap && (
+            <IconButton
+              color="primary"
+              aria-label={t('details.selectLayerAndScrollChart')}
+              tooltipPlacement="top"
+              onClick={onGeochart}
+              className="buttonOutline"
+              size="small"
+            >
+              <ChartIcon />
+            </IconButton>
+          )}
+          <IconButton
+            aria-label={t('details.keepFeatureSelected')}
+            tooltipPlacement="top"
+            aria-disabled={!canHighlight}
+            onClick={handleChecked}
+            className="buttonOutline"
+            size="small"
+            aria-pressed={checked}
+          >
+            {checked ? <HighlightIcon /> : <HighlightOutlinedIcon />}
+          </IconButton>
+          <IconButton
+            color="primary"
+            aria-label={t('details.zoomTo')}
+            tooltipPlacement="top"
+            aria-disabled={!hasExtent}
+            onClick={onZoomIn}
+            className="buttonOutline"
+            size="small"
+          >
+            <ZoomInSearchIcon />
+          </IconButton>
+        </Box>
+      </Box>
+    );
+  }
+);
+FeatureHeader.displayName = 'FeatureHeader';
+
+/**
+ * Creates the feature info component.
+ *
+ * @param props - Properties defined in FeatureInfoProps interface
+ * @returns The feature info component, or null if no feature
+ */
+export function FeatureInfo({ feature, containerType }: FeatureInfoProps): JSX.Element | null {
+  logger.logTraceRender('components/details/feature-info', feature);
+
+  // Hooks
+  const theme = useTheme();
+
+  /**
+   * Memoizes the style classes for the feature info component.
+   */
+  const memoSxClasses = useMemo(() => {
+    logger.logTraceUseMemo('FEATURE-INFO - FeatureInfo - memoSxClasses', theme);
+    return getSxClasses(theme);
+  }, [theme]);
+
+  // State
+  const [checked, setChecked] = useState<boolean>(false);
+
+  // Store
+  const checkedFeatures = useStoreDetailsCheckedFeatures();
+  const geochartLayerDataArrayBatch = useStoreGeochartLayerDataArrayBatch();
+  const geochartConfigs = useStoreGeochartChartsConfig();
+  const language = useStoreAppDisplayLanguage();
+  const layerDateTemporalMode = useStoreLayerDateTemporalMode(feature.layerPath);
+  const displayDateFormat = useStoreLayerDisplayDateFormat(feature.layerPath);
+  const displayDateTimezone = useStoreLayerDisplayDateTimezone(feature.layerPath);
+  const layerController = useLayerController();
+  const detailsController = useDetailsController();
+  const geoChartController = useGeoChartControllerIfExists();
+
+  // Use navigate hook for geochart (only if geochart state exists)
+  const navigateToGeochart = useNavigateToTab('geochart', (lyrPath) => {
+    geoChartController?.setSelectedLayerPath(lyrPath);
+  });
+
+  /**
+   * Memoizes the feature name.
+   */
+  const memoFeatureName = useMemo<string>((): string => {
+    logger.logTraceUseMemo('FEATURE-INFO - memoFeatureName', feature.nameField);
+
+    // Try to get the value at the fieldName
+    let value = feature.nameField && feature.fieldInfo?.[feature.nameField]?.value;
+    // If nameField is 'html' or 'plain_text', treat it as undefined (WMS special fields)
+    if (feature.nameField === 'html' || feature.nameField === 'plain_text') {
+      value = undefined; // Clear the header value, because html or plain_text isn't a property -> value response
+    }
+
+    // If the value is a date type
+    if (value instanceof Date) {
+      value = DateMgt.formatDate(value, displayDateFormat[language], language, displayDateTimezone, layerDateTemporalMode);
+    }
+
+    // Return the header value
+    return (value as string) ?? 'No name / Sans nom';
+  }, [displayDateFormat, displayDateTimezone, feature.fieldInfo, feature.nameField, language, layerDateTemporalMode]);
+
+  /** Whether the feature geometry can be highlighted (present and not too complex to render). */
+  const featureCanHighlight = GeometryApi.canRenderGeometry(feature.geometry);
+
+  /** Whether the feature has an extent to zoom to. */
+  const featureHasExtent = !!feature.extent;
+
+  /**
+   * Memoizes the feature info list.
+   */
+  const memoFeatureInfoList: TypeFieldEntry[] = useMemo<TypeFieldEntry[]>((): TypeFieldEntry[] => {
+    logger.logTraceUseMemo('FEATURE-INFO - memoFeatureInfoList', feature.fieldInfo);
+    if (!feature?.fieldInfo) return [];
+
+    return Object.entries(feature.fieldInfo).map(([fieldName, field]) => ({
+      fieldKey: field!.fieldKey,
+      value: field!.value,
+      dataType: field!.dataType,
+      alias:
+        feature.geoviewLayerType !== 'ogcWms' && feature.geoviewLayerType !== 'ogcWfs'
+          ? field!.alias || fieldName
+          : (field!.alias || fieldName).split('.').pop() || '',
+    }));
+  }, [feature]);
+
+  /**
+   * Memoizes whether the feature has a geochart.
+   */
+  const memoHasGeochart = useMemo<boolean>((): boolean => {
+    logger.logTraceUseMemo('FEATURE-INFO - memoHasGeochart', feature.layerPath);
+    return (
+      !!geochartConfigs?.[feature.layerPath] &&
+      (geochartLayerDataArrayBatch?.some((entry) => entry.layerPath === feature.layerPath && (entry.features?.length ?? 0) > 0) ?? false)
+    );
+  }, [feature.layerPath, geochartConfigs, geochartLayerDataArrayBatch]);
+
+  // #region Handlers
+
+  /**
+   * Handles when the feature checked state changes.
+   */
+  const handleFeatureChecked = useCallback(
+    (checkedState: boolean): void => {
+      // If feature is checked
+      if (checkedState) {
+        // Skip features whose geometry is too complex to highlight
+        if (!GeometryApi.canRenderGeometry(feature.geometry)) return;
+
+        // Add
+        detailsController.addCheckedFeature(feature);
+      } else {
+        // Remove
+        detailsController.removeCheckedFeature(feature);
+      }
+    },
+    [detailsController, feature]
+  );
+
+  /**
+   * Handles when the zoom-in button is clicked.
+   */
+  const handleZoomIn = useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>): void => {
+      event.stopPropagation();
+
+      // Skip when there is no extent to zoom to
+      if (!feature?.extent) return;
+
+      // Zoom to the feature extent and highlight the feature (highlight is skipped for geometries too complex to render)
+      layerController.zoomToExtentRestrictedAndHighlight(feature.layerPath, feature, feature.extent, true).catch((error: unknown) => {
+        // Log
+        logger.logPromiseFailed('zoomToExtentRestrictedAndHighlight in handleZoomIn in FeatureInfo', error);
+      });
+    },
+    [feature, layerController]
+  );
+
+  /**
+   * Handles when the geochart button is clicked.
+   */
+  const handleGeochart = useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>): void => {
+      event.stopPropagation();
+      if (!feature) return;
+      navigateToGeochart({ layerPath: feature.layerPath });
+    },
+    [feature, navigateToGeochart]
+  );
+
+  // #endregion
+
+  /**
+   * Syncs the checked state with the store checkedFeatures.
+   */
+  useEffect(() => {
+    logger.logTraceUseEffect('FEATURE-INFO - checkedFeatures', checkedFeatures);
+
+    if (!feature?.uid) return;
+
+    setChecked(checkedFeatures.some((checkedFeature) => checkedFeature?.uid === feature.uid));
+  }, [checkedFeatures, feature]);
+
+  return (
+    <Paper sx={memoSxClasses.featurePaper}>
+      <FeatureHeader
+        iconSrc={feature.featureIcon}
+        name={memoFeatureName}
+        canHighlight={featureCanHighlight}
+        hasExtent={featureHasExtent}
+        hasGeochart={memoHasGeochart}
+        checked={checked}
+        onCheckChange={handleFeatureChecked}
+        onZoomIn={handleZoomIn}
+        onGeochart={handleGeochart}
+      />
+
+      <Box sx={memoSxClasses.featureInfoListContainer}>
+        <FeatureInfoTable layerPath={feature.layerPath} featureInfoList={memoFeatureInfoList} containerType={containerType} />
+      </Box>
+    </Paper>
+  );
+}

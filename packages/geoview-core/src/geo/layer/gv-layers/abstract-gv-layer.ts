@@ -1,0 +1,2831 @@
+import type { Options } from 'ol/layer/Base';
+import type BaseLayer from 'ol/layer/Base';
+import type { Coordinate } from 'ol/coordinate';
+import type { Pixel } from 'ol/pixel';
+import type { Extent } from 'ol/extent';
+import type Feature from 'ol/Feature';
+import type { Layer } from 'ol/layer';
+import type Source from 'ol/source/Source';
+import TileSource from 'ol/source/Tile';
+import type { Projection as OLProjection } from 'ol/proj';
+import type { Map as OLMap } from 'ol';
+import { getUid } from 'ol';
+
+import type { TemporalMode, TimeDimension, TimeIANA } from '@/core/utils/date-mgt';
+import { DateMgt } from '@/core/utils/date-mgt';
+import { logger } from '@/core/utils/logger';
+import type { EsriDynamicLayerEntryConfig } from '@/api/config/validation-classes/raster-validation-classes/esri-dynamic-layer-entry-config';
+import type { OgcWmsLayerEntryConfig } from '@/api/config/validation-classes/raster-validation-classes/ogc-wms-layer-entry-config';
+import type { VectorLayerEntryConfig } from '@/api/config/validation-classes/vector-layer-entry-config';
+import type { AbstractBaseLayerEntryConfig } from '@/api/config/validation-classes/abstract-base-layer-entry-config';
+import type { EventDelegateBase } from '@/api/events/event-helper';
+import EventHelper from '@/api/events/event-helper';
+import type {
+  TypeLayerStyleConfig,
+  TypeFeatureInfoEntry,
+  TypeLocation,
+  QueryType,
+  TypeStyleGeometry,
+  TypeOutfieldsType,
+  TypeOutfields,
+  TypeLayerStyleSettings,
+  TypeFeatureInfoResult,
+  TypeDisplayLanguage,
+  TypeFieldEntry,
+  TypeDomain,
+} from '@/api/types/map-schema-types';
+import type {
+  TypeLayerMetadataFields,
+  TypeGeoviewLayerType,
+  TypeMetadataEsriDynamicLayer,
+  TypeLegend,
+} from '@/api/types/layer-schema-types';
+import type { GeoViewError } from '@/core/exceptions/geoview-exceptions';
+import { LayerFailedToLoadError, LayerImageFailedToLoadError } from '@/core/exceptions/geoview-exceptions';
+import type { TypeLegendItem } from '@/core/components/layers/types';
+import { GeoviewRenderer, type TypeStyleProcessorOptions } from '@/geo/utils/renderer/geoview-renderer';
+import { AbstractBaseGVLayer, type LayerBaseDelegate, type LayerBaseEvent } from '@/geo/layer/gv-layers/abstract-base-layer';
+import type { SnackbarType } from '@/core/utils/notifications';
+import { formatError, NotImplementedError, NotSupportedError } from '@/core/exceptions/core-exceptions';
+import { LayerNotQueryableError, LayerStatusErrorError, LayerStyleGeometryNotFoundError } from '@/core/exceptions/layer-exceptions';
+import { GVLayerUtilities } from '@/geo/layer/gv-layers/utils';
+import { LayerFilters, type FilterCategory } from '@/geo/layer/gv-layers/layer-filters';
+import { delay, doTimeout, type DelayJob } from '@/core/utils/utilities';
+import type { EsriImageLayerEntryConfig } from '@/api/config/validation-classes/raster-validation-classes/esri-image-layer-entry-config';
+
+/**
+ * Abstract Geoview Layer managing an OpenLayer layer.
+ */
+export abstract class AbstractGVLayer extends AbstractBaseGVLayer {
+  /** The default hit tolerance the query should be using. */
+  static readonly DEFAULT_HIT_TOLERANCE: number = 4;
+
+  /** The default loading period before we show a message to the user about a layer taking a long time to render on map. */
+  static readonly DEFAULT_LOADING_PERIOD: number = 8 * 1000; // 8 seconds
+
+  /** Quiescence period after a tile source change with no tile-load activity before remaining in-flight tiles are treated as orphans and force-closed. */
+  static readonly TILE_LOADING_QUIESCENCE_PERIOD: number = 3 * 1000; // 3 seconds
+
+  /** Keywords used to identify name fields in the layer's outfields when none specified. */
+  static readonly NAME_FIELD_KEYWORDS = [
+    '^name$',
+    '^name_lang$', // GV Here and others, '_lang' suffix is a placeholder to favor the current language of the application
+    '^title$',
+    '^title_lang$',
+    '^label$',
+    '^label_lang$',
+    '^project_name$',
+    '^project_name_lang$',
+    '^display*',
+    '^id$',
+    '^objectid$',
+    '^oid$',
+  ];
+
+  /**
+   * Number of in-flight load operations across all OL source event families (features, image, tile).
+   *
+   * Per OL's lifecycle contract each `*loadstart` is followed by exactly one terminator
+   * (`*loadend` or `*loaderror`), so reconciling on both keeps the count accurate.
+   */
+  #inFlightCount = 0;
+
+  /** Per-wave session id bumped on each 0=>1 transition of `#inFlightCount`; used by the slow-render watcher to detect supersession. */
+  #loadingWaveId = 0;
+
+  /** Quiescence watcher armed after a tile source change; reconciles orphan in-flight tile loads when tile-load activity goes quiet. */
+  #tileSourceQuiescenceJob?: DelayJob;
+
+  /** The OpenLayer source. */
+  #olSource: Source;
+
+  /** The legend as fetched. */
+  #layerLegend?: TypeLegend;
+
+  /** Style to apply to the vector layer. */
+  #layerStyle?: TypeLayerStyleConfig;
+
+  /** The layer filters currently applied on the layer, if any. */
+  #layerFilters: LayerFilters;
+
+  /** Indicates if the layer is currently queryable. */
+  #queryable: boolean;
+
+  /** Indicates if the layer is currently hoverable. */
+  #hoverable: boolean;
+
+  /** Indicates if a message about a tile error has been emitted. */
+  #emittedMessageAboutTileError = false;
+
+  /** Callback delegates for the layer style changed event. */
+  #onLayerStyleChangedHandlers: StyleChangedDelegate[] = [];
+
+  /** Callback delegates for the legend querying event. */
+  #onLegendQueryingHandlers: LegendQueryingDelegate[] = [];
+
+  /** Callback delegates for the legend queried event. */
+  #onLegendQueriedHandlers: LegendQueriedDelegate[] = [];
+
+  /** Callback delegates for the layer filter applied event. */
+  #onLayerFilterAppliedHandlers: LayerFilterAppliedDelegate[] = [];
+
+  /** Callback delegates for the layer first loaded event. */
+  #onLayerFirstLoadedHandlers: LayerBaseDelegate[] = [];
+
+  /** Callback delegates for the layer loading event. */
+  #onLayerLoadingHandlers: LayerBaseDelegate[] = [];
+
+  /** Callback delegates for the layer loaded event. */
+  #onLayerLoadedHandlers: LayerBaseDelegate[] = [];
+
+  /** Callback delegates for the layer error event. */
+  #onLayerErrorHandlers: LayerErrorDelegate[] = [];
+
+  /** Callback delegates for the layer message event. */
+  #onLayerMessageHandlers: LayerMessageDelegate[] = [];
+
+  /** Callback delegates for the layer queryable changed event. */
+  #onLayerQueryableChangedHandlers: LayerQueryableChangedDelegate[] = [];
+
+  /** Callback delegates for the layer hoverable changed event. */
+  #onLayerHoverableChangedHandlers: LayerHoverableChangedDelegate[] = [];
+
+  /** Callback delegates for the layer item visibility changed event. */
+  #onLayerItemVisibilityChangedHandlers: LayerItemVisibilityChangedDelegate[] = [];
+
+  /**
+   * Constructs a GeoView layer to manage an OpenLayer layer.
+   *
+   * @param olSource - The OpenLayer Source
+   * @param layerConfig - The layer configuration
+   */
+  protected constructor(olSource: Source, layerConfig: AbstractBaseLayerEntryConfig) {
+    super(layerConfig);
+    this.#olSource = olSource;
+
+    // Copy the queryable flag, we'll work with this and the config remains static
+    this.#queryable = layerConfig.getInitialSettings()?.states?.queryable ?? true;
+    this.#hoverable = layerConfig.getInitialSettings()?.states?.hoverable ?? true;
+
+    // Create the layer filters object to empty. It'll be initialized properly later via 'initGVLayer' once the object is done being created.
+    this.#layerFilters = new LayerFilters();
+  }
+
+  // #region OVERRIDES
+
+  /**
+   * Gets the data projection of the layer source, either coming from the data itself or as indicated from the metadata.
+   *
+   * @returns The OpenLayers projection of the layer's source data, or undefined if not available
+   */
+  getDataProjection(): OLProjection | undefined {
+    return this.getLayerConfig().getMetadataProjection();
+  }
+
+  /**
+   * Overrides the parent method to return a more specific OpenLayers layer type (covariant return).
+   *
+   * @returns The OpenLayers generic type.
+   */
+  override getOLLayer(): Layer {
+    // Call parent and cast
+    return super.getOLLayer() as Layer;
+  }
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer configuration specific to this layer.
+   */
+  override getLayerConfig(): AbstractBaseLayerEntryConfig {
+    return super.getLayerConfig() as AbstractBaseLayerEntryConfig;
+  }
+
+  /**
+   * Overrides the way the attributions are retrieved.
+   *
+   * @returns The layer attributions
+   */
+  override onGetAttributions(): string[] {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const attributionsAsRead = this.getOLSource().getAttributions()?.({} as any); // This looks very weird, but it's as documented in OpenLayers..
+
+    // Depending on the internal formatting
+    if (!attributionsAsRead) return [];
+    if (typeof attributionsAsRead === 'string') return [attributionsAsRead];
+    return attributionsAsRead;
+  }
+
+  /**
+   * Overrides the refresh function to refresh the layer source.
+   *
+   * @param projection - Optional projection to refresh to
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  override onRefresh(projection: OLProjection | undefined): void {
+    // Refresh the layer source
+    this.getOLSource().refresh();
+  }
+
+  /**
+   * Overrides the way to wait for the layer to be loaded at least once.
+   *
+   * Sync-checks first, then subscribes to the layer-first-loaded and layer-error events. Resolves
+   * when the layer reaches its first loaded state; rejects when the layer enters the `error` state before that.
+   *
+   * @returns A promise that resolves once the layer has been loaded at least once
+   * @throws {LayerStatusErrorError} When the layer enters the `error` state before being loaded
+   */
+  override onWaitForLoadedOnce(): Promise<void> {
+    // Sync check: already loaded once
+    if (this.loadedOnce) return Promise.resolve();
+
+    // The config can reach loaded before this instance's first-loaded flag is observed.
+    // Treat the authoritative config status as already loaded to avoid waiting for an event that has fired.
+    if (this.getLayerStatus() === 'loaded') {
+      this.loadedOnce = true;
+      return Promise.resolve();
+    }
+
+    // Sync check: already in error
+    if (this.getLayerStatus() === 'error') {
+      return Promise.reject(new LayerStatusErrorError(this.getGeoviewLayerId(), this.getLayerName()));
+    }
+
+    // Subscribe to first-loaded and error events; the first to fire settles the promise.
+    // GV The handlers cross-reference each other to cross-unsubscribe, so they must be forward-declared.
+    return new Promise<void>((resolve, reject) => {
+      const loadedHandler: LayerBaseDelegate = (): void => {
+        this.offLayerFirstLoaded(loadedHandler);
+        // eslint-disable-next-line @typescript-eslint/no-use-before-define
+        this.offLayerError(errorHandler);
+        resolve();
+      };
+
+      const errorHandler: LayerErrorDelegate = (): void => {
+        this.offLayerFirstLoaded(loadedHandler);
+        this.offLayerError(errorHandler);
+        reject(new LayerStatusErrorError(this.getGeoviewLayerId(), this.getLayerName()));
+      };
+
+      // Hook on the first loaded and error events to resolve the promise in question
+      this.onLayerFirstLoaded(loadedHandler);
+      this.onLayerError(errorHandler);
+    });
+  }
+
+  /**
+   * Overridable function that gets the extent of an array of features.
+   *
+   * @param objectIds - The IDs of the features to calculate the extent from
+   * @param outProjection - The output projection for the extent
+   * @param outfield - Optional ID field to return for services that require a value in outfields
+   * @returns A promise that resolves with the extent of the features
+   * @throws {NotImplementedError} When the function isn't overridden by the children class
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  protected onGetExtentFromFeatures(objectIds: number[] | string[], outProjection: OLProjection, outfield?: string): Promise<Extent> {
+    // Crash on purpose
+    throw new NotImplementedError(`onGetExtentFromFeatures function not implemented for ${this.getLayerPath()}`);
+  }
+
+  /**
+   * Overridable function that gets the extent of the features currently matching the layer's active filters.
+   *
+   * @param outProjection - The output projection for the extent
+   * @returns A promise that resolves with the extent of the features matching the active filters
+   * @throws {NotImplementedError} When the function isn't overridden by the children class
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  protected onGetExtentFromFilteredFeatures(outProjection: OLProjection): Promise<Extent> {
+    // Crash on purpose
+    throw new NotImplementedError(`onGetExtentFromFilteredFeatures function not implemented for ${this.getLayerPath()}`);
+  }
+
+  /**
+   * Overridable function returning the legend of the layer.
+   *
+   * Returns null when the layerPath specified is not found. If the style property
+   * of the layerConfig object is undefined, the legend property of the object returned will be null.
+   *
+   * @returns A promise that resolves with the legend of the layer or null
+   */
+  async onFetchLegend(): Promise<TypeLegend | null> {
+    try {
+      // Get the style
+      const style = this.getStyle();
+
+      // Redirect
+      return await AbstractGVLayer.createLegendFromStyle(this.getLayerConfig().getSchemaTag(), style);
+    } catch (error: unknown) {
+      // Log
+      logger.logError(error);
+      return null;
+    }
+  }
+
+  /**
+   * Overridable method called when the layer has started to load itself on the map.
+   */
+  protected onLoading(): void {
+    // Redirect
+    this.#processLoading();
+  }
+
+  /**
+   * Overridable method called when the layer has been loaded correctly.
+   *
+   * Fired only on the wave-terminating `*loadend` (i.e. when the in-flight counter transitions back to 0). Intermediate
+   * `*loadend` events while other loads are still in flight are absorbed by the counter and do not call this method.
+   */
+  protected onLoaded(): void {
+    // Redirect
+    this.#processLoaded();
+  }
+
+  /**
+   * Overridable method called when the layer is in error and couldn't be loaded correctly.
+   *
+   * @param error - The error which is being raised
+   */
+  protected onSourceError(error: GeoViewError): void {
+    // Redirect
+    this.#processSourceOrFeaturesError(error);
+  }
+
+  /**
+   * Overridable method called when the layer is in error and couldn't be loaded correctly.
+   *
+   * Fired only on the wave-terminating `featuresloaderror` (i.e. when the in-flight counter transitions back to 0).
+   * Errors arriving while other loads are still in flight are absorbed by the counter and do not reach this method,
+   * which naturally suppresses superseded errors.
+   *
+   * @param error - The error which is being raised
+   */
+  protected onFeaturesLoadError(error: GeoViewError): void {
+    // Redirect
+    this.#processSourceOrFeaturesError(error);
+  }
+
+  /**
+   * Overridable method called when the layer tile image is in error and couldn't be loaded correctly.
+   *
+   * Fired only on the wave-terminating `tileloaderror` (i.e. when the in-flight counter transitions back to 0). Tile
+   * errors arriving mid-burst, while other tiles are still loading, are absorbed by the counter and do not reach this
+   * method - only the error that closes out the wave is reported.
+   *
+   * @param error - The error which is being raised
+   */
+  protected onImageTileLoadError(error: GeoViewError): void {
+    // Redirect
+    this.#processTileLoadError(error);
+  }
+
+  /**
+   * Overridable method called when the layer image is in error and couldn't be loaded correctly.
+   *
+   * Fired only on the wave-terminating `imageloaderror` (i.e. when the in-flight counter transitions back to 0).
+   * Errors arriving while other loads are still in flight are absorbed by the counter and do not reach this method,
+   * which naturally suppresses superseded errors.
+   *
+   * @param error - The error which is being raised
+   */
+  protected onImageLoadError(error: GeoViewError): void {
+    // Redirect
+    this.#processImageLoadError(error);
+  }
+
+  /**
+   * Overridable method called to get a more specific error code for all errors.
+   *
+   * @param event - The event which is being triggered
+   * @returns A LayerFailedToLoadError error
+   */
+  protected onErrorDecipherError(event: Event): GeoViewError {
+    // Try to read an error in the source object
+    // eslint-disable-next-line no-underscore-dangle, @typescript-eslint/no-explicit-any
+    const sourceError = (this.#olSource as any).error_;
+    const error = sourceError ? formatError(sourceError) : undefined;
+
+    // Return a generic error with a cause inside when any was found
+    return new LayerFailedToLoadError(this.getLayerName(), error);
+  }
+
+  /**
+   * Overridable method called to get a more specific error code for image load errors.
+   *
+   * @param event - The event which is being triggered
+   * @returns A LayerImageFailedToLoadError error
+   */
+  protected onImageLoadErrorDecipherError(event: Event): GeoViewError {
+    // Try to read an error in the source object
+    // eslint-disable-next-line no-underscore-dangle, @typescript-eslint/no-explicit-any
+    const sourceError = (this.#olSource as any).error_;
+    const error = sourceError ? formatError(sourceError) : undefined;
+
+    // Return a generic error with a cause inside when any was found
+    return new LayerImageFailedToLoadError(this.getLayerName(), error);
+  }
+
+  /**
+   * Overridable function to get all feature information for all the features stored in the layer.
+   *
+   * @param map - The Map so that we can grab the resolution/projection we want to get features on
+   * @param layerFilters - The layer filters to apply when querying the features
+   * @param language - The display language, used to guess the best name field if `nameField` is not provided
+   * @param abortController - Optional {@link AbortController} to cancel the operation
+   * @returns A promise that resolves with the feature info result
+   * @throws {NotImplementedError} When the function isn't overridden by the children class
+   */
+  protected getAllFeatureInfo(
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    map: OLMap,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    layerFilters: LayerFilters,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    language: TypeDisplayLanguage, // Used if we have to guess the field name for the 'nameField'
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    abortController?: AbortController
+  ): Promise<TypeFeatureInfoResult> {
+    // Crash on purpose
+    throw new NotImplementedError(`getAllFeatureInfo not implemented on layer path ${this.getLayerPath()}`);
+  }
+
+  /**
+   * Overridable function to return of feature information at a given pixel location.
+   *
+   * @param map - The Map where to get Feature Info At Pixel from
+   * @param location - The pixel coordinate that will be used by the query
+   * @param queryGeometry - Whether to include geometry in the query, default is true
+   * @param language - The display language, used to guess the best name field if `nameField` is not provided
+   * @param abortController - Optional {@link AbortController} to cancel the operation
+   * @returns A promise that resolves with the feature info result
+   * @throws {NotImplementedError} When the subclass does not override `getFeatureInfoAtCoordinate` (propagated from `getFeatureInfoAtCoordinate()`)
+   */
+  protected getFeatureInfoAtPixel(
+    map: OLMap,
+    location: Pixel,
+    queryGeometry = true,
+    language: TypeDisplayLanguage, // Used if we have to guess the field name for the 'nameField'
+    abortController: AbortController | undefined = undefined
+  ): Promise<TypeFeatureInfoResult> {
+    // Redirect to getFeatureInfoAtCoordinate
+    return this.getFeatureInfoAtCoordinate(map, map.getCoordinateFromPixel(location), queryGeometry, language, abortController);
+  }
+
+  /**
+   * Overridable function to return of feature information at a given coordinate.
+   *
+   * @param map - The Map where to get Feature Info At Coordinate from
+   * @param location - The coordinate that will be used by the query
+   * @param queryGeometry - Whether to include geometry in the query, default is true
+   * @param language - The display language, used to guess the best name field if `nameField` is not provided
+   * @param abortController - Optional {@link AbortController} to cancel the operation
+   * @returns A promise that resolves with the feature info result
+   * @throws {NotImplementedError} When the function isn't overridden by the children class
+   */
+  protected getFeatureInfoAtCoordinate(
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    map: OLMap,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    location: Coordinate,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    queryGeometry = true,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    language: TypeDisplayLanguage, // Used if we have to guess the field name for the 'nameField'
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    abortController: AbortController | undefined = undefined
+  ): Promise<TypeFeatureInfoResult> {
+    // Crash on purpose
+    throw new NotImplementedError(`getFeatureInfoAtCoordinate not implemented on layer path ${this.getLayerPath()}`);
+  }
+
+  /**
+   * Overridable function to return of feature information at the provided long lat coordinate.
+   *
+   * @param map - The Map where to get Feature Info At LonLat from
+   * @param lonlat - The coordinate that will be used by the query
+   * @param queryGeometry - Whether to include geometry in the query, default is true
+   * @param language - The display language, used to guess the best name field if `nameField` is not provided
+   * @param abortController - Optional {@link AbortController} to cancel the operation
+   * @returns A promise that resolves with the feature info result
+   * @throws {NotImplementedError} When the function isn't overridden by the children class
+   */
+  protected getFeatureInfoAtLonLat(
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    map: OLMap,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    lonlat: Coordinate,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    queryGeometry = true,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    language: TypeDisplayLanguage, // Used if we have to guess the field name for the 'nameField'
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    abortController: AbortController | undefined = undefined
+  ): Promise<TypeFeatureInfoResult> {
+    // Crash on purpose
+    throw new NotImplementedError(`getFeatureInfoAtLonLat not implemented on layer path ${this.getLayerPath()}`);
+  }
+
+  /**
+   * Overridable function to return of feature information at the provided bounding box.
+   *
+   * @param map - The Map where to get Feature using BBox from
+   * @param location - The bounding box that will be used by the query
+   * @param queryGeometry - Whether to include geometry in the query, default is true
+   * @param language - The display language, used to guess the best name field if `nameField` is not provided
+   * @param abortController - Optional {@link AbortController} to cancel the operation
+   * @returns A promise that resolves with the feature info result
+   * @throws {NotImplementedError} When the function isn't overridden by the children class
+   */
+  protected getFeatureInfoUsingBBox(
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    map: OLMap,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    location: Coordinate[],
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    queryGeometry = true,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    language: TypeDisplayLanguage, // Used if we have to guess the field name for the 'nameField'
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    abortController: AbortController | undefined = undefined
+  ): Promise<TypeFeatureInfoResult> {
+    // Crash on purpose
+    throw new NotImplementedError(`getFeatureInfoUsingBBox not implemented on layer path ${this.getLayerPath()}`);
+  }
+
+  /**
+   * Overridable function to return of feature information at the provided polygon.
+   *
+   * @param map - The Map where to get Feature Info using Polygon from
+   * @param location - The polygon that will be used by the query
+   * @param queryGeometry - Whether to include geometry in the query, default is true
+   * @param language - The display language, used to guess the best name field if `nameField` is not provided
+   * @param abortController - Optional {@link AbortController} to cancel the operation
+   * @returns A promise that resolves with the feature info result
+   * @throws {NotImplementedError} When the function isn't overridden by the children class
+   */
+  protected getFeatureInfoUsingPolygon(
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    map: OLMap,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    location: Coordinate[],
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    queryGeometry = true,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    language: TypeDisplayLanguage, // Used if we have to guess the field name for the 'nameField'
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    abortController: AbortController | undefined = undefined
+  ): Promise<TypeFeatureInfoResult> {
+    // Crash on purpose
+    throw new NotImplementedError(`getFeatureInfoUsingPolygon not implemented on layer path ${this.getLayerPath()}`);
+  }
+
+  /**
+   * Overridable function set the style according to the fetched legend information.
+   *
+   * @param legend - The fetched legend information
+   */
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this, @typescript-eslint/no-unused-vars
+  onSetStyleAccordingToLegend(legend: TypeLegend): void {
+    // By default, nothing to do here, check for overrides in children classes
+  }
+
+  /**
+   * Overridable function to apply a view filter on the current layer.
+   *
+   * @param filter - Optional elaborate layer filters to be used
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars, @typescript-eslint/class-methods-use-this
+  protected onSetLayerFilters(filter?: LayerFilters): void {
+    // Override this to set the filters on the layer
+  }
+
+  // #endregion OVERRIDES
+
+  // #region PUBLIC METHODS
+
+  /**
+   * Initializes the GVLayer.
+   *
+   * Applies the initial layer filters, wires the OpenLayers source event listeners that drive the loading lifecycle
+   * (start/end shared across features/image/tile families plus one handler per error family), registers the source
+   * `change` listener to surface fatal source errors, and patches the renderer to guard against null-context errors.
+   */
+  init(): void {
+    // Set the layer filters right away for the initial view
+    this.#setLayerFiltersInitial(this.getLayerConfig().getLayerFilter());
+    this.#setLayerFiltersClass();
+
+    // Activation of the load start/end/error listeners. Per OL's contract each *loadstart is followed by exactly one
+    // terminator (*loadend or *loaderror), so start/end share a single counter-based handler and the error handlers
+    // reconcile that same counter.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (this.#olSource as any).on(['featuresloadstart', 'imageloadstart', 'tileloadstart'], this.#handleLoadStart.bind(this));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (this.#olSource as any).on(['featuresloadend', 'imageloadend', 'tileloadend'], this.#handleLoadEnd.bind(this));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (this.#olSource as any).on(['featuresloaderror'], this.#handleFeaturesLoadError.bind(this));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (this.#olSource as any).on(['imageloaderror'], this.#handleImageLoadError.bind(this));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (this.#olSource as any).on(['tileloaderror'], this.#handleTileLoadError.bind(this));
+
+    // Activate source change listener to catch error
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (this.#olSource as any).on('change', this.#handleSourceChange.bind(this));
+
+    // Apply render error handling to prevent "Cannot read properties of null (reading 'globalAlpha')" errors
+    AbstractGVLayer.#addRenderErrorHandling(this.getOLLayer());
+  }
+
+  /**
+   * Gets the OpenLayers Layer Source.
+   *
+   * @returns The OpenLayers Layer Source
+   */
+  protected getOLSource(): Source {
+    return this.#olSource;
+  }
+
+  /**
+   * Gets the hit tolerance associated with the layer.
+   *
+   * @returns The hit tolerance
+   */
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this
+  getHitTolerance(): number {
+    return AbstractGVLayer.DEFAULT_HIT_TOLERANCE;
+  }
+
+  /**
+   * Gets the legend associated with the layer.
+   *
+   * @returns The layer legend
+   */
+  getLegend(): TypeLegend | undefined {
+    return this.#layerLegend;
+  }
+
+  /**
+   * Sets the legend associated with the layer.
+   *
+   * @param legend - The layer legend
+   */
+  setLegend(legend: TypeLegend): void {
+    this.#layerLegend = legend;
+  }
+
+  /**
+   * Gets the layer style.
+   *
+   * @returns The layer style
+   */
+  getStyle(): TypeLayerStyleConfig | undefined {
+    return this.#layerStyle ?? this.getLayerConfig().getLayerStyle();
+  }
+
+  /**
+   * Sets the layer style.
+   *
+   * @param style - The layer style
+   */
+  setStyle(style: TypeLayerStyleConfig): void {
+    this.#layerStyle = style;
+    this.#emitLayerStyleChanged({ style });
+  }
+
+  /**
+   * Gets the style item visibility on the layer.
+   *
+   * @param item - The style item whose visibility to retrieve
+   * @returns The visibility of the style item
+   */
+  getStyleItemVisibility(item: TypeLegendItem): boolean {
+    // Get the style config
+    const geometryStyleConfig = this.getStyle()![item.geometryType];
+
+    // Get all styles with the label matching the name of the clicked item
+    const styleInfos = geometryStyleConfig?.info.filter((styleInfo) => styleInfo.label === item.name);
+    const styleInfosVisible = styleInfos?.filter((styleInfo) => styleInfo.visible ?? false);
+
+    // Return if all visible
+    return styleInfosVisible?.length === styleInfos?.length;
+  }
+
+  /**
+   * Updates the visibility of a style item on the layer and triggers a re-render.
+   *
+   * This method mutates the layer's style configuration for the specified legend
+   * item, calls `changed()` on the underlying OpenLayers layer to schedule a new
+   * render, and optionally waits for the next render cycle to complete.
+   *
+   * @param item - The legend/style item whose visibility will be updated
+   * @param visible - Whether the style item should be visible
+   * @param waitForRender - When `true`, waits for the next layer render to complete before resolving
+   * @returns A promise that resolves after the visibility has been
+   * updated and, if requested, the layer has finished rendering
+   * @throws {LayerStyleGeometryNotFoundError} When the geometry type of the item doesn't match any geometry type in the layer style configuration
+   */
+  async setStyleItemVisibility(item: TypeLegendItem, visible: boolean, waitForRender: boolean): Promise<void> {
+    // Apply the visibility mutation using the same item-matching semantics as batch updates.
+    this.#setStyleItemVisibilityInternal(item, visible);
+
+    // Also refresh the filter class, this will force a re-render of the layer source (this is required if there are classes)
+    this.#setLayerFiltersClass();
+
+    // Emit about it
+    this.#emitLayerItemVisibilityChanged({ item, visible });
+
+    // If waiting for the render to complete
+    if (waitForRender) {
+      // Wait for the render to complete
+      await this.waitForRender();
+    }
+  }
+
+  /**
+   * Updates the visibility of all style items on the layer and triggers a single re-render.
+   *
+   * This method walks the layer style configuration directly, updates every unique legend item
+   * visibility in one batch, refreshes the class filter once, and optionally waits for the next
+   * render cycle. It intentionally does not emit per-item visibility events because callers use
+   * the returned changed items list to synchronize UI/store state as a single batch.
+   *
+   * @param visible - Whether all style items should be visible
+   * @param waitForRender - When `true`, waits for the next layer render to complete before resolving
+   * @returns A promise that resolves with the legend items whose visibility actually changed
+   */
+  async setAllStyleItemsVisibility(visible: boolean, waitForRender: boolean): Promise<TypeLegendItem[]> {
+    // Work against the effective style (runtime override when present, config fallback otherwise).
+    const styleConfig = this.getStyle();
+    // Return payload consumed by callers (domain/controller) to synchronize store/UI in one pass.
+    const changedItems: TypeLegendItem[] = [];
+    // De-duplicate by geometry+label so a repeated style entry is toggled and reported only once.
+    const seenKeys = new Set<string>();
+
+    // No style means nothing to mutate; optional render wait keeps API behavior consistent.
+    if (!styleConfig) {
+      if (waitForRender) await this.waitForRender();
+      return changedItems;
+    }
+
+    Object.entries(styleConfig).forEach(([geometryType, geometryStyleConfig]) => {
+      geometryStyleConfig?.info.forEach((styleInfo) => {
+        const { label } = styleInfo;
+        // Style entries without labels are not representable as legend items, skip them.
+        if (!label) return;
+
+        // Match identity semantics used by the legend: one item per geometry type + label pair.
+        const itemKey = `${geometryType}/${label}`;
+
+        if (seenKeys.has(itemKey)) return;
+
+        const item: TypeLegendItem = {
+          geometryType: geometryType as TypeStyleGeometry,
+          name: label,
+          isVisible: visible,
+          icon: null,
+        };
+
+        // Reuse the single-item mutation path so batch and non-batch behavior stay aligned.
+        if (this.#setStyleItemVisibilityInternal(item, visible)) {
+          // Report only items that truly changed state.
+          changedItems.push(item);
+        }
+
+        seenKeys.add(itemKey);
+      });
+    });
+
+    // Recompute class filter once after all mutations to avoid repeated re-renders during batch updates.
+    this.#setLayerFiltersClass();
+
+    if (waitForRender) {
+      await this.waitForRender();
+    }
+
+    return changedItems;
+  }
+
+  /**
+   * Builds and returns a filter expression derived from the layer's style configuration.
+   *
+   * This method delegates the filter extraction logic to {@link GeoviewRenderer.getFilterFromStyle},
+   * using the current layer configuration (outfields, style, and style settings).
+   *
+   * @returns A filter expression string if one can be derived from the style,
+   * or `undefined` if no filter applies.
+   */
+  getFilterFromStyle(): string | undefined {
+    // Redirect
+    return GeoviewRenderer.getFilterFromStyle(
+      this.getLayerConfig().getOutfields(),
+      this.getStyle(),
+      this.getLayerConfig().getLayerStyleSettings()
+    );
+  }
+
+  /**
+   * Gets the effective temporal dimension associated with the layer.
+   *
+   * When the layer participates in a QGIS group dimension, the parent group's temporal dimension takes precedence.
+   * Otherwise, the temporal dimension configured directly on the layer is returned.
+   *
+   * @returns The effective temporal dimension, or undefined when none is configured
+   */
+  getTimeDimension(): TimeDimension | undefined {
+    // If the layer is part of a QGIS group dimension, return the time dimension of the group
+    if (this.getLayerConfig().getTimeDimension()?.isGroupDimension) {
+      // Return the time dimension of the parent group
+      return this.getLayerConfig().getTimeDimensionFavoringGroup();
+    }
+
+    // Default
+    return this.getLayerConfig().getTimeDimension();
+  }
+
+  /**
+   * Gets the flag if layer use its time dimension, this can be use to exclude layers from time function like time slider.
+   *
+   * @returns The flag indicating if the layer should be included in time awareness functions such as the Time Slider. True by default.
+   */
+  getIsTimeAware(): boolean {
+    return this.getLayerConfig().getGeoviewLayerConfig()?.isTimeAware ?? true;
+  }
+
+  /**
+   * Indicates if the layer is currently queryable.
+   *
+   * @returns The currently queryable flag.
+   */
+  getQueryable(): boolean {
+    return this.#queryable;
+  }
+
+  /**
+   * Sets if the layer is currently queryable.
+   *
+   * @param queryable - The queryable value
+   * @throws {LayerNotQueryableError} When the underlying source is not queryable
+   */
+  setQueryable(queryable: boolean): void {
+    // Get the layer config
+    const layerConfig = this.getLayerConfig();
+
+    // If the source is not queryable
+    if (!layerConfig.getQueryableSourceDefaulted()) throw new LayerNotQueryableError(layerConfig.layerPath, this.getLayerName());
+
+    // Go for it
+    this.#queryable = queryable;
+    this.#emitLayerQueryableChanged({ queryable });
+  }
+
+  /**
+   * Indicates if the layer is currently hoverable.
+   *
+   * @returns The currently hoverable flag.
+   */
+  getHoverable(): boolean {
+    return this.#hoverable;
+  }
+
+  /**
+   * Sets if the layer is currently hoverable.
+   *
+   * @param hoverable - The hoverable value
+   */
+  setHoverable(hoverable: boolean): void {
+    // Go for it
+    this.#hoverable = hoverable;
+    this.#emitLayerHoverableChanged({ hoverable });
+  }
+
+  /**
+   * Gets the extent of an array of features.
+   *
+   * @param objectIds - The IDs of the features to calculate the extent from
+   * @param outProjection - The output projection for the extent
+   * @param outfield - Optional ID field to return for services that require a value in outfields
+   * @returns A promise that resolves to the extent of the features, if available
+   * @throws {NotImplementedError} When the subclass does not override `onGetExtentFromFeatures` (propagated from `onGetExtentFromFeatures()`)
+   */
+  getExtentFromFeatures(objectIds: number[] | string[], outProjection: OLProjection, outfield?: string): Promise<Extent> {
+    // Redirect
+    return this.onGetExtentFromFeatures(objectIds, outProjection, outfield);
+  }
+
+  /**
+   * Gets the extent of the features currently matching the layer's active filters.
+   *
+   * @param outProjection - The output projection for the extent
+   * @returns A promise that resolves to the extent of the features matching the active filters, if available
+   * @throws {NotImplementedError} When the subclass does not override `onGetExtentFromFilteredFeatures` (propagated from `onGetExtentFromFilteredFeatures()`)
+   */
+  getExtentFromFilteredFeatures(outProjection: OLProjection): Promise<Extent> {
+    // Redirect
+    return this.onGetExtentFromFilteredFeatures(outProjection);
+  }
+
+  /**
+   * Gets the layer filters associated to the layer.
+   *
+   * @returns The layer filters associated to the layer.
+   */
+  getLayerFilters(): LayerFilters {
+    // Return it
+    return this.#layerFilters;
+  }
+
+  /**
+   * Sets the data filter on the layer.
+   *
+   * This function only updates the data filter query string inside the layer filters object.
+   * The active filter applied on the layer will update accordingly, however, the UI component elements themselves won't update.
+   *
+   * @param dataFilterQueryString - Optional data filter expression to apply
+   */
+  setLayerFiltersData(dataFilterQueryString: string | undefined): void {
+    // TODO: REFACTOR FILTERS - We should probably replace this function with a public-facing one which filters using time properties (other than
+    // TO.DOCONT: a single query string) which raises an event on the domain to update which updates the UI accordingly.
+    // TO.DOCONT: This would be more user-friendly and less error prone than having to create the query string outside
+    // TO.DOCONT: of the layer and then set it here, which requires the user to know the exact syntax of the query string
+    // TO.DOCONT: to apply a data filter on the layer. In order to be able to update the UI based on a query, more information than a single
+    // TO.DOCONT: query string would have to get carried. Search id: 0ecb948f
+    // Get the current layer filter
+    const curLayerFilter = this.getLayerFilters();
+
+    // Set it
+    curLayerFilter.setDataFilter(dataFilterQueryString);
+
+    // Redirect
+    this.#setLayerFilters(curLayerFilter, 'data');
+  }
+
+  /**
+   * Sets the time filter on the layer.
+   *
+   * This function only updates the time filter query string inside the layer filters object.
+   * The active filter applied on the layer will update accordingly, however, the UI component elements themselves won't update.
+   *
+   * @param timeFilterQueryString - Optional time filter expression to apply
+   */
+  setLayerFiltersTime(timeFilterQueryString: string | undefined): void {
+    // TODO: REFACTOR FILTERS - We should probably replace this function with a public-facing one which filters using time properties (other than
+    // TO.DOCONT: a single query string) which raises an event on the domain to update which updates the UI accordingly.
+    // TO.DOCONT: This would be more user-friendly and less error prone than having to create the query string outside
+    // TO.DOCONT: of the layer and then set it here, which requires the user to know the exact syntax of the query string
+    // TO.DOCONT: to apply a time filter on the layer. In order to be able to update the UI based on a query, more information than a single
+    // TO.DOCONT: query string would have to get carried. Search id: 0ecb948f
+    // Get the current layer filter
+    const curLayerFilter = this.getLayerFilters();
+
+    // Set it
+    curLayerFilter.setTimeFilter(timeFilterQueryString);
+
+    // Redirect
+    this.#setLayerFilters(curLayerFilter, 'time');
+  }
+
+  /**
+   * Sets the panel filter on the layer.
+   *
+   * This function only updates the panel filter query string inside the layer filters object.
+   * The active filter applied on the layer will update accordingly, however, the UI component elements themselves won't update.
+   *
+   * @param panelFilterQueryString - Optional panel filter expression to apply
+   */
+  setLayerFiltersPanel(panelFilterQueryString: string | undefined): void {
+    // Get the current layer filter
+    const curLayerFilter = this.getLayerFilters();
+
+    // Set it
+    curLayerFilter.setPanelFilter(panelFilterQueryString);
+
+    // Redirect
+    this.#setLayerFilters(curLayerFilter, 'panel');
+  }
+
+  /**
+   * Applies a time filter on a date range.
+   *
+   * This function only updates the time filter query string inside the layer filters object.
+   * The active filter applied on the layer will update accordingly, however, the UI component elements themselves won't update.
+   *
+   * @param date1 - The start date
+   * @param date2 - The end date
+   * @deprecated This method should be removed in favor of setLayerFiltersTime so that future enhancements regarding time filtering
+   * and UI synchronization can be made.
+   */
+  setLayerFiltersDate(date1: string, date2: string): void {
+    // Get the time dimension field
+    const { field } = this.getTimeDimension()!;
+
+    // Tweak the current layer filters to modify the time filter (create a new layer filters if none currently exists)
+    const layerFilters = this.getLayerFilters();
+    layerFilters.setTimeFilter(`${field} >= date '${date1}' and ${field} <= date '${date2}'`);
+
+    // Redirect
+    this.#setLayerFilters(layerFilters, 'time');
+  }
+
+  /**
+   * Returns feature information for the layer specified.
+   *
+   * @param map - The Map to get feature info from
+   * @param queryType - The type of query to perform
+   * @param location - A pixel, coordinate or polygon that will be used by the query
+   * @param queryGeometry - Whether to include geometry in the query, default is true
+   * @param language - The display language, used to guess the best name field if `nameField` is not provided
+   * @param abortController - Optional {@link AbortController} to cancel the operation
+   * @returns A promise that resolves with the feature info result
+   * @throws {NotSupportedError} When `queryType` is not one of the supported query types
+   * @throws {NotImplementedError} When the subclass does not override the underlying `get*FeatureInfo*` method for the requested `queryType` (propagated from the dispatched method)
+   */
+  async getFeatureInfo(
+    map: OLMap,
+    queryType: QueryType,
+    location: TypeLocation,
+    queryGeometry = true,
+    language: TypeDisplayLanguage, // Used if we have to guess the field name for the 'nameField'
+    abortController: AbortController | undefined = undefined
+  ): Promise<TypeFeatureInfoResult> {
+    // Log
+    logger.logTraceCore('ABSTRACT-GV-LAYERS - getFeatureInfo', queryType);
+    const logMarkerKey = `${queryType}`;
+    logger.logMarkerStart(logMarkerKey);
+
+    let promiseGetFeature: Promise<TypeFeatureInfoResult>;
+    switch (queryType) {
+      case 'all': {
+        // Create the filter on the initial filter only, get everything else.
+        const layerFilters = new LayerFilters(this.getLayerFilters().getInitialFilter());
+
+        // Get all feature info
+        promiseGetFeature = this.getAllFeatureInfo(map, layerFilters, language, abortController);
+        break;
+      }
+      case 'at_pixel':
+        promiseGetFeature = this.getFeatureInfoAtPixel(map, location as Pixel, queryGeometry, language, abortController);
+        break;
+      case 'at_coordinate':
+        promiseGetFeature = this.getFeatureInfoAtCoordinate(map, location as Coordinate, queryGeometry, language, abortController);
+        break;
+      case 'at_lon_lat':
+        promiseGetFeature = this.getFeatureInfoAtLonLat(map, location as Coordinate, queryGeometry, language, abortController);
+        break;
+      case 'using_a_bounding_box':
+        promiseGetFeature = this.getFeatureInfoUsingBBox(map, location as Coordinate[], queryGeometry, language, abortController);
+        break;
+      case 'using_a_polygon':
+        promiseGetFeature = this.getFeatureInfoUsingPolygon(map, location as Coordinate[], queryGeometry, language, abortController);
+        break;
+      default:
+        // Not implemented
+        throw new NotSupportedError(`Unsupported query type '${queryType}'`);
+    }
+
+    // Wait for results
+    const arrayOfFeatureInfoEntries = await promiseGetFeature;
+
+    // If not aborted
+    if (!abortController?.signal.aborted) {
+      // Log
+      logger.logMarkerCheck(logMarkerKey, `to getFeatureInfo on ${this.getLayerPath()}`, arrayOfFeatureInfoEntries);
+    }
+
+    // Return the result
+    return arrayOfFeatureInfoEntries;
+  }
+
+  /**
+   * Queries the legend.
+   *
+   * This function raises legend querying and queried events. It calls the overridable onFetchLegend() function.
+   *
+   * @returns A promise that resolves with the legend or null
+   */
+  queryLegend(): Promise<TypeLegend | null> {
+    // Emit that the legend has been queried
+    this.#emitLegendQuerying();
+
+    // Fetch the legend by calling the overridable function
+    const promiseLegend = this.onFetchLegend();
+
+    // Whenever the promise resolves
+    promiseLegend
+      .then((legend) => {
+        // If legend was received
+        if (legend) {
+          // Set the legend
+          this.setLegend(legend);
+          // Save the style according to the legend
+          this.onSetStyleAccordingToLegend(legend);
+          // Emit legend information once retrieved
+          this.#emitLegendQueried({ legend });
+        }
+      })
+      .catch((error: unknown) => {
+        // Log
+        logger.logPromiseFailed('promiseLegend in queryLegend in AbstractGVLayer', error);
+      });
+
+    // Return the promise
+    return promiseLegend;
+  }
+
+  /**
+   * Waits until the underlying OpenLayers source reaches the `ready` state.
+   *
+   * If the source is already ready, the returned promise resolves immediately.
+   * If the source enters the `error` state, the promise is rejected.
+   *
+   * @returns A promise that resolves when the source state becomes
+   * `ready`, or rejects if the source enters the `error` state
+   */
+  waitForSourceReady(): Promise<void> {
+    // Return a promise when the source is ready
+    return new Promise((resolve, reject) => {
+      const state = this.#olSource.getState();
+
+      if (state === 'ready') {
+        resolve();
+        return;
+      }
+
+      if (state === 'error') {
+        reject(new Error('Source failed to load'));
+        return;
+      }
+
+      const onChange = (): void => {
+        const newState = this.#olSource.getState();
+
+        if (newState === 'ready') {
+          this.#olSource.un('change', onChange);
+          resolve();
+        } else if (newState === 'error') {
+          this.#olSource.un('change', onChange);
+          reject(new Error('Source failed to load'));
+        }
+      };
+
+      // Register handler when the source changes
+      this.#olSource.on('change', onChange);
+    });
+  }
+
+  /**
+   * Waits for the next render cycle of the underlying OpenLayers layer to complete.
+   *
+   * Resolves the returned promise after the layer emits a `postrender` event,
+   * indicating that it has finished rendering for a frame.
+   *
+   * @returns A promise that resolves after the layer has rendered at least once
+   */
+  waitForRender(): Promise<void> {
+    return new Promise((resolve) => {
+      this.getOLLayer().once('postrender', () => resolve());
+    });
+  }
+
+  /**
+   * Utility function allowing to wait for the layer status to become `loaded`.
+   *
+   * Sync-checks first, then subscribes to the layer-loaded and layer-error events. Resolves
+   * when the layer reaches the `loaded` state; rejects when the layer enters the `error` state first.
+   *
+   * @returns A promise that resolves once the layer status is `loaded`
+   * @throws {LayerStatusErrorError} When the layer enters the `error` state before reaching `loaded`
+   */
+  waitForLoadedStatus(): Promise<void> {
+    // Sync check: already loaded
+    if (this.getLayerStatus() === 'loaded') return Promise.resolve();
+
+    // Sync check: already in error
+    if (this.getLayerStatus() === 'error') {
+      return Promise.reject(new LayerStatusErrorError(this.getGeoviewLayerId(), this.getLayerName()));
+    }
+
+    // Subscribe to loaded and error events; the first to fire settles the promise.
+    // GV The handlers cross-reference each other to cross-unsubscribe, so they must be forward-declared.
+    return new Promise<void>((resolve, reject) => {
+      const loadedHandler: LayerBaseDelegate = (): void => {
+        this.offLayerLoaded(loadedHandler);
+        // eslint-disable-next-line @typescript-eslint/no-use-before-define
+        this.offLayerError(errorHandler);
+        resolve();
+      };
+
+      const errorHandler: LayerErrorDelegate = (): void => {
+        this.offLayerLoaded(loadedHandler);
+        this.offLayerError(errorHandler);
+        reject(new LayerStatusErrorError(this.getGeoviewLayerId(), this.getLayerName()));
+      };
+
+      // Hook on the loaded and error events to resolve the promise in question
+      this.onLayerLoaded(loadedHandler);
+      this.onLayerError(errorHandler);
+    });
+  }
+
+  /**
+   * Utility function allowing to wait for the layer legend to be queried.
+   *
+   * Sync-checks first, then subscribes to the legend-changed and layer-error events. Resolves
+   * when the legend becomes available; rejects when the layer enters the `error` state first.
+   *
+   * @returns A promise that resolves once the layer legend has been queried
+   * @throws {LayerStatusErrorError} When the layer enters the `error` state before the legend is queried
+   */
+  waitForLegendQueried(): Promise<void> {
+    // Sync check: legend already queried
+    if (this.getLegend()) return Promise.resolve();
+
+    // Sync check: already in error
+    if (this.getLayerStatus() === 'error') {
+      return Promise.reject(new LayerStatusErrorError(this.getGeoviewLayerId(), this.getLayerName()));
+    }
+
+    // Subscribe to legend-changed and layer-error events; the first to fire settles the promise.
+    // GV The handlers cross-reference each other to cross-unsubscribe, so they must be forward-declared.
+    return new Promise<void>((resolve, reject) => {
+      const legendHandler: LegendChangedDelegate = (sender, event): void => {
+        // Only settle if the event payload actually carries a legend; otherwise keep waiting for the next change
+        if (!event.legend) return;
+
+        this.offLegendQueried(legendHandler);
+        // eslint-disable-next-line @typescript-eslint/no-use-before-define
+        this.offLayerError(errorHandler);
+        resolve();
+      };
+
+      const errorHandler: LayerErrorDelegate = (): void => {
+        this.offLegendQueried(legendHandler);
+        this.offLayerError(errorHandler);
+        reject(new LayerStatusErrorError(this.getGeoviewLayerId(), this.getLayerName()));
+      };
+
+      // Hook on the legend-changed and error events to resolve the promise in question
+      this.onLegendQueried(legendHandler);
+      this.onLayerError(errorHandler);
+    });
+  }
+
+  // #endregion PUBLIC METHODS
+
+  // #region PROTECTED METHODS
+
+  /**
+   * Formats a list of features into an array of TypeFeatureInfoEntry, including icons, field values, domains, and metadata.
+   *
+   * @param features - Array of features to format
+   * @param layerConfig - Configuration of the associated layer
+   * @param language - The display language, used to guess the best name field if `nameField` is not provided
+   * @param includeNoStyleFeatures - Whether to include features that have no matching style (no icon generated)
+   * @param serviceDateFormat - Optional date format used by the service
+   * @param serviceDateIANA - Optional IANA time zone identifier used by the service
+   * @param serviceDateTemporalMode - Optional temporal mode for date handling
+   * @returns An array of TypeFeatureInfoEntry objects
+   */
+  protected formatFeatureInfoResult(
+    features: Feature[],
+    layerConfig: OgcWmsLayerEntryConfig | EsriDynamicLayerEntryConfig | EsriImageLayerEntryConfig | VectorLayerEntryConfig,
+    language: TypeDisplayLanguage,
+    includeNoStyleFeatures: boolean,
+    serviceDateFormat: string | undefined,
+    serviceDateIANA: string | undefined,
+    serviceDateTemporalMode: TemporalMode | undefined
+  ): TypeFeatureInfoEntry[] {
+    // Get the layer metadata
+    const layerMetadata = layerConfig.getLayerMetadata();
+
+    // Cast to the EsriDynamic version to check for domains lookup
+    const layerMetadataEsriDynamicLayer = layerMetadata as TypeMetadataEsriDynamicLayer;
+
+    // Get the fields from metadata if any
+    const domainsLookup = layerMetadataEsriDynamicLayer?.fields;
+
+    // Find the best name field and validate its existance at the same time when one was initially configured
+    const nameField = AbstractGVLayer.findBestNameField(layerConfig.getNameField(), layerConfig.getOutfields(), language);
+
+    // Redirect
+    return AbstractGVLayer.helperFormatFeatureInfoResult(
+      features,
+      layerConfig.layerPath,
+      layerConfig.getSchemaTag(),
+      nameField,
+      layerConfig.getOutfields(),
+      true,
+      domainsLookup,
+      this.getStyle(),
+      includeNoStyleFeatures,
+      serviceDateFormat,
+      serviceDateIANA,
+      serviceDateTemporalMode,
+      AbstractGVLayer.helperGetFieldValue
+    );
+  }
+
+  /**
+   * Emits a layer-specific message event with localization support.
+   *
+   * @param messageKey - The key used to lookup the localized message OR message
+   * @param messageParams - Array of parameters to be interpolated into the localized message
+   * @param messageType - The message type
+   * @param notificationMessageKey - Optional separate key for the notification panel; when set, the snackbar keeps the detailed `messageKey` while the panel groups this generic message
+   * @param notificationMessageParams - Optional parameters for the separate notification-panel message
+   *
+   * @example
+   * this.emitMessage(
+   *   'layers.fetchProgress',
+   *   ['50', '100'],
+   *   'error',
+   * );
+   */
+  protected emitMessage(
+    messageKey: string,
+    messageParams: Record<string, unknown> | undefined,
+    messageType: SnackbarType = 'info',
+    notificationMessageKey?: string,
+    notificationMessageParams?: Record<string, unknown>
+  ): void {
+    this.#emitLayerMessage({ messageKey, messageParams, messageType, notificationMessageKey, notificationMessageParams });
+  }
+
+  // #endregion PROTECTED METHODS
+
+  // #region PRIVATE METHODS
+
+  /**
+   * Handles when an OL source signals that a load operation has started (features, image, or tile).
+   *
+   * Bumps the in-flight counter and, on the 0=>1 transition, opens a new loading wave: increments the wave id, starts the
+   * slow-render watcher tied to that wave snapshot, and calls the overridable `onLoading()`.
+   */
+  #handleLoadStart(): void {
+    // Keep the log line commented, for debugging
+    // logger.logDebug('handleLoadStart', this.getLayerPath(), this.#inFlightCount);
+
+    // First load in flight => open a new loading wave
+    if (this.#inFlightCount === 0) {
+      this.#loadingWaveId++;
+      const waveSnapshot = this.#loadingWaveId;
+      this.#startLoadingPeriodWatcher(() => this.#loadingWaveId === waveSnapshot);
+      this.onLoading();
+    }
+    this.#inFlightCount++;
+
+    // Activity => re-arm the tile-source quiescence watcher if armed (no-op when not armed, i.e. non-tile sources)
+    this.#rearmTileSourceQuiescenceWatcher();
+  }
+
+  /**
+   * Handles when an OL source signals that a load operation has ended successfully (features, image, or tile).
+   *
+   * Decrements the in-flight counter and, only on the 1=>0 transition, calls the overridable `onLoaded()`. Intermediate
+   * `*loadend` events while other loads are still in flight are absorbed silently.
+   */
+  #handleLoadEnd(): void {
+    // Keep the log line commented, for debugging
+    // logger.logDebug('handleLoadEnd', this.getLayerPath(), this.#inFlightCount);
+
+    // Per OL contract, featuresloadend/imageloadend/tileloadend is a terminator like featuresloaderror/imageloaderror/tileloaderror => reconcile to keep the counter accurate for future waves
+    const wasLast = this.#decrementInFlight();
+
+    // Activity => re-arm the tile-source quiescence watcher if armed (or cancel if the wave is now closed)
+    if (wasLast) this.#cancelTileSourceQuiescenceWatcher();
+    else this.#rearmTileSourceQuiescenceWatcher();
+
+    if (!wasLast) return;
+
+    // Last load settled => the wave is complete
+    this.onLoaded();
+  }
+
+  /**
+   * Handles when the layer features failed to load.
+   *
+   * Reconciles the in-flight counter (errors are terminators per the OL contract). The overridable `onFeaturesLoadError`
+   * is fired only on the 1=>0 transition; errors arriving while other loads are still in flight are absorbed silently,
+   * which naturally suppresses superseded errors and lets the wave-terminating event decide the layer's final state.
+   *
+   * @param event - The event which is being triggered
+   */
+  #handleFeaturesLoadError(event: Event): void {
+    // Keep the log line commented, for debugging
+    // logger.logDebug('handleFeaturesLoadError', this.getLayerPath(), this.#inFlightCount);
+
+    // Log
+    logger.logError(`An error happened on the layer: ${this.getLayerPath()} after it was processed and added on the map.`, event);
+
+    // Per OL contract, featuresloaderror is a terminator like featuresloadend => reconcile to keep the counter accurate for future waves
+    const wasLast = this.#decrementInFlight();
+
+    // Activity => re-arm the tile-source quiescence watcher if armed (or cancel if the wave is now closed)
+    if (wasLast) this.#cancelTileSourceQuiescenceWatcher();
+    else this.#rearmTileSourceQuiescenceWatcher();
+
+    if (!wasLast) return;
+
+    // Decipher the error, allowing children classes to be more specific
+    const gvError = this.onErrorDecipherError(event);
+
+    // Call overridable method
+    this.onFeaturesLoadError(gvError);
+  }
+
+  /**
+   * Handles when the layer image failed to load.
+   *
+   * Reconciles the in-flight counter (errors are terminators per the OL contract). The overridable `onImageLoadError`
+   * is fired only on the 1=>0 transition; errors arriving while other loads are still in flight are absorbed silently,
+   * which naturally suppresses superseded errors and lets the wave-terminating event decide the layer's final state.
+   *
+   * @param event - The event which is being triggered
+   */
+  #handleImageLoadError(event: Event): void {
+    // Keep the log line commented, for debugging
+    // logger.logDebug('handleImageLoadError', this.getLayerPath(), this.#inFlightCount);
+
+    // Log
+    logger.logError(`Error loading source image for layer: ${this.getLayerPath()}.`, event);
+
+    // Per OL contract, imageloaderror is a terminator like imageloadend => reconcile to keep the counter accurate for future waves
+    const wasLast = this.#decrementInFlight();
+
+    // Activity => re-arm the tile-source quiescence watcher if armed (or cancel if the wave is now closed)
+    if (wasLast) this.#cancelTileSourceQuiescenceWatcher();
+    else this.#rearmTileSourceQuiescenceWatcher();
+
+    if (!wasLast) return;
+
+    // Decipher the error, allowing children classes to be more specific (ex: WMS GetMap specific errors)
+    const gvError = this.onImageLoadErrorDecipherError(event);
+
+    // Call overridable method
+    this.onImageLoadError(gvError);
+  }
+
+  /**
+   * Handles when a layer tile failed to load.
+   *
+   * Reconciles the in-flight counter (errors are terminators per the OL contract). The overridable `onImageTileLoadError`
+   * is fired only on the 1=>0 transition; per-tile errors that arrive while other tiles are still loading are absorbed
+   * silently - only the error that closes out the wave is reported. The handler does not call `onLoaded()`; status
+   * remains unchanged because `#processTileLoadError` treats tile errors as non-fatal for the layer.
+   *
+   * @param event - The event which is being triggered
+   */
+  #handleTileLoadError(event: Event): void {
+    // Keep the log line commented, for debugging
+    // logger.logDebug('handleTileLoadError', this.getLayerPath(), this.#inFlightCount);
+
+    // Log
+    logger.logWarning(`A tile couldn't be loaded on the layer: ${this.getLayerPath()}.`, event);
+
+    // Per OL contract, tileloaderror is a terminator like tileloadend => reconcile and, if last in flight, mark loaded
+    const wasLast = this.#decrementInFlight();
+
+    // Activity => re-arm the tile-source quiescence watcher if armed (or cancel if the wave is now closed)
+    if (wasLast) this.#cancelTileSourceQuiescenceWatcher();
+    else this.#rearmTileSourceQuiescenceWatcher();
+
+    if (!wasLast) return;
+
+    // Decipher the error, allowing children classes to be more specific
+    const gvError = this.onErrorDecipherError(event);
+
+    // Call overridable method
+    this.onImageTileLoadError(gvError);
+  }
+
+  /**
+   * Decrements the in-flight load counter, clamped at zero.
+   *
+   * @returns True when this decrement transitioned the counter to zero (i.e. this terminator was the last in-flight load)
+   */
+  #decrementInFlight(): boolean {
+    if (this.#inFlightCount === 0) return false;
+    this.#inFlightCount--;
+    return this.#inFlightCount === 0;
+  }
+
+  /**
+   * Handles a `change` event from the OL source: surfaces source errors and, for tile sources only, arms the
+   * orphan-load reconciliation watcher.
+   *
+   * Why tile-source-only? OL silently abandons in-flight tile loads when the tile grid is recomputed (e.g. on a
+   * projection switch) - those tiles never fire `tileloadend`/`tileloaderror`, so the in-flight counter would leak
+   * forever and the layer would stay stuck in `loading`. The other source families do not have this leak window:
+   *  - `VectorSource` fires `change` from `addFeatures()` mid-load, so arming on every change would clobber the
+   *    counter; vector loads always reach a terminator (`featuresloadend`/`featuresloaderror`) on their own.
+   *  - `ImageSource` (WMS/ArcGISRest/Static) only ever has one request in flight at a time and replaces it cleanly
+   *    on source mutation, so the leak window does not occur in practice.
+   *
+   * Reconciliation strategy: arm a quiescence watcher (see `#armTileSourceQuiescenceWatcher`). We cannot reset the
+   * counter eagerly because at source-change time the count may already include the new wave's `tileloadstart` events
+   * that fired synchronously between the projection switch and this source `change` event - wiping them out would
+   * leave their terminators clamped at zero in `#decrementInFlight` and the wave would never reach `onLoaded()`.
+   * Instead we wait for tile-load activity to genuinely settle; whatever is still in flight at that point is
+   * guaranteed orphan.
+   *
+   * @param event - The event which is being triggered
+   */
+  #handleSourceChange(event: Event): void {
+    // Keep the log line commented, for debugging
+    // logger.logDebug('handleSourceChange', this.getLayerPath(), this.#inFlightCount);
+
+    // Get the source state
+    const state = this.#olSource.getState();
+
+    if (state === 'error') {
+      // Decipher the error, allowing children classes to be more specific
+      const gvError = this.onErrorDecipherError(event);
+
+      // Call overridable method
+      this.onSourceError(gvError);
+      return;
+    }
+
+    // Tile sources are the only family that needs orphan-load reconciliation (see JSDoc for the per-source-type rationale)
+    if (this.#olSource instanceof TileSource) {
+      this.#armTileSourceQuiescenceWatcher();
+    }
+  }
+
+  /**
+   * Arms a tile-source quiescence watcher that fires after `TILE_LOADING_QUIESCENCE_PERIOD` ms of no tile-load activity.
+   *
+   * Only ever invoked from `#handleSourceChange` after a `TileSource` mutation. Any prior watcher is cancelled and
+   * replaced. The watcher is re-armed by every `*loadstart`/`*loadend`/`*loaderror` (see
+   * `#rearmTileSourceQuiescenceWatcher`), so as long as OL is actively loading tiles the timer keeps sliding forward.
+   * When it finally fires, tile-load activity has been quiet for the full period: if `#inFlightCount > 0` at that
+   * point, those remaining loads are orphans from the pre-mutation tile source and we force-close the wave.
+   */
+  #armTileSourceQuiescenceWatcher(): void {
+    this.#tileSourceQuiescenceJob?.cancel();
+    const job = doTimeout(AbstractGVLayer.TILE_LOADING_QUIESCENCE_PERIOD);
+    this.#tileSourceQuiescenceJob = job;
+    job.promise
+      .then((result) => {
+        // If this job is no longer the active one, a newer arm superseded us; bail out
+        if (this.#tileSourceQuiescenceJob !== job) return;
+        // Only the natural 'timeout' result indicates true quiescence; 'cancelled' means we were re-armed or stopped
+        if (result !== 'timeout') return;
+        this.#tileSourceQuiescenceJob = undefined;
+        if (this.#inFlightCount === 0) return;
+        logger.logDebug('handleSourceChange quiescence - discarding phantom loads', this.getLayerPath(), this.#inFlightCount);
+        this.#inFlightCount = 0;
+        this.#loadingWaveId++;
+        this.onLoaded();
+      })
+      .catch((error: unknown) => logger.logPromiseFailed('Quiescence watcher in #armTileSourceQuiescenceWatcher failed', error));
+  }
+
+  /**
+   * Re-arms the tile-source quiescence watcher if it is currently armed.
+   *
+   * Called from every load activity handler (`#handleLoadStart`, `#handleLoadEnd`, `#handleFeaturesLoadError`,
+   * `#handleImageLoadError`, `#handleTileLoadError`) so that ongoing tile loads keep the timer alive. No-op when no
+   * watcher is armed - which is the normal case for non-tile sources and for tile sources outside a source-change
+   * window - so the cost stays negligible during regular loading waves.
+   */
+  #rearmTileSourceQuiescenceWatcher(): void {
+    if (!this.#tileSourceQuiescenceJob) return;
+    this.#armTileSourceQuiescenceWatcher();
+  }
+
+  /**
+   * Cancels the tile-source quiescence watcher if armed.
+   *
+   * Called from `#handleLoadEnd`, `#handleFeaturesLoadError`, `#handleImageLoadError`, and `#handleTileLoadError`
+   * when the in-flight counter naturally reaches zero. At that point the wave closed cleanly and no orphan
+   * reconciliation is needed.
+   */
+  #cancelTileSourceQuiescenceWatcher(): void {
+    this.#tileSourceQuiescenceJob?.cancel();
+    this.#tileSourceQuiescenceJob = undefined;
+  }
+
+  /**
+   * Drives the side-effects of a layer loading transition: flips the layer config status to `loading`, cascades that
+   * status to the parent group (if any), and emits the layer loading event.
+   */
+  #processLoading(): void {
+    // Get the layer config
+    const layerConfig = this.getLayerConfig();
+
+    // Set the layer has loading
+    layerConfig.setLayerStatusLoading(true);
+
+    // Emit event for all layer load events
+    this.#emitLayerLoading();
+  }
+
+  /**
+   * Drives the side-effects of a layer loaded transition: flips the layer config status to `loaded`, cascades to the
+   * parent group, performs first-load-only setup (basemap z-index, initial visibility, first-loaded event), and emits
+   * the layer loaded event.
+   */
+  #processLoaded(): void {
+    // Get the layer config
+    const layerConfig = this.getLayerConfig();
+
+    // Set the layer config status to loaded to keep mirroring the AbstractGeoViewLayer for now
+    layerConfig.setLayerStatusLoaded(true);
+
+    // If first time
+    if (!this.loadedOnce) {
+      // If it's a basemap layer, put it at the bottom of the stack to avoid any issue with layers order on map.
+      if (layerConfig.getGeoviewLayerConfig().useAsBasemap === true) this.getOLLayer().setZIndex(-1);
+      // Now that the layer is loaded, set its visibility correctly (had to be done in the loaded event, not before, per prior note in pre-refactor)
+      this.setVisible(layerConfig.getInitialSettings()?.states?.visible ?? true); // default: true
+
+      // Emit event for the first time the layer got loaded
+      this.#emitLayerFirstLoaded();
+    }
+
+    // Flag
+    this.loadedOnce = true;
+
+    // Emit event for all layer load events
+    this.#emitLayerLoaded();
+  }
+
+  /**
+   * Drives the side-effects of a fatal source or features load error: flips the layer config status to `error` (once,
+   * to avoid spamming), cascades to the parent group, surfaces a user-facing message, and emits the layer error event.
+   *
+   * @param error - The deciphered error to propagate
+   */
+  #processSourceOrFeaturesError(error: GeoViewError): void {
+    // Check the layer status before
+    const layerStatusBefore = this.getLayerConfig().layerStatus;
+
+    // If we were not error before
+    if (layerStatusBefore !== 'error') {
+      // Set the layer config status to error to keep mirroring the AbstractGeoViewLayer for now
+      this.getLayerConfig().setLayerStatusError(true);
+
+      // Emits a user-facing error message
+      this.emitMessage(error.messageKey, error.messageParams, 'error');
+    } else {
+      // We've already emitted an error to the user about the layer being in error, skip so that we don't spam
+    }
+
+    // Emit event for all layer error events
+    this.#emitLayerError({ error });
+  }
+
+  /**
+   * Drives the side-effects of a non-fatal tile load error: only emits the layer error event without flipping the
+   * layer status, since tile errors are recoverable (other tiles can still render).
+   *
+   * @param error - The deciphered error to propagate
+   */
+  #processTileLoadError(error: GeoViewError): void {
+    // Check the layer status before
+    const layerStatusBefore = this.getLayerConfig().layerStatus;
+
+    // If we were not error before
+    if (layerStatusBefore !== 'error') {
+      // If loaded once already
+      if (this.loadedOnce) {
+        // Tile errors are non-fatal => at this point it was the last tile in flight, we can process the layer as loaded
+        // GV For example, Circompolar view, we don't want a error to pop for the user all the time
+        this.#processLoaded();
+      } else {
+        // Never got loaded, ever
+        // GV For example, a service that is reachable, but fails to return actual tiles on the map
+
+        // Set the layer config status to error to keep mirroring the AbstractGeoViewLayer for now
+        this.getLayerConfig().setLayerStatusError(true);
+
+        // If we never warned the user about a tile issue for that layer, warn them once
+        if (!this.#emittedMessageAboutTileError) {
+          // Flag
+          this.#emittedMessageAboutTileError = true;
+
+          // Emits a user-facing error message
+          this.emitMessage(error.messageKey, error.messageParams, 'error');
+        }
+      }
+    }
+
+    // Emit event for all layer error events
+    this.#emitLayerError({ error });
+  }
+
+  /**
+   * Drives the side-effects of a fatal image load error: flips the layer config status to `error` (once, to avoid
+   * spamming), cascades to the parent group, surfaces a user-facing message, and emits the layer error event.
+   *
+   * @param error - The deciphered error to propagate
+   */
+  #processImageLoadError(error: GeoViewError): void {
+    // Check the layer status before
+    const layerStatusBefore = this.getLayerConfig().layerStatus;
+
+    // If we were not error before
+    if (layerStatusBefore !== 'error') {
+      // Set the layer config status to error to keep mirroring the AbstractGeoViewLayer for now
+      this.getLayerConfig().setLayerStatusError(true);
+
+      // Emits a user-facing error message
+      this.emitMessage(error.messageKey, error.messageParams, 'error');
+    } else {
+      // We've already emitted an error to the user about the layer being in error, skip so that we don't spam
+    }
+
+    // Emit event for all layer error events
+    this.#emitLayerError({ error });
+  }
+
+  /**
+   * Monitors the loading status of a layer.
+   *
+   * After `DEFAULT_LOADING_PERIOD` milliseconds, it checks whether the layer is still loading. If so, it emits a warning
+   * message indicating that the rendering is taking longer than expected. The interval stops automatically when the layer
+   * finishes loading or encounters an error, or when the loading wave that started this watcher is superseded.
+   *
+   * @param isStillCurrentWave - Predicate returning true while the loading wave that started this watcher is still the
+   *                             most recent one for the layer
+   */
+  #startLoadingPeriodWatcher(isStillCurrentWave: () => boolean): void {
+    delay(AbstractGVLayer.DEFAULT_LOADING_PERIOD).then(
+      () => {
+        // This is the right interval that we want to be checking the layer status
+        const { layerStatus } = this.getLayerConfig();
+
+        // If the wave that started this watcher has been superseded, we're on a stale timer
+        if (!isStillCurrentWave()) return true;
+
+        // If loaded or error, we're done
+        if (layerStatus === 'loaded' || layerStatus === 'error') return true;
+
+        // If still loading
+        if (layerStatus === 'loading') {
+          // Emits a user-facing error message
+          this.emitMessage('warning.layer.slowRender', { layerName: this.getLayerName() }, 'warning');
+        }
+
+        return false;
+      },
+      (error: unknown) => logger.logPromiseFailed('Delay in #startLoadingPeriodWatcher failed', error)
+    );
+  }
+
+  /**
+   * Sets the initial filter on the layer, which is the base filter that will be applied on the layer and
+   * combined with the other filters (class, data, time) when they get set.
+   *
+   * @param initialFilter - Optional initial filter expression to apply on the layer, this is the filter that
+   * will be combined with the other filters (class, data, time) when they get set. It can be used to set a
+   * fixed filter on the layer that will always be applied and combined with the other filters.
+   * If not provided, it will just keep the current initial filter on the layer (which can be empty if it was never set before).
+   */
+  #setLayerFiltersInitial(initialFilter: string | undefined): void {
+    // Get the current layer filter
+    const curLayerFilter = this.getLayerFilters();
+
+    // Set it
+    curLayerFilter.setInitialFilter(initialFilter);
+
+    // Redirect
+    this.#setLayerFilters(curLayerFilter, 'initial');
+  }
+
+  /**
+   * Updates a single style item's visibility in the layer style configuration.
+   *
+   * Matches the same legend-item semantics used by the controller path: geometry type first,
+   * then all style infos whose label matches the item name.
+   *
+   * @param item - The legend/style item whose visibility will be updated
+   * @param visible - Whether the style item should be visible
+   * @returns Whether at least one matched style entry changed visibility
+   * @throws {LayerStyleGeometryNotFoundError} When the geometry type of the item doesn't match any geometry type in the layer style configuration
+   */
+  #setStyleItemVisibilityInternal(item: TypeLegendItem, visible: boolean): boolean {
+    // First constrain the lookup by geometry bucket; mismatched geometry is considered a configuration error.
+    const geometryStyleConfig = this.getStyle()?.[item.geometryType];
+
+    if (!geometryStyleConfig) throw new LayerStyleGeometryNotFoundError(this.getLayerName(), item.geometryType);
+
+    // Within the geometry bucket, all style infos sharing the legend label represent the same logical item.
+    const styleInfos = geometryStyleConfig.info.filter((styleInfo) => styleInfo.label === item.name);
+    // Preserve legacy semantics: missing visibility defaults to true, so toggling to true may be a no-op.
+    const didChange = styleInfos.some((styleInfo) => (styleInfo.visible ?? true) !== visible);
+
+    styleInfos.forEach((styleInfo) => {
+      // Mutate in place because style config objects are shared with renderer/filter derivation.
+      // eslint-disable-next-line no-param-reassign
+      styleInfo.visible = visible;
+    });
+
+    return didChange;
+  }
+
+  /**
+   * Sets the class filter on the layer, derived from the current style configuration.
+   *
+   * This function only updates the class filter query string inside the layer filters object.
+   * The active filter applied on the layer, on the map, will update accordingly, however, the UI component elements themselves won't update.
+   * Consider using the setStyleItemVisibility function to change a class filter to benefit from a better UI interaction.
+   *
+   * @param classFilter - Optional class filter expression to apply. Defaults to the filter derived from the current style.
+   */
+  #setLayerFiltersClass(classFilter: string | undefined = this.getFilterFromStyle()): void {
+    // Get the current layer filter
+    const curLayerFilter = this.getLayerFilters();
+
+    // Set it
+    curLayerFilter.setClassFilter(classFilter);
+
+    // Redirect
+    this.#setLayerFilters(curLayerFilter, 'class');
+  }
+
+  /**
+   * Sets the layer filters associated to the layer.
+   *
+   * @param layerFilters - The layer filters to apply
+   * @param filterCategoryChanged - The filter category that changed
+   */
+  #setLayerFilters(layerFilters: LayerFilters, filterCategoryChanged: FilterCategory): void {
+    // Keep it
+    this.#layerFilters = layerFilters;
+
+    // Redirect
+    this.onSetLayerFilters(layerFilters);
+
+    // Refresh
+    this.getOLLayer().changed();
+
+    // Emit event
+    this.#emitLayerFilterApplied({
+      filter: layerFilters,
+      filterCategory: filterCategoryChanged,
+    });
+  }
+
+  // #endregion PRIVATE METHODS
+
+  // #region EVENTS
+
+  /**
+   * Emits an event to all handlers.
+   *
+   * @param event - The event to emit
+   */
+  #emitLegendQuerying(): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLegendQueryingHandlers, {});
+  }
+
+  /**
+   * Registers a legend querying event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The registered callback for potential unregistration
+   */
+  onLegendQuerying(callback: LegendQueryingDelegate): LegendQueryingDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLegendQueryingHandlers, callback);
+  }
+
+  /**
+   * Unregisters a legend querying event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLegendQuerying(callback: LegendQueryingDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLegendQueryingHandlers, callback);
+  }
+
+  /**
+   * Emits an event to all handlers.
+   *
+   * @param event - The event to emit
+   */
+  #emitLegendQueried(event: LegendQueriedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLegendQueriedHandlers, event);
+  }
+
+  /**
+   * Registers a legend queried event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The registered callback for potential unregistration
+   */
+  onLegendQueried(callback: LegendQueriedDelegate): LegendQueriedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLegendQueriedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a legend queried event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLegendQueried(callback: LegendQueriedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLegendQueriedHandlers, callback);
+  }
+
+  /**
+   * Emits an event to all handlers.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerStyleChanged(event: StyleChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerStyleChangedHandlers, event);
+  }
+
+  /**
+   * Returns a promise that resolves the next time the layer style changed event fires.
+   *
+   * @param filter - Optional filter predicate. When provided, only events passing the filter resolve the promise
+   * @returns A promise that resolves with the style changed event payload
+   */
+  onceLayerStyleChanged(filter?: (event: StyleChangedEvent) => boolean): Promise<StyleChangedEvent> {
+    // Register a one-shot event handler that resolves a promise
+    return EventHelper.onceEventPromise(this.#onLayerStyleChangedHandlers, filter);
+  }
+
+  /**
+   * Registers a layer style changed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The registered callback for potential unregistration
+   */
+  onLayerStyleChanged(callback: StyleChangedDelegate): StyleChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerStyleChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer style changed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerStyleChanged(callback: StyleChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerStyleChangedHandlers, callback);
+  }
+
+  /**
+   * Emits filter applied event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerFilterApplied(event: LayerFilterAppliedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerFilterAppliedHandlers, event);
+  }
+
+  /**
+   * Registers a filter applied event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The registered callback for potential unregistration
+   */
+  onLayerFilterApplied(callback: LayerFilterAppliedDelegate): LayerFilterAppliedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerFilterAppliedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a filter applied event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerFilterApplied(callback: LayerFilterAppliedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerFilterAppliedHandlers, callback);
+  }
+
+  /**
+   * Emits an event to all handlers when a layer have been first loaded on the map.
+   */
+  #emitLayerFirstLoaded(): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerFirstLoadedHandlers, {});
+  }
+
+  /**
+   * Returns a promise that resolves the next time the layer first loaded event fires.
+   *
+   * @param filter - Optional filter predicate. When provided, only events passing the filter resolve the promise
+   * @returns A promise that resolves with the layer base event payload
+   */
+  onceLayerFirstLoaded(filter?: (event: LayerBaseEvent) => boolean): Promise<LayerBaseEvent> {
+    // Register a one-shot event handler that resolves a promise
+    return EventHelper.onceEventPromise(this.#onLayerFirstLoadedHandlers, filter);
+  }
+
+  /**
+   * Registers when a layer have been first loaded on the map event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The registered callback for potential unregistration
+   */
+  onLayerFirstLoaded(callback: LayerBaseDelegate): LayerBaseDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerFirstLoadedHandlers, callback);
+  }
+
+  /**
+   * Unregisters when a layer have been first loaded on the map event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerFirstLoaded(callback: LayerBaseDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerFirstLoadedHandlers, callback);
+  }
+
+  /**
+   * Emits an event to all handlers when a layer is turning into a loading stage on the map.
+   */
+  #emitLayerLoading(): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerLoadingHandlers, {});
+  }
+
+  /**
+   * Registers when a layer is turning into a loading stage event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The registered callback for potential unregistration
+   */
+  onLayerLoading(callback: LayerBaseDelegate): LayerBaseDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerLoadingHandlers, callback);
+  }
+
+  /**
+   * Unregisters when a layer is turning into a loading stage event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerLoading(callback: LayerBaseDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerLoadingHandlers, callback);
+  }
+
+  /**
+   * Emits an event to all handlers when a layer is turning into a loaded stage on the map.
+   */
+  #emitLayerLoaded(): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerLoadedHandlers, {});
+  }
+
+  /**
+   * Registers when a layer is turning into a loaded stage event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The registered callback for potential unregistration
+   */
+  onLayerLoaded(callback: LayerBaseDelegate): LayerBaseDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerLoadedHandlers, callback);
+  }
+
+  /**
+   * Unregisters when a layer is turning into a loaded stage event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerLoaded(callback: LayerBaseDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerLoadedHandlers, callback);
+  }
+
+  /**
+   * Emits an event to all handlers when a layer is turning into an error stage on the map.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerError(event: LayerErrorEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerErrorHandlers, event);
+  }
+
+  /**
+   * Returns a promise that resolves the next time the layer error event fires.
+   *
+   * @param filter - Optional filter predicate. When provided, only events passing the filter resolve the promise
+   * @returns A promise that resolves with the layer error event payload
+   */
+  onceLayerError(filter?: (event: LayerErrorEvent) => boolean): Promise<LayerErrorEvent> {
+    // Register a one-shot event handler that resolves a promise
+    return EventHelper.onceEventPromise(this.#onLayerErrorHandlers, filter);
+  }
+
+  /**
+   * Registers when a layer is turning into a error stage event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The registered callback for potential unregistration
+   */
+  onLayerError(callback: LayerErrorDelegate): LayerErrorDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerErrorHandlers, callback);
+  }
+
+  /**
+   * Unregisters when a layer is turning into a error stage event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerError(callback: LayerErrorDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerErrorHandlers, callback);
+  }
+
+  /**
+   * Emits an event to all handlers when the layer's sent a message.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerMessage(event: LayerMessageEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerMessageHandlers, event);
+  }
+
+  /**
+   * Registers a layer message event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The registered callback for potential unregistration
+   */
+  onLayerMessage(callback: LayerMessageDelegate): LayerMessageDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerMessageHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer message event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerMessage(callback: LayerMessageDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerMessageHandlers, callback);
+  }
+
+  /**
+   * Emits queryable changed event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerQueryableChanged(event: LayerQueryableChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerQueryableChangedHandlers, event);
+  }
+
+  /**
+   * Registers an queryable changed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The registered callback for potential unregistration
+   */
+  onLayerQueryableChanged(callback: LayerQueryableChangedDelegate): LayerQueryableChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerQueryableChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters an queryable changed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerQueryableChanged(callback: LayerQueryableChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerQueryableChangedHandlers, callback);
+  }
+
+  /**
+   * Emits hoverable changed event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerHoverableChanged(event: LayerHoverableChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerHoverableChangedHandlers, event);
+  }
+
+  /**
+   * Registers an hoverable changed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The registered callback for potential unregistration
+   */
+  onLayerHoverableChanged(callback: LayerHoverableChangedDelegate): LayerHoverableChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerHoverableChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters an hoverable changed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerHoverableChanged(callback: LayerHoverableChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerHoverableChangedHandlers, callback);
+  }
+
+  /**
+   * Emits layer item visibility toggled event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerItemVisibilityChanged(event: LayerItemVisibilityChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerItemVisibilityChangedHandlers, event);
+  }
+
+  /**
+   * Registers a layer item visibility toggled event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The registered callback for potential unregistration
+   */
+  onLayerItemVisibilityChanged(callback: LayerItemVisibilityChangedDelegate): LayerItemVisibilityChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerItemVisibilityChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer item visibility changed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerItemVisibilityChanged(callback: LayerItemVisibilityChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerItemVisibilityChangedHandlers, callback);
+  }
+
+  // #endregion EVENTS
+
+  // #region STATIC METHODS
+
+  /**
+   * Initializes common properties on a layer options.
+   *
+   * @param layerOptions - The layer options to initialize
+   * @param layerConfig - The config to read the initial settings from
+   */
+  protected static initOptionsWithInitialSettings(layerOptions: Options, layerConfig: AbstractBaseLayerEntryConfig): void {
+    // GV Note: The visible flag (and maybe others?) must be set in the 'onLoaded' function below, because the layer needs to
+    // GV attempt to be visible on the map in order to trigger its source loaded event.
+
+    // Set the layer options as read from the initialSettings
+    // GV We disable the warnings, because this function purpose is to actually initialize the given parameter
+
+    // If a className is defined in the initial settings, set it in the layer options
+    // eslint-disable-next-line no-param-reassign
+    if (layerConfig.getInitialSettingsClassName() !== undefined) layerOptions.className = layerConfig.getInitialSettingsClassName();
+
+    // If an extent is defined in the initial settings, set it in the layer options
+    // eslint-disable-next-line no-param-reassign
+    if (layerConfig.getInitialSettingsExtent() !== undefined) layerOptions.extent = layerConfig.getInitialSettingsExtent();
+
+    // If an opacity is defined in the initial settings, set it in the layer options
+    if (layerConfig.getInitialSettings()?.states?.opacity !== undefined)
+      // eslint-disable-next-line no-param-reassign
+      layerOptions.opacity = layerConfig.getInitialSettings()?.states!.opacity;
+  }
+
+  /**
+   * Finds the best field to use as a name field by searching for common name-like field patterns.
+   *
+   * Searches field names for predefined keywords (name, title, label) in priority order.
+   * Supports both outfields arrays and field info dictionaries keyed by field name.
+   * If no keyword match is found, returns the first available field name as a fallback.
+   *
+   * @param nameField - Optional provided name field to validate and use first
+   * @param outfields - Outfields array or field info dictionary to search
+   * @param lang - The display language used to resolve `_lang` placeholders in keyword patterns
+   * @returns The name of the best matching field, or undefined if no fields available
+   */
+  static findBestNameField(
+    nameField: string | undefined,
+    outfields: TypeOutfields[] | Partial<Record<string, TypeFieldEntry>> | undefined = [],
+    lang: TypeDisplayLanguage = 'en'
+  ): string | undefined {
+    // Normalize to a simple list of field names regardless of input shape.
+    const fieldNames = Array.isArray(outfields)
+      ? outfields.map((field) => field.name)
+      : Object.keys(outfields).filter((key) => outfields[key] !== undefined);
+
+    if (!fieldNames.length) return undefined;
+
+    // If a nameField was provided, only keep it when it actually exists in the outfields.
+    const validProvidedNameField = nameField && fieldNames.includes(nameField) ? nameField : undefined;
+    if (validProvidedNameField) return validProvidedNameField;
+
+    const languagePriority: TypeDisplayLanguage[] = [
+      lang,
+      ...(['en', 'fr'] as TypeDisplayLanguage[]).filter((language) => language !== lang),
+    ];
+
+    // Try to find a field matching name keywords in priority order.
+    // For _lang keywords, try the requested language first, then the alternate language.
+    const resolvedNameField = this.NAME_FIELD_KEYWORDS.reduce<string | undefined>((found, keyword) => {
+      if (found) return found;
+
+      const resolvedKeywords = keyword.includes('_lang')
+        ? languagePriority.map((language) => keyword.replace('_lang', `_${language}`))
+        : [keyword];
+
+      return resolvedKeywords.reduce<string | undefined>((matchedFieldName, resolvedKeyword) => {
+        if (matchedFieldName) return matchedFieldName;
+        return fieldNames.find((fieldName) => new RegExp(resolvedKeyword, 'i').test(fieldName));
+      }, undefined);
+    }, undefined);
+
+    // Return the matched field name, or fall back to the first field.
+    return resolvedNameField ?? fieldNames[0];
+  }
+
+  /**
+   * Adds error handling to a layer's render function to prevent globalAlpha errors
+   * that can occur during layer rendering, especially when highlighting layers while others are still loading.
+   *
+   * This patches the OpenLayers renderer to safely handle cases where the canvas context is not yet available.
+   *
+   * @param layer - The OpenLayers layer to patch
+   */
+  static #addRenderErrorHandling(layer: BaseLayer): void {
+    // Use type assertion to access internal getRenderer method
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const layerWithRenderer = layer as BaseLayer & { getRenderer?: () => any };
+    if (!layerWithRenderer || typeof layerWithRenderer.getRenderer !== 'function') return;
+
+    const renderer = layerWithRenderer.getRenderer();
+    if (!renderer || typeof renderer.renderDeferredInternal !== 'function') return;
+
+    const originalRenderFunction = renderer.renderDeferredInternal;
+
+    renderer.renderDeferredInternal = function renderDeferredInternalPatched(...args: unknown[]) {
+      try {
+        // If the renderer is not ready yet, skip rendering
+        if (!this.context || !this.context.canvas) {
+          // Skip rendering but don't throw an error
+          return false;
+        }
+
+        // Context exists, proceed with original rendering
+        return originalRenderFunction.apply(this, args);
+      } catch (error: unknown) {
+        logger.logError('Vector layer rendering error:', error);
+
+        // Attempt recovery by requesting a new frame
+        requestAnimationFrame(() => this.changed());
+        return false; // Return false instead of undefined
+      }
+    };
+  }
+
+  /**
+   * Creates a legend object based on a given GeoView layer type and style configuration.
+   *
+   * This method builds a legend representation by combining the provided style settings
+   * with the computed legend symbols retrieved from the renderer. It is asynchronous
+   * because it waits for `GeoviewRenderer.getLegendStyles` to generate the legend items.
+   *
+   * @param schemaTag - The GeoView layer type identifier (e.g., vector, raster, etc.)
+   * @param style - Optional style configuration mapping geometry types to their style settings
+   * @returns A promise that resolves with a legend object containing type, styleConfig, and legend entries
+   */
+  static async createLegendFromStyle(
+    schemaTag: TypeGeoviewLayerType,
+    style: Partial<Record<TypeStyleGeometry, TypeLayerStyleSettings>> | undefined
+  ): Promise<TypeLegend> {
+    return {
+      type: schemaTag,
+      styleConfig: style,
+      legend: await GeoviewRenderer.getLegendStyles(style),
+    };
+  }
+
+  /**
+   * Retrieves or generates an image source (data URI or path) representing the visual style of a feature.
+   *
+   * Caches results in the `imageSourceDict` to avoid redundant processing.
+   *
+   * @param feature - The feature whose visual representation is to be retrieved
+   * @param layerStyle - Style configuration grouped by geometry type (e.g., Point, LineString, Polygon)
+   * @param domainsLookup - Optional domain information for interpreting coded values
+   * @param aliasLookup - A mapping of original field names to their aliases
+   * @param imageSourceDict - A dictionary used to cache and reuse image sources by style key
+   * @returns The image source string representing the feature's style, or undefined when generation fails
+   */
+  static getFeatureIconSource(
+    feature: Feature,
+    layerStyle: TypeLayerStyleConfig,
+    domainsLookup: TypeLayerMetadataFields[] | undefined,
+    aliasLookup: Record<string, string>,
+    imageSourceDict: Record<string, string | undefined>
+  ): string | undefined {
+    // Read the simplified geometry type, favoring the feature itself
+    const geometryType = GeoviewRenderer.readGeometryTypeSimplifiedFromFeature(feature, layerStyle);
+
+    // If no style for the geometry type
+    if (!layerStyle[geometryType]) {
+      // No style
+      return undefined;
+    }
+
+    // Read the style settings
+    const styleSettings = layerStyle[geometryType];
+    const { type } = styleSettings;
+
+    // No filter equation, because we want the icon even if technically the feature would be filtered out
+    const filterEquation = undefined;
+
+    // Bypass the class visibility, because we want the icon even if technically the feature class visibility is not visible
+    const bypassVisibility = true;
+
+    // Create the options to process the style
+    const options: TypeStyleProcessorOptions = {
+      filterEquation,
+      bypassVisibility,
+      domainsLookup,
+      aliasLookup,
+    };
+
+    // Process the feature style
+    const featureStyle = GeoviewRenderer.processStyle[type][geometryType](styleSettings, feature, options);
+
+    // If no feature style generated
+    if (!featureStyle) {
+      // No style
+      return undefined;
+    }
+
+    // Clone the style
+    const styleClone = featureStyle.clone();
+    styleClone.setGeometry('');
+    const styleKey = `${geometryType}${JSON.stringify(styleClone)}`;
+
+    if (!imageSourceDict[styleKey]) {
+      // eslint-disable-next-line no-param-reassign
+      imageSourceDict[styleKey] = GeoviewRenderer.getFeatureIconSource(featureStyle, geometryType, styleSettings);
+    }
+
+    // Return the style
+    return imageSourceDict[styleKey];
+  }
+
+  /**
+   * Formats a set of OpenLayers features into a structured array of feature info entries.
+   *
+   * Each feature is enriched with geometry, extent, field information, and optional styling.
+   * Will not throw; errors are caught and logged. Returns an empty array if processing fails.
+   *
+   * @param features - Array of OpenLayers features to process
+   * @param layerPath - Path of the layer these features belong to
+   * @param schemaTag - The Geoview layer type for the features
+   * @param nameField - Optional field name to use as the display name for features
+   * @param outFields - Optional array of output fields to include in the feature info
+   * @param supportZoomTo - Whether zoom-to functionality is supported for these features
+   * @param domainsLookup - Optional array of field metadata for domain lookups
+   * @param layerStyle - Optional mapping of geometry type to style settings for icons
+   * @param includeNoStyleFeatures - Whether to include features that have no matching style (no icon generated)
+   * @param inputFormat - Optional format(s) to prioritize for string inputs
+   * @param inputTimezone - Optional IANA timezone the dates are in
+   * @param inputTemporalMode - Optional temporal mode for date handling
+   * @param callbackGetFieldValue - Callback that returns the value of a field for a feature, in the correct type
+   * @returns Array of feature info entries representing each feature with enriched metadata
+   */
+  static helperFormatFeatureInfoResult(
+    features: Feature[],
+    layerPath: string,
+    schemaTag: TypeGeoviewLayerType,
+    nameField: string | undefined,
+    outFields: TypeOutfields[] | undefined,
+    supportZoomTo: boolean,
+    domainsLookup: TypeLayerMetadataFields[] | undefined,
+    layerStyle: Partial<Record<TypeStyleGeometry, TypeLayerStyleSettings>> | undefined,
+    includeNoStyleFeatures: boolean,
+    inputFormat: string | string[] | undefined,
+    inputTimezone: TimeIANA | undefined,
+    inputTemporalMode: TemporalMode | undefined,
+    callbackGetFieldValue: GetFieldValueDelegate
+  ): TypeFeatureInfoEntry[] {
+    try {
+      if (!features.length) return [];
+
+      const aliasLookup = GVLayerUtilities.createAliasLookup(outFields);
+
+      let featureKeyCounter = 0;
+      let fieldKeyCounter = 0;
+      const queryResult: TypeFeatureInfoEntry[] = [];
+
+      const imageSourceDict: Record<string, string | undefined> = {};
+
+      // For each feature
+      for (const feature of features) {
+        // Get the image source for a feature using styling information and cache it
+        const imageSource = layerStyle
+          ? AbstractGVLayer.getFeatureIconSource(feature, layerStyle, domainsLookup, aliasLookup, imageSourceDict)
+          : undefined;
+
+        // Check if we do want to include the feature when it has no style
+        let includeFeature = true;
+        if (!includeNoStyleFeatures && !imageSource) includeFeature = false;
+
+        // If including the feature
+        if (includeFeature) {
+          // Get the TypeFeatureInfoEntry object
+          const featureInfoEntry: TypeFeatureInfoEntry = {
+            uid: getUid(feature),
+            featureKey: featureKeyCounter++,
+            geoviewLayerType: schemaTag,
+            feature,
+            geometry: feature.getGeometry(),
+            extent: feature.getGeometry()?.getExtent(),
+            featureIcon: imageSource,
+            fieldInfo: {},
+            nameField,
+            supportZoomTo,
+            layerPath,
+          };
+
+          // Process the feature fields
+          fieldKeyCounter = this.#helperFeatureFields(
+            feature,
+            outFields,
+            featureInfoEntry,
+            fieldKeyCounter,
+            inputFormat,
+            inputTimezone,
+            inputTemporalMode,
+            callbackGetFieldValue
+          );
+          queryResult.push(featureInfoEntry);
+        }
+      }
+
+      return queryResult;
+    } catch (error: unknown) {
+      logger.logError(error);
+      return [];
+    }
+  }
+
+  /**
+   * Processes the fields of a given feature and populates a feature info entry with relevant data.
+   *
+   * It also updates field domain and type dictionaries if needed.
+   *
+   * @param feature - The OpenLayers feature object whose fields are being processed
+   * @param outfields - Optional array of output field metadata
+   * @param featureInfoEntry - The feature info entry object where processed field information is stored
+   * @param fieldKeyCounterStart - Starting value for the field key counter
+   * @param inputFormat - Optional format(s) to prioritize for string inputs
+   * @param inputTimezone - Optional IANA timezone the dates are in
+   * @param inputTemporalMode - Optional temporal mode for date handling
+   * @param callbackGetFieldValue - Callback function that returns the value of a given field for the feature
+   * @returns The next field key counter value after processing
+   */
+  static #helperFeatureFields(
+    feature: Feature,
+    outfields: TypeOutfields[] | undefined,
+    featureInfoEntry: TypeFeatureInfoEntry,
+    fieldKeyCounterStart: number,
+    inputFormat: string | string[] | undefined,
+    inputTimezone: TimeIANA | undefined,
+    inputTemporalMode: TemporalMode | undefined,
+    callbackGetFieldValue: GetFieldValueDelegate
+  ): number {
+    let fieldKeyCounter = fieldKeyCounterStart;
+
+    // Build field entries: use outfields if available, otherwise create minimal entries from feature keys
+    // GV Note: We assume that if outfields are not provided, all fields are of type string and have no domain.
+    // GV This is a fallback and may not be accurate, but without outfield metadata we have no way to know the correct types or domains.
+    // GV And the alternative would be to skip and show no fields
+    const fieldEntries: Array<{
+      name: string;
+      type: TypeOutfieldsType;
+      alias: string;
+      domain?: TypeDomain;
+    }> = outfields ?? feature.getKeys().map((name) => ({ name, type: 'string', alias: name }));
+
+    for (const fieldEntry of fieldEntries) {
+      // Skip geometry field
+      // eslint-disable-next-line no-continue
+      if (fieldEntry.name === 'geometry') continue;
+
+      // Get the field value from the feature
+      const fieldValue = feature.get(fieldEntry.name);
+
+      // Skip nested objects (but allow arrays)
+      // eslint-disable-next-line no-continue
+      if (fieldValue && typeof fieldValue === 'object' && !Array.isArray(fieldValue)) continue;
+
+      // Attach the fieldInfo property on the feature info entry
+      // eslint-disable-next-line no-param-reassign
+      featureInfoEntry.fieldInfo[fieldEntry.name] = {
+        fieldKey: fieldKeyCounter++,
+        value: callbackGetFieldValue(
+          feature,
+          fieldEntry.name,
+          fieldEntry.type,
+          fieldEntry.domain,
+          inputFormat,
+          inputTimezone,
+          inputTemporalMode
+        ),
+        dataType: fieldEntry.type,
+        alias: fieldEntry.alias,
+        domain: fieldEntry.domain,
+      };
+    }
+
+    // Return the counter
+    return fieldKeyCounter;
+  }
+
+  /**
+   * Retrieves and formats the value of a field from an OpenLayers feature.
+   * - For `date` fields, the raw value (epoch ms or date string) is normalized
+   *   via the date management utilities.
+   * - For fields with a `codedValue` domain, the raw code is resolved to its
+   *   human-readable name. If no matching code is found, the raw value is returned.
+   * - For all other fields, the raw value is returned as-is.
+   *
+   * @param feature - The OpenLayers feature containing the field values.
+   * @param fieldName - The name of the field to retrieve.
+   * @param fieldType - The data type of the field (e.g. `'string'`, `'number'`, `'date'`, `'oid'`).
+   * @param fieldDomain - Optional domain metadata. When present and of type `codedValue`,
+   * the raw field value is mapped to the corresponding coded-value name.
+   * @param inputFormat - Optional format(s) to prioritize when parsing date string inputs.
+   * @param inputTimezone - Optional IANA timezone to assume when interpreting date values.
+   * @param inputTemporalMode - Optional temporal mode. `'calendar'` treats dates as
+   * timezone-agnostic calendar dates; `'instant'` treats them as timezone-aware moments.
+   * @returns The processed field value: a formatted date for date fields, the decoded
+   * name for coded-value domains, or the raw value otherwise.
+   */
+  static helperGetFieldValue(
+    feature: Feature,
+    fieldName: string,
+    fieldType: TypeOutfieldsType,
+    fieldDomain: TypeDomain | undefined,
+    inputFormat: string | string[] | undefined,
+    inputTimezone: TimeIANA | undefined,
+    inputTemporalMode: TemporalMode | undefined
+  ): unknown {
+    const fieldValue = feature.get(fieldName);
+    if (fieldType === 'date') {
+      // If the value is null or undefined, return it as-is instead of trying to parse it as a date
+      // GV Some services have date fields with 'Null' in their data.. e.g. https://sampleserver6.arcgisonline.com/arcgis/rest/services/Water_Network/MapServer/6
+      if (fieldValue === null || fieldValue === undefined || fieldValue === 'Null') return fieldValue;
+
+      // Read the date
+      return DateMgt.createDate(fieldValue, inputFormat, inputTimezone, inputTemporalMode);
+    }
+
+    // If the field has a domain
+    if (fieldDomain && fieldDomain.type === 'codedValue') {
+      // Find the coded value corresponding to the value
+      const codedValue = fieldDomain.codedValues.find((cv) => cv.code === fieldValue);
+
+      // Read the value from the domain
+      return codedValue ? codedValue.name : fieldValue;
+    }
+
+    return fieldValue;
+  }
+
+  // #endregion STATIC METHODS
+}
+
+// #region EVENT TYPES
+
+/** Callback signature used to extract and format the value of a single feature field. */
+export type GetFieldValueDelegate = (
+  feature: Feature,
+  fieldName: string,
+  fieldType: TypeOutfieldsType,
+  fieldDomain: TypeDomain | undefined,
+  inputFormat: string | string[] | undefined,
+  inputTimezone: TimeIANA | undefined,
+  inputTemporalMode: TemporalMode | undefined
+) => unknown;
+
+/** Event payload emitted when the layer style changes. */
+export interface StyleChangedEvent extends LayerBaseEvent {
+  /** The newly applied layer style. */
+  style: TypeLayerStyleConfig;
+}
+
+/** Delegate for the {@link StyleChangedEvent} handler. */
+export type StyleChangedDelegate = EventDelegateBase<AbstractGVLayer, StyleChangedEvent, void>;
+
+/** Event payload emitted when a legend query starts. */
+export interface LegendQueryingEvent extends LayerBaseEvent {}
+
+/** Delegate for the {@link LegendQueryingEvent} handler. */
+export type LegendQueryingDelegate = EventDelegateBase<AbstractGVLayer, LegendQueryingEvent, void>;
+
+/** Event payload emitted when a legend query completes. */
+export interface LegendQueriedEvent extends LayerBaseEvent {
+  /** The legend returned by the query. */
+  legend: TypeLegend;
+}
+
+/** Delegate for the {@link LegendQueriedEvent} handler. */
+export type LegendQueriedDelegate = EventDelegateBase<AbstractGVLayer, LegendQueriedEvent, void>;
+
+/** Event payload emitted when the layer legend changes. */
+export interface LegendChangedEvent extends LayerBaseEvent {
+  /** The new legend assigned to the layer. */
+  legend: TypeLegend;
+}
+
+/** Delegate for the {@link LegendChangedEvent} handler. */
+export type LegendChangedDelegate = EventDelegateBase<AbstractGVLayer, LegendChangedEvent, void>;
+
+/** Event payload emitted when a layer filter is applied. */
+export interface LayerFilterAppliedEvent extends LayerBaseEvent {
+  /** The filter currently applied on the layer. */
+  filter: LayerFilters;
+
+  /** The filter category that changed and triggered this event. */
+  filterCategory: FilterCategory;
+}
+
+/** Delegate for the {@link LayerFilterAppliedEvent} handler. */
+export type LayerFilterAppliedDelegate = EventDelegateBase<AbstractGVLayer, LayerFilterAppliedEvent, void>;
+
+/** Event payload emitted when the layer enters an error state. */
+export interface LayerErrorEvent extends LayerBaseEvent {
+  /** The deciphered error that triggered this event. */
+  error: GeoViewError;
+}
+
+/** Delegate for the {@link LayerErrorEvent} handler. */
+export type LayerErrorDelegate = EventDelegateBase<AbstractGVLayer, LayerErrorEvent, void>;
+
+/** Event payload emitted when the layer surfaces a user-facing message. */
+export interface LayerMessageEvent extends LayerBaseEvent {
+  /** The i18n key used to look up the localized message (or the literal message). */
+  messageKey: string;
+
+  /** Parameters interpolated into the localized message. */
+  messageParams: Record<string, unknown> | undefined;
+
+  /** The severity / category of the message. */
+  messageType: SnackbarType;
+
+  /** Optional separate i18n key for the notification panel; when set, the snackbar keeps the detailed `messageKey`. */
+  notificationMessageKey?: string;
+
+  /** Optional parameters interpolated into the separate notification-panel message. */
+  notificationMessageParams?: Record<string, unknown>;
+}
+
+/** Delegate for the {@link LayerMessageEvent} handler. */
+export type LayerMessageDelegate = EventDelegateBase<AbstractGVLayer, LayerMessageEvent, void>;
+
+/** Event payload emitted when the layer's queryable flag changes. */
+export interface LayerQueryableChangedEvent extends LayerBaseEvent {
+  /** The new queryable value. */
+  queryable: boolean;
+}
+
+/** Delegate for the {@link LayerQueryableChangedEvent} handler. */
+export type LayerQueryableChangedDelegate = EventDelegateBase<AbstractGVLayer, LayerQueryableChangedEvent, void>;
+
+/** Event payload emitted when the layer's hoverable flag changes. */
+export interface LayerHoverableChangedEvent extends LayerBaseEvent {
+  /** The new hoverable value. */
+  hoverable: boolean;
+}
+
+/** Delegate for the {@link LayerHoverableChangedEvent} handler. */
+export type LayerHoverableChangedDelegate = EventDelegateBase<AbstractGVLayer, LayerHoverableChangedEvent, void>;
+
+/** Event payload emitted when a style item's visibility is toggled. */
+export interface LayerItemVisibilityChangedEvent extends LayerBaseEvent {
+  /** The legend item being toggled. */
+  item: TypeLegendItem;
+
+  /** The new visibility of the item. */
+  visible: boolean;
+}
+
+/** Delegate for the {@link LayerItemVisibilityChangedEvent} handler. */
+export type LayerItemVisibilityChangedDelegate = EventDelegateBase<AbstractGVLayer, LayerItemVisibilityChangedEvent, void>;
+
+// #endregion EVENT TYPES

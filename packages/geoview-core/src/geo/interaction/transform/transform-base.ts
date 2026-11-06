@@ -1,0 +1,2438 @@
+import type OLMap from 'ol/Map';
+import type { MapBrowserEvent } from 'ol';
+import { Overlay } from 'ol';
+import { Pointer as OLPointer } from 'ol/interaction';
+import Collection from 'ol/Collection';
+import Feature from 'ol/Feature';
+import type { Geometry } from 'ol/geom';
+import { Point, Polygon, LineString, Circle } from 'ol/geom';
+import { Fill, Stroke, Circle as CircleStyle, RegularShape, Text as OLText } from 'ol/style';
+import type { StyleLike } from 'ol/style/Style';
+import VectorLayer from 'ol/layer/Vector';
+import VectorSource from 'ol/source/Vector';
+import type { Coordinate } from 'ol/coordinate';
+import type { Extent } from 'ol/extent';
+import { getCenter } from 'ol/extent';
+
+import { TIMEOUT } from '@/core/utils/constant';
+
+import type { MapViewer } from '@/geo/map/map-viewer';
+import { GeoUtilities } from '@/geo/utils/utilities';
+import { DrawerText } from '@/geo/style/drawer-text';
+import { DrawerStyle } from '@/geo/style/drawer-style';
+
+import { TransformEvent, TransformSelectionEvent, TransformDeleteFeatureEvent } from './transform-events';
+
+// #region CONSTANTS
+
+// Handle style constants
+const ROTATE_STYLE = new DrawerStyle({
+  image: new RegularShape({
+    points: 50,
+    radius: 10,
+    fill: new Fill({
+      color: 'rgba(255, 255, 255, 0.5)',
+    }),
+    stroke: new Stroke({
+      color: '#333',
+      width: 1,
+    }),
+  }),
+  text: new OLText({
+    text: '↻',
+    fill: new Fill({
+      color: 'rgba(100, 100, 100, 0.95)',
+    }),
+    font: 'bold 20px sans-serif',
+  }),
+});
+
+const DELETE_STYLE = new DrawerStyle({
+  image: new RegularShape({
+    points: 50,
+    radius: 10,
+    fill: new Fill({
+      color: 'rgba(244, 67, 54, 0.95)',
+    }),
+    stroke: new Stroke({
+      color: '#333',
+      width: 1,
+    }),
+  }),
+  text: new OLText({
+    text: '✕',
+    fill: new Fill({
+      color: '#fff',
+    }),
+    font: 'bold 14px sans-serif',
+    offsetY: 1,
+  }),
+});
+
+const SCALE_STYLE = new DrawerStyle({
+  image: new RegularShape({
+    points: 50,
+    radius: 8,
+    fill: new Fill({
+      color: 'rgba(160, 160, 160, 0.8)',
+    }),
+    stroke: new Stroke({
+      color: '#333',
+      width: 1,
+    }),
+  }),
+});
+
+const STRETCH_STYLE = new DrawerStyle({
+  image: new RegularShape({
+    points: 4,
+    radius: 8,
+    angle: Math.PI / 4, // 45 degrees to make it a square
+    fill: new Fill({
+      color: 'rgba(160, 160, 160, 0.8)',
+    }),
+    stroke: new Stroke({
+      color: '#333',
+      width: 1,
+    }),
+  }),
+});
+
+const VERTEX_STYLE = new DrawerStyle({
+  image: new CircleStyle({
+    radius: 6,
+    fill: new Fill({ color: 'rgba(255, 255, 255, 0.9)' }),
+    stroke: new Stroke({ color: '#333', width: 2 }),
+  }),
+});
+
+const EDGE_MIDPOINT_STYLE = new DrawerStyle({
+  image: new CircleStyle({
+    radius: 4,
+    fill: new Fill({ color: 'rgba(0, 255, 255, 0.7)' }),
+    stroke: new Stroke({ color: '#333', width: 1 }),
+  }),
+});
+
+const EXTENT_BOUNDARY_STYLE = new DrawerStyle({
+  stroke: new Stroke({
+    color: 'rgba(100, 100, 100, 0.5)',
+    width: 1,
+    lineDash: [5, 5],
+  }),
+});
+
+const ROTATE_LINE_STYLE = new DrawerStyle({
+  stroke: new Stroke({
+    color: 'rgba(100, 100, 100, 0.5)',
+    width: 1,
+    lineDash: [5, 5],
+  }),
+});
+
+const HIGHLIGHT_OVERLAY_STYLE = new DrawerStyle({
+  image: new CircleStyle({
+    radius: 12,
+    fill: new Fill({ color: 'rgba(255, 235, 59, 0.3)' }), // Semi-transparent yellow fill
+    stroke: new Stroke({ color: 'rgba(255, 235, 59, 0.8)', width: 3 }), // Yellow stroke
+  }),
+});
+
+/**
+ * Handle types for the transform interaction
+ */
+export enum HandleType {
+  BOUNDARY = 'boundary',
+  ROTATE = 'rotate',
+  ROTATE_LINE = 'rotate-line',
+  SCALE = 'scale',
+  TRANSLATE = 'translate',
+  STRETCH_N = 'stretch-n',
+  STRETCH_E = 'stretch-e',
+  STRETCH_S = 'stretch-s',
+  STRETCH_W = 'stretch-w',
+  SCALE_NE = 'scale-ne',
+  SCALE_SE = 'scale-se',
+  SCALE_SW = 'scale-sw',
+  SCALE_NW = 'scale-nw',
+  DELETE = 'delete',
+  VERTEX = 'vertex',
+  EDGE_MIDPOINT = 'edge-midpoint',
+}
+
+// #endregion CONSTANTS
+
+/**
+ * OpenLayers Transform interaction for manipulating features on the map.
+ */
+// TODO: Refactor - May be able to remove the use of properties and instead just read / set the style
+// TO.DOCONT - This has already been done in the drawer controller
+export class OLTransform extends OLPointer {
+  /** The collection of features to transform */
+  features: Collection<Feature>;
+
+  /** The layer used to display handles */
+  handleLayer: VectorLayer<VectorSource>;
+
+  /** The source for the handle layer */
+  handleSource: VectorSource;
+
+  /** The currently selected feature */
+  selectedFeature?: Feature;
+
+  /** The current handle being dragged */
+  currentHandle?: Feature;
+
+  /** Options for the transform interaction */
+  options: TransformBaseOptions;
+
+  /** The start coordinates when dragging */
+  startCoordinate?: Coordinate;
+
+  /** The start geometry when transforming */
+  startGeometry?: Geometry;
+
+  /** The center of the feature being transformed */
+  center?: Coordinate;
+
+  /** The angle for rotation */
+  angle = 0;
+
+  /** The map viewer */
+  mapViewer?: MapViewer;
+
+  /** Flag to prevent recursion */
+  #inHandleDownEvent = false;
+
+  /** Flag to prevent recursion */
+  #inHandleDragEvent = false;
+
+  /** Flag to prevent recursion */
+  #inHandleUpEvent = false;
+
+  /** Flag to prevent recursion */
+  #inHandleMoveEvent = false;
+
+  /** Flag to track if we're currently transforming */
+  #isTransforming = false;
+
+  /** Stores the original feature style when highlighting for translation */
+  #originalStyleBeforeHighlight?: StyleLike;
+
+  /** The type of transformation being performed */
+  #transformType?: HandleType;
+
+  /** Flag to track if a vertex was already added during this drag operation */
+  #vertexAdded = false;
+
+  /** Text editing overlay for text features */
+  #textEditOverlay?: Overlay;
+
+  /** Flag to track if text editor is active */
+  #isTextEditing = false;
+
+  /** Text editor element reference */
+  #textEditorElement?: HTMLDivElement;
+
+  /** Original feature style (to restore after editing) */
+  #originalTextStyle?: DrawerStyle;
+
+  /** Original text extent when scaling starts */
+  #originalTextExtent?: Extent;
+
+  /** Original text size when scaling starts */
+  #originalTextSize?: number;
+
+  /** Original text rotation when rotation starts */
+  #originalTextRotation?: number;
+
+  /** History stack for undo/redo functionality */
+  #geometryHistory: Geometry[] = [];
+
+  /** Current position in history stack */
+  #historyIndex = -1;
+
+  /** Maximum history size */
+  #maxHistorySize = 50;
+
+  /** Callback invoked when a transformation starts. Bridged to EventHelper delegates by the Transform wrapper. */
+  onTransformStart?: (event: TransformEvent) => void;
+
+  /** Callback invoked during an ongoing transformation. Bridged to EventHelper delegates by the Transform wrapper. */
+  onTransforming?: (event: TransformEvent) => void;
+
+  /** Callback invoked when a transformation ends. Bridged to EventHelper delegates by the Transform wrapper. */
+  onTransformEnd?: (event: TransformEvent) => void;
+
+  /** Callback invoked when a feature is deleted. Bridged to EventHelper delegates by the Transform wrapper. */
+  onDeleteFeature?: (event: TransformDeleteFeatureEvent) => void;
+
+  /** Callback invoked when the selected feature changes. Bridged to EventHelper delegates by the Transform wrapper. */
+  onSelectionChange?: (event: TransformSelectionEvent) => void;
+
+  // #region CONSTRUCTOR
+
+  /**
+   * Initializes a OLTransform component.
+   *
+   * @param options - Object to configure the initialization
+   */
+  constructor(options: TransformBaseOptions = {}) {
+    super();
+
+    this.options = {
+      translate: true,
+      scale: true,
+      rotate: true,
+      stretch: true,
+      keepAspectRatio: false,
+      hitTolerance: 5,
+      enableDelete: true,
+      ...options,
+    };
+
+    this.mapViewer = options.mapViewer;
+
+    // Set up features collection
+    if (options.features) {
+      this.features = options.features;
+    } else if (options.source) {
+      this.features = new Collection(options.source.getFeatures());
+    } else {
+      this.features = new Collection<Feature>();
+    }
+
+    // Create a vector source and layer for the handles
+    this.handleSource = new VectorSource();
+    this.handleLayer = new VectorLayer({
+      source: this.handleSource,
+      zIndex: 1000,
+    });
+
+    // Set up feature collection change handlers
+    this.features.on('remove', this.#handleFeatureRemove.bind(this));
+  }
+
+  // #endregion CONSTRUCTOR
+
+  // #region OVERRIDES
+
+  /**
+   * Handles click events for feature selection and handle interaction.
+   *
+   * @param event - The map browser event
+   * @returns Whether the event was handled
+   */
+  // GV This overrides a method named like so in OpenLayers, that's why it's not named with the prefix 'on' for this particular override.
+  override handleDownEvent(event: MapBrowserEvent<PointerEvent>): boolean {
+    if (this.#inHandleDownEvent) return false;
+    this.#inHandleDownEvent = true;
+
+    try {
+      const { map } = event;
+      const { coordinate } = event;
+
+      // Check if we clicked on a handle
+      const handleFeature = this.#getHandleAtCoordinate(coordinate, map);
+      const handleType = handleFeature?.get('handleType') as HandleType;
+
+      if (handleFeature && handleType !== HandleType.BOUNDARY && handleType !== HandleType.ROTATE_LINE) {
+        // If text editor is active, apply changes before starting any other transformation
+        if (this.#isTextEditing) {
+          this.#applyTextChanges();
+          this.#hideTextEditor();
+        }
+
+        // Handle delete action
+        if (handleType === HandleType.DELETE) {
+          const feature = handleFeature.get('feature');
+          if (feature) {
+            this.features.remove(feature);
+            this.onDeleteFeature?.(new TransformDeleteFeatureEvent(feature as Feature));
+          }
+          return false;
+        }
+
+        // Handle right-click on vertex to delete it
+        if (handleType === HandleType.VERTEX && event.originalEvent.button === 2) {
+          this.#deleteVertex(handleFeature);
+          return false;
+        }
+
+        // Start transformation
+        this.currentHandle = handleFeature;
+        this.startCoordinate = coordinate;
+        this.#transformType = handleType;
+        this.#vertexAdded = false;
+
+        if (this.selectedFeature) {
+          this.startGeometry = this.selectedFeature.getGeometry()?.clone();
+          this.#isTransforming = true;
+
+          // Store initial rotation for text features when starting rotation
+          if (handleType === HandleType.ROTATE && OLTransform.#isTextFeature(this.selectedFeature)) {
+            const currentStyle = this.selectedFeature.getStyle() as DrawerStyle;
+            this.#originalTextRotation = currentStyle.getTextRotation();
+          }
+
+          // Clear Handles
+          this.clearHandles();
+
+          // For edge midpoint, add vertex immediately on down event
+          if (handleType === HandleType.EDGE_MIDPOINT) {
+            this.#handleAddVertex(coordinate, handleFeature);
+            this.#vertexAdded = true;
+            this.#transformType = HandleType.VERTEX;
+            const edgeIndex = handleFeature.get('edgeIndex');
+            this.currentHandle.set('vertexIndex', edgeIndex + 1);
+          }
+
+          this.onTransformStart?.(new TransformEvent('transformstart', this.selectedFeature));
+        }
+
+        return true;
+      }
+
+      // Check if we clicked on a feature to select it
+      const features = map.getFeaturesAtPixel(event.pixel, {
+        hitTolerance: this.options.hitTolerance,
+        layerFilter: (layer) => {
+          // Target the geometry layer that contains the drawing feature
+          // GV Layer filter is required for the hitTolerance to work
+          // GV because otherwise it stops at the first/most accurate layer hit (basemap)
+          return layer.getSource() === this.options.source;
+        },
+      });
+
+      if (features && features.length > 0) {
+        const feature = features[0] as Feature;
+        if (this.features.getArray().includes(feature)) {
+          // Only select if it's a different feature
+          if (this.selectedFeature !== feature) {
+            this.selectFeature(feature);
+          }
+
+          // Start translation for non-text features or when not text editing
+          if (this.options.translate) {
+            // If text editor is active, apply changes before starting any other transformation
+            if (this.#isTextEditing) {
+              this.#applyTextChanges();
+              this.#hideTextEditor();
+            }
+
+            this.startCoordinate = coordinate;
+            this.startGeometry = feature.getGeometry()?.clone();
+            this.#transformType = HandleType.TRANSLATE;
+            this.#isTransforming = true;
+
+            if (OLTransform.#isTextFeature(this.selectedFeature)) {
+              this.#originalTextExtent = this.#calculateTextExtent()!;
+              const currentStyle = this.selectedFeature?.getStyle() as DrawerStyle;
+              this.#originalTextSize = currentStyle.getTextSize();
+            }
+
+            this.clearHandles();
+            this.onTransformStart?.(new TransformEvent('transformstart', feature));
+            return true;
+          }
+        }
+      }
+
+      // Also check if we're clicking on the currently selected text feature (even if hidden)
+      if (this.selectedFeature && OLTransform.#isTextFeature(this.selectedFeature) && this.#isTextEditing) {
+        // Check if click is within text bounds
+        const textExtent = this.#calculateTextExtent();
+        if (textExtent) {
+          const [minX, minY, maxX, maxY] = textExtent;
+          if (coordinate[0] >= minX && coordinate[0] <= maxX && coordinate[1] >= minY && coordinate[1] <= maxY) {
+            // Click is within text bounds, don't clear selection
+            return true;
+          }
+        }
+      }
+
+      // If we get here and text editing is active, apply changes and clear selection
+      if (this.#isTextEditing) {
+        this.#applyTextChanges();
+      }
+
+      // Clear selection if clicking elsewhere
+      if (this.selectedFeature) {
+        this.clearSelection();
+      }
+
+      return false;
+    } finally {
+      this.#inHandleDownEvent = false;
+    }
+  }
+
+  /**
+   * Handles pointer drag events for feature transformation.
+   *
+   * @param event - The map browser event
+   */
+  // GV This overrides a method named like so in OpenLayers, that's why it's not named with the prefix 'on' for this particular override.
+  override handleDragEvent(event: MapBrowserEvent<PointerEvent>): void {
+    if (this.#inHandleDragEvent || !this.#isTransforming || !this.selectedFeature || !this.startCoordinate) return;
+    this.#inHandleDragEvent = true;
+
+    try {
+      const { coordinate } = event;
+
+      // Perform the transformation based on the handle type
+      switch (this.#transformType) {
+        case HandleType.TRANSLATE:
+          // Delta X and Delta Y
+          this.#handleTranslate(coordinate[0] - this.startCoordinate[0], coordinate[1] - this.startCoordinate[1]);
+          break;
+
+        case HandleType.ROTATE:
+          this.#handleRotate(coordinate);
+          break;
+
+        case HandleType.SCALE_NE:
+        case HandleType.SCALE_SE:
+        case HandleType.SCALE_SW:
+        case HandleType.SCALE_NW:
+          this.#handleScale(coordinate, this.#transformType, event.originalEvent.ctrlKey);
+          break;
+
+        case HandleType.STRETCH_N:
+        case HandleType.STRETCH_E:
+        case HandleType.STRETCH_S:
+        case HandleType.STRETCH_W:
+          this.#handleStretch(coordinate, this.#transformType);
+          break;
+        case HandleType.VERTEX:
+          this.#handleVertexMove(coordinate, this.currentHandle);
+          break;
+        default:
+          break;
+      }
+
+      // Update handles to match the new geometry
+      // this.updateHandles();
+
+      // Dispatch transforming event
+      this.onTransforming?.(new TransformEvent('transforming', this.selectedFeature));
+    } finally {
+      this.#inHandleDragEvent = false;
+    }
+  }
+
+  /**
+   * Handles pointer up events to finalize transformation.
+   *
+   * @param event - The map browser event
+   * @returns Whether the event was handled
+   */
+  // GV This overrides a method named like so in OpenLayers, that's why it's not named with the prefix 'on' for this particular override.
+  override handleUpEvent(event: MapBrowserEvent<PointerEvent>): boolean {
+    if (this.#inHandleUpEvent) return false;
+    this.#inHandleUpEvent = true;
+
+    try {
+      if (this.#isTransforming && this.selectedFeature) {
+        // Save state to history after transformation if the geometry changed
+        const currentGeometry = this.selectedFeature.getGeometry();
+        const geometryChanged =
+          this.startGeometry && currentGeometry && !GeoUtilities.geometriesAreEqual(this.startGeometry, currentGeometry);
+        if (geometryChanged) {
+          this.#saveToHistory();
+        }
+
+        // For text features, update handles to match new text size
+        if (OLTransform.#isTextFeature(this.selectedFeature)) {
+          // Apply final style update
+          const currentStyle = this.selectedFeature.getStyle() as DrawerStyle;
+
+          const finalStyle = new DrawerStyle({
+            text: new DrawerText({
+              text: currentStyle.getTextContent(),
+              fill: new Fill({ color: currentStyle.getTextColor() }),
+              stroke: new Stroke({
+                color: currentStyle.getTextHaloColor(),
+                width: currentStyle.getTextHaloWidth(),
+              }),
+              bold: currentStyle.getTextBold(),
+              italic: currentStyle.getTextItalic(),
+              size: currentStyle.getTextSize(),
+              fontFamily: currentStyle.getTextFontFamily(),
+              rotation: currentStyle.getTextRotation(),
+            }),
+          });
+
+          this.selectedFeature.setStyle(finalStyle);
+
+          // Clear cached values
+          this.#originalTextExtent = undefined;
+          this.#originalTextSize = undefined;
+
+          // Update handles
+          this.#createTextHandles();
+        } else {
+          // Update handles to match the new geometry position
+          this.updateHandles();
+        }
+
+        // Dispatch transform end event
+        this.onTransformEnd?.(new TransformEvent('transformend', this.selectedFeature));
+
+        // Reset transformation state
+        this.#isTransforming = false;
+        this.currentHandle = undefined;
+        this.startCoordinate = undefined;
+        this.startGeometry = undefined;
+        this.#transformType = undefined;
+
+        // Only reset angle to 0 for non-text features
+        if (!OLTransform.#isTextFeature(this.selectedFeature)) {
+          this.angle = 0;
+        }
+
+        return true;
+      }
+
+      return false;
+    } finally {
+      this.#inHandleUpEvent = false;
+    }
+  }
+
+  /**
+   * Handles pointer move events for cursor updates.
+   *
+   * Not to be confused with moving handles. This overrides the move event from OL Pointer.
+   *
+   * @param event - The map browser event
+   */
+  // GV This overrides a method named like so in OpenLayers, that's why it's not named with the prefix 'on' for this particular override.
+  override handleMoveEvent(event: MapBrowserEvent<PointerEvent>): void {
+    if (this.#inHandleMoveEvent) return;
+    this.#inHandleMoveEvent = true;
+
+    try {
+      const { map } = event;
+      const { coordinate } = event;
+
+      // Check if we're over a handle and update cursor
+      const handleFeature = this.#getHandleAtCoordinate(coordinate, map);
+      if (handleFeature) {
+        const handleType = handleFeature.get('handleType') as HandleType;
+        const cursor = OLTransform.getCursorForHandleType(handleType);
+        map.getTargetElement().style.cursor = cursor;
+      } else if (!this.#isTransforming) {
+        // Check if we're over a feature
+        const features = map.getFeaturesAtPixel(event.pixel, {
+          hitTolerance: this.options.hitTolerance,
+          layerFilter: (layer) => layer.getSource() === this.options.source,
+        });
+        if (features && features.length > 0) {
+          const feature = features[0] as Feature;
+          if (this.features.getArray().includes(feature) && this.options.translate) {
+            map.getTargetElement().style.cursor = 'move';
+            return;
+          }
+        }
+        // Reset cursor when not over a handle and not transforming
+        map.getTargetElement().style.cursor = 'default';
+      }
+    } finally {
+      this.#inHandleMoveEvent = false;
+    }
+  }
+
+  /**
+   * Handles all events, including double-click.
+   *
+   * @param event - The map browser event
+   * @returns Whether the event was handled
+   */
+  // GV This overrides a method named like so in OpenLayers, that's why it's not named with the prefix 'on' for this particular override.
+  override handleEvent(event: MapBrowserEvent<PointerEvent>): boolean {
+    if (event.type === 'dblclick') {
+      return this.#handleDoubleClick(event);
+    }
+    return super.handleEvent(event);
+  }
+
+  /**
+   * Cleans up the interaction.
+   */
+  // GV This overrides a method named like so in OpenLayers, that's why it's not named with the prefix 'on' for this particular override.
+  override dispose(): void {
+    this.clearSelection();
+  }
+
+  // #endregion OVERRIDES
+
+  // #region METHODS - PUBLIC
+
+  /**
+   * Selects a feature for transformation.
+   *
+   * @param feature - The feature to select
+   * @param clearHistory - Whether to clear the history
+   */
+  selectFeature(feature: Feature<Geometry>, clearHistory = true): void {
+    const previousFeature = this.selectedFeature;
+
+    // Hide any existing text editor
+    this.#hideTextEditor();
+
+    // Only clear history when changing selection
+    if (previousFeature !== feature && clearHistory) {
+      this.#clearHistory();
+    }
+
+    // Clear any existing selection
+    this.clearHandles();
+
+    // Set the selected feature
+    this.selectedFeature = feature;
+
+    // Save initial state to history when selecting a new feature
+    if (previousFeature !== feature && clearHistory) {
+      this.#saveToHistory();
+    }
+
+    // Set angle to actual rotation value for text features
+    if (OLTransform.#isTextFeature(feature)) {
+      const style = feature.getStyle() as DrawerStyle;
+      this.angle = style.getTextRotation() || 0;
+    } else {
+      this.angle = 0;
+    }
+
+    // Emit selection change event
+    if (this.onSelectionChange) {
+      this.onSelectionChange(new TransformSelectionEvent('selectionchange', previousFeature, feature));
+    }
+
+    this.createHandles();
+  }
+
+  /**
+   * Checks if a feature is currently being transformed.
+   *
+   * @param feature - The feature to check
+   * @returns True if the feature is being transformed
+   */
+  isFeatureBeingTransformed(feature: Feature): boolean {
+    return this.#isTransforming && this.selectedFeature === feature;
+  }
+
+  /**
+   * Gets the currently selected/transforming feature.
+   *
+   * @returns The selected feature or undefined
+   */
+  getSelectedFeature(): Feature | undefined {
+    return this.selectedFeature;
+  }
+
+  /**
+   * Checks if any transformation is currently active.
+   *
+   * @returns True if transformation is active
+   */
+  isTransforming(): boolean {
+    return this.#isTransforming;
+  }
+
+  /**
+   * Clears the current selection.
+   *
+   * @param keepHistory - Whether the history should be kept when clearing the selection
+   */
+  clearSelection(keepHistory = false): void {
+    if (this.onSelectionChange) {
+      this.onSelectionChange(new TransformSelectionEvent('selectionchange', this.selectedFeature, undefined, keepHistory));
+    }
+
+    this.#hideTextEditor();
+    this.clearHandles();
+    this.selectedFeature = undefined;
+    if (!keepHistory) {
+      this.#clearHistory();
+    }
+  }
+
+  /**
+   * Initializes transformation state for keyboard-based transformations (Keyboard / Crosshair).
+   * Sets up all necessary state that would normally be set by mouse-down event.
+   *
+   * @param coordinate - The coordinate where the transformation begins
+   * @param handleType - The type of handle being transformed
+   * @returns True if a transformation was started, false if just an action was performed (e.g., vertex added, feature deleted)
+   */
+  beginKeyboardTransform(coordinate: Coordinate, handleType: HandleType): boolean {
+    if (!this.selectedFeature) return false;
+
+    // Reset vertex added flag (same as mouse flow does in handleDownEvent)
+    this.#vertexAdded = false;
+
+    // Get the map to find the actual handle feature
+    const map = this.mapViewer?.map;
+    if (!map) return false;
+
+    // Special handling for delete - just delete the feature immediately
+    if (handleType === HandleType.DELETE) {
+      const handleFeature = this.#getHandleAtCoordinate(coordinate, map);
+      if (handleFeature) {
+        const feature = handleFeature.get('feature');
+        if (feature) {
+          this.features.remove(feature);
+          this.onDeleteFeature?.(new TransformDeleteFeatureEvent(feature as Feature));
+        }
+      }
+      return false; // No transformation started, just deleted
+    }
+
+    // Special handling for edge midpoints - just add the vertex, don't start dragging
+    if (handleType === HandleType.EDGE_MIDPOINT) {
+      const handleFeature = this.#getHandleAtCoordinate(coordinate, map);
+      if (handleFeature) {
+        this.#handleAddVertex(coordinate, handleFeature);
+        this.updateHandles(); // Refresh handles to show the new vertex
+      }
+      return false; // No transformation started, just added vertex
+    }
+
+    // For TRANSLATE without a handle (clicking on feature itself), we don't need a handle feature
+    if (handleType === HandleType.TRANSLATE) {
+      // Set up transformation state for translation
+      this.startCoordinate = coordinate;
+      this.startGeometry = this.selectedFeature.getGeometry()?.clone();
+      this.#transformType = handleType;
+      this.#isTransforming = true;
+
+      // For text features, store original properties
+      if (OLTransform.#isTextFeature(this.selectedFeature)) {
+        this.#originalTextExtent = this.#calculateTextExtent()!;
+        const currentStyle = this.selectedFeature.getStyle() as DrawerStyle;
+        this.#originalTextSize = currentStyle.getTextSize();
+      }
+
+      // Highlight the feature itself (not a handle)
+      this.#highlightFeature();
+
+      // Clear handles so only the highlighted feature is visible
+      this.clearHandles();
+
+      return true; // Transformation started
+    }
+
+    // Find the handle feature at the coordinate (for all other handle types)
+    const handleFeature = this.#getHandleAtCoordinate(coordinate, map);
+    if (!handleFeature) return false;
+
+    // Set up transformation state (same as mouse-down on handle)
+    this.currentHandle = handleFeature;
+    this.startCoordinate = coordinate;
+    this.startGeometry = this.selectedFeature.getGeometry()?.clone();
+    this.#transformType = handleType;
+    this.#isTransforming = true;
+
+    // For text features, store original properties for rotation/scaling
+    if (OLTransform.#isTextFeature(this.selectedFeature)) {
+      if (handleType === HandleType.ROTATE) {
+        const currentStyle = this.selectedFeature.getStyle() as DrawerStyle;
+        this.#originalTextRotation = currentStyle.getTextRotation();
+      }
+      if (handleType.startsWith('scale')) {
+        this.#originalTextExtent = this.#calculateTextExtent()!;
+        const currentStyle = this.selectedFeature.getStyle() as DrawerStyle;
+        this.#originalTextSize = currentStyle.getTextSize();
+      }
+    }
+
+    // Apply visual feedback - highlight the grabbed handle
+    this.#highlightHandle(handleFeature);
+
+    return true; // Transformation started
+  }
+
+  /**
+   * Applies a transformation from a grabbed coordinate to a new coordinate (Keyboard / Crosshair).
+   * Handles all transformation types internally based on the handle type.
+   *
+   * @param startCoordinate - The coordinate where the handle was grabbed
+   * @param endCoordinate - The coordinate to transform to
+   * @param handleType - The type of handle being transformed
+   * @returns Whether the transformation was successfully applied
+   */
+  applyKeyboardTransformFromCoordinates(startCoordinate: number[], endCoordinate: number[], handleType: HandleType): boolean {
+    if (!this.selectedFeature) return false;
+
+    // Calculate the delta for translation-based transforms
+    const deltaX = endCoordinate[0] - startCoordinate[0];
+    const deltaY = endCoordinate[1] - startCoordinate[1];
+
+    // Apply the appropriate transformation based on handle type
+    if (handleType === HandleType.TRANSLATE || handleType.startsWith('translate')) {
+      this.#handleTranslate(deltaX, deltaY);
+    } else if (handleType === HandleType.ROTATE) {
+      this.#handleRotate(endCoordinate);
+    } else if (handleType.startsWith('scale')) {
+      this.#handleScale(endCoordinate, handleType, false);
+    } else if (handleType.startsWith('stretch')) {
+      this.#handleStretch(endCoordinate, handleType);
+    } else if (handleType === HandleType.VERTEX) {
+      this.#handleVertexMove(endCoordinate, this.currentHandle);
+    } else {
+      // Unknown handle type
+      return false;
+    }
+
+    // Update handles and restore original style
+    this.updateHandles();
+    this.restoreHandleStyle();
+
+    return true;
+  }
+
+  /**
+   * Restores all handles by recreating them.
+   */
+  restoreHandleStyle(): void {
+    // Restore feature style if it was highlighted
+    this.#restoreFeatureStyle();
+
+    // Recreate all handles
+    this.updateHandles();
+  }
+
+  /**
+   * Deletes a vertex at the specified coordinate if one exists.
+   *
+   * @param coordinate - The coordinate to check for a vertex
+   * @returns Whether a vertex was deleted
+   */
+  deleteVertexAtCoordinate(coordinate: Coordinate): boolean {
+    if (!this.selectedFeature) return false;
+
+    const map = this.mapViewer?.map;
+    if (!map) return false;
+
+    // Find the vertex handle at this coordinate
+    const handleFeature = this.#getHandleAtCoordinate(coordinate, map);
+    if (!handleFeature) return false;
+
+    const handleType = handleFeature.get('handleType') as HandleType;
+    if (handleType !== HandleType.VERTEX) return false;
+
+    // Delete the vertex
+    this.#deleteVertex(handleFeature);
+
+    return true;
+  }
+
+  // #endregion METHODS - PUBLIC
+
+  // #region METHODS - PRIVATE
+
+  /**
+   * Deletes a vertex from the geometry.
+   *
+   * @param vertexHandle - The vertex handle to delete
+   */
+  #deleteVertex(vertexHandle: Feature): void {
+    if (!this.selectedFeature) return;
+
+    const vertexIndex = vertexHandle.get('vertexIndex');
+    const geometry = this.selectedFeature.getGeometry();
+
+    if (geometry instanceof LineString) {
+      const coords = geometry.getCoordinates();
+      // Don't allow deletion if it would leave less than 2 points
+      if (coords.length <= 2) return;
+      coords.splice(vertexIndex, 1);
+      geometry.setCoordinates(coords);
+    } else if (geometry instanceof Polygon) {
+      const coords = geometry.getCoordinates();
+      // Don't allow deletion if it would leave less than 4 points (including closing point)
+      if (coords[0].length <= 4) return;
+      coords[0].splice(vertexIndex, 1);
+
+      // If we deleted the first vertex, update the last vertex to be the same as the new first
+      // to properly close the polygon
+      if (vertexIndex === 0) {
+        coords[0][coords[0].length - 1] = coords[0][0];
+      }
+
+      geometry.setCoordinates(coords);
+    }
+
+    // Save state before deleting the vertex
+    this.#saveToHistory();
+
+    // Update handles after deletion
+    this.updateHandles();
+
+    // Fire transform end raise event to update undo/redo buttons
+    this.onTransformEnd?.(new TransformEvent('transformend', this.selectedFeature));
+  }
+
+  /**
+   * Gets the handle feature at the specified coordinate.
+   *
+   * @param coordinate - The coordinate to check
+   * @param map - The map instance
+   * @returns The handle feature if found
+   */
+  #getHandleAtCoordinate(coordinate: Coordinate, map: OLMap): Feature | undefined {
+    const pixel = map.getPixelFromCoordinate(coordinate);
+
+    const features = map.getFeaturesAtPixel(pixel, {
+      layerFilter: (layer) => layer === this.handleLayer,
+      hitTolerance: this.options.hitTolerance,
+    });
+
+    return features && features.length > 0 ? (features[0] as Feature) : undefined;
+  }
+
+  /**
+   * Gets padding based on map resolution for consistent visual spacing.
+   *
+   * @returns Padding in map units
+   */
+  #getMapBasedPadding(): number {
+    if (!this.mapViewer?.map) return 0; // fallback
+
+    const view = this.mapViewer.getView();
+    const resolution = view.getResolution() || 1;
+
+    // 30 pixels converted to map units
+    return resolution * 15;
+  }
+
+  /**
+   * Restores the original style of the highlighted feature.
+   */
+  #restoreFeatureStyle(): void {
+    if (this.#originalStyleBeforeHighlight && this.selectedFeature) {
+      this.selectedFeature.setStyle(this.#originalStyleBeforeHighlight);
+      this.selectedFeature.changed();
+      this.#originalStyleBeforeHighlight = undefined;
+    }
+  }
+
+  /**
+   * Highlights a handle to indicate it's been grabbed.
+   *
+   * @param handle - The handle to highlight
+   */
+  #highlightHandle(handle: Feature): void {
+    const handleType = handle.get('handleType') as HandleType;
+
+    // For translate (moving the whole feature), highlight the feature itself
+    if (handleType === HandleType.TRANSLATE) {
+      this.#highlightFeature();
+    }
+
+    // Clear ALL handles
+    this.clearHandles();
+
+    // Recreate just the highlighted handle with overlay style
+    const coordinate = (handle.getGeometry() as Point).getCoordinates();
+    const properties = {
+      vertexIndex: handle.get('vertexIndex'),
+      isCircleCenter: handle.get('isCircleCenter'),
+      isCircleEdge: handle.get('isCircleEdge'),
+      edgeIndex: handle.get('edgeIndex'),
+    };
+
+    this.#createHandle(coordinate, handleType, properties);
+
+    // Apply highlight overlay to the handle
+    const highlightedHandle = this.handleSource.getFeatures()[0];
+    if (highlightedHandle) {
+      const originalStyle = highlightedHandle.getStyle() as DrawerStyle;
+      // Apply both original style and highlight overlay
+      highlightedHandle.setStyle([originalStyle, HIGHLIGHT_OVERLAY_STYLE]);
+    }
+  }
+
+  /**
+   * Highlights the feature to indicate it's being translated.
+   */
+  #highlightFeature(): void {
+    if (!this.selectedFeature) return;
+
+    const originalStyle = this.selectedFeature.getStyle() as DrawerStyle;
+    // Save reference to the ORIGINAL style before any modifications
+    this.#originalStyleBeforeHighlight = originalStyle;
+
+    // Handle different feature types with appropriate highlight styles
+    if (OLTransform.#isTextFeature(this.selectedFeature)) {
+      // For text: create a completely new highlighted style
+      const originalText = originalStyle.getDrawerText();
+      if (originalText) {
+        const highlightedStyle = new DrawerStyle({
+          text: new DrawerText({
+            text: originalText.getText(),
+            fill: originalText.getFill()!,
+            stroke: new Stroke({
+              color: 'rgba(255, 235, 59, 0.8)', // Yellow highlight
+              width: (originalText.getStroke()?.getWidth() || 1) + 2, // Thicker
+            }),
+            rotation: originalText.getRotation(),
+            italic: originalText.getItalic(),
+            bold: originalText.getBold(),
+            size: originalText.getSize(),
+            fontFamily: originalText.getFontFamily(),
+            offsetX: originalText.getOffsetX(),
+            offsetY: originalText.getOffsetY(),
+          }),
+        });
+        this.selectedFeature.setStyle(highlightedStyle);
+      }
+    } else if (this.selectedFeature.getGeometry() instanceof Point) {
+      // For icons: replace with a simple yellow circle highlight during translation
+      const highlightedStyle = new DrawerStyle({
+        image: new CircleStyle({
+          radius: 8,
+          fill: new Fill({ color: 'rgba(255, 235, 59, 0.5)' }), // Semi-transparent yellow
+          stroke: new Stroke({ color: 'rgba(255, 235, 59, 1)', width: 3 }), // Solid yellow border
+        }),
+      });
+      this.selectedFeature.setStyle(highlightedStyle);
+      this.selectedFeature.changed();
+    } else {
+      // Stroke/fill highlighting for LineString, Polygon, Circle
+      const highlightedStyle = new DrawerStyle({
+        stroke: originalStyle.getStroke()
+          ? new Stroke({
+              color: 'rgba(255, 235, 59, 0.8)', // Yellow
+              width: (originalStyle.getStroke()?.getWidth() || 1.3) + 2, // Thicker
+            })
+          : undefined,
+        fill: originalStyle.getFill()
+          ? new Fill({
+              color: originalStyle.getFill()!.getColor() as string,
+            })
+          : undefined,
+      });
+
+      this.selectedFeature.setStyle(highlightedStyle);
+    }
+  }
+
+  // #endregion METHODS - PRIVATE
+
+  // #region HANDLE CREATION - PUBLIC
+
+  /**
+   * Creates handles for the selected feature.
+   */
+  createHandles(): void {
+    if (!this.selectedFeature) return;
+
+    // For text features, show text editor instead of handles
+    if (OLTransform.#isTextFeature(this.selectedFeature)) {
+      this.#createTextHandles();
+      return;
+    }
+
+    const geometry = this.selectedFeature.getGeometry();
+    if (!geometry) return;
+
+    // Handles for Points
+    if (geometry instanceof Point) {
+      if (this.options.enableDelete) {
+        const coords = geometry.getCoordinates();
+        const offset = this.#getMapBasedPadding() * 2;
+        this.#createHandle([coords[0] + offset, coords[1] + offset], HandleType.DELETE);
+      }
+      return;
+    }
+
+    // Handles for Circles
+    if (geometry instanceof Circle) {
+      const center = geometry.getCenter();
+      const radius = geometry.getRadius();
+      const edgePoint: Coordinate = [center[0] + radius, center[1]];
+
+      // Create center vertex (for moving)
+      this.#createHandle(center, HandleType.VERTEX, { vertexIndex: 0, isCircleCenter: true });
+
+      // Create edge vertex (for resizing)
+      this.#createHandle(edgePoint, HandleType.VERTEX, { vertexIndex: 1, isCircleEdge: true });
+
+      // Create delete handle
+      if (this.options.enableDelete) {
+        const offset = this.#getMapBasedPadding();
+        this.#createHandle([center[0] + radius + offset, center[1] + offset], HandleType.DELETE);
+      }
+      return;
+    }
+
+    // Handles for other geometries (LineString, Polygon)
+    // Get the extent of the feature
+    const extent = geometry.getExtent();
+    const padding = this.#getMapBasedPadding();
+    const expandedExtent: Extent = [extent[0] - padding, extent[1] - padding, extent[2] + padding, extent[3] + padding];
+    const center = getCenter(extent);
+    this.center = center;
+
+    // Create extent boundary
+    this.#createExtentBoundary(expandedExtent);
+
+    // Create handles based on the options
+    if (this.options.scale) {
+      this.#createScaleHandles(expandedExtent);
+    }
+
+    if (this.options.stretch) {
+      this.#createStretchHandles(expandedExtent);
+    }
+
+    if (this.options.rotate) {
+      this.#createRotateHandle(expandedExtent);
+    }
+
+    if (this.options.enableDelete) {
+      this.#createDeleteHandle(expandedExtent);
+    }
+
+    if (geometry instanceof LineString || geometry instanceof Polygon) {
+      this.#createVertexHandles(geometry);
+    }
+  }
+
+  /**
+   * Clears all handles.
+   */
+  clearHandles(): void {
+    this.handleSource.clear();
+  }
+
+  /**
+   * Updates the handles to match the new geometry.
+   */
+  updateHandles(): void {
+    // Clear existing handles
+    this.clearHandles();
+
+    // Create new handles
+    this.createHandles();
+  }
+
+  // #endregion HANDLE CREATION - PUBLIC
+
+  // #region HANDLE CREATION - PRIVATE
+
+  /**
+   * Creates a handle at the specified coordinate with the given type.
+   *
+   * @param coordinate - The coordinate for the handle
+   * @param type - The type of handle
+   */
+  #createHandle(coordinate: Coordinate, type: HandleType, properties?: CreateHandleProps): void {
+    const handle = new Feature({
+      geometry: new Point(coordinate),
+      handleType: type,
+      ...properties,
+    });
+
+    // Store a reference to the selected feature in the handle
+    handle.set('feature', this.selectedFeature);
+
+    // Update Rotate Icon Rotation
+    if (type === HandleType.ROTATE) {
+      const text = ROTATE_STYLE.getText();
+      if (text) {
+        text.setRotation(this.angle);
+        ROTATE_STYLE.setText(text);
+      }
+    }
+
+    // Apply style based on handle type
+    switch (type) {
+      case HandleType.VERTEX:
+        handle.setStyle(VERTEX_STYLE);
+        break;
+      case HandleType.ROTATE:
+        handle.setStyle(ROTATE_STYLE);
+        break;
+      case HandleType.DELETE:
+        handle.setStyle(DELETE_STYLE);
+        break;
+      case HandleType.SCALE_NE:
+      case HandleType.SCALE_SE:
+      case HandleType.SCALE_SW:
+      case HandleType.SCALE_NW:
+        handle.setStyle(SCALE_STYLE);
+        break;
+      case HandleType.STRETCH_N:
+      case HandleType.STRETCH_E:
+      case HandleType.STRETCH_S:
+      case HandleType.STRETCH_W:
+        handle.setStyle(STRETCH_STYLE);
+        break;
+      default:
+        break;
+    }
+
+    // Add the handle to the source
+    this.handleSource.addFeature(handle);
+  }
+
+  /**
+   * Creates the extent boundary rectangle.
+   *
+   * @param extent - The expanded extent
+   */
+  #createExtentBoundary(extent: Extent): void {
+    const [minX, minY, maxX, maxY] = extent;
+    const boundaryGeometry = new LineString([
+      [minX, minY],
+      [maxX, minY],
+      [maxX, maxY],
+      [minX, maxY],
+      [minX, minY],
+    ]);
+
+    const boundary = new Feature({
+      geometry: boundaryGeometry,
+      handleType: HandleType.BOUNDARY,
+    });
+
+    boundary.setStyle(EXTENT_BOUNDARY_STYLE);
+    this.handleSource.addFeature(boundary);
+  }
+
+  /**
+   * Creates scale handles at the corners of the extent.
+   *
+   * @param extent - The extent of the feature
+   */
+  #createScaleHandles(extent: Extent): void {
+    const [minX, minY, maxX, maxY] = extent;
+
+    // Create corner handles
+    this.#createHandle([minX, minY], HandleType.SCALE_SW);
+    this.#createHandle([maxX, minY], HandleType.SCALE_SE);
+    this.#createHandle([maxX, maxY], HandleType.SCALE_NE);
+    this.#createHandle([minX, maxY], HandleType.SCALE_NW);
+  }
+
+  /**
+   * Creates stretch handles at the middle of each side of the extent.
+   *
+   * @param extent - The extent of the feature
+   */
+  #createStretchHandles(extent: Extent): void {
+    const [minX, minY, maxX, maxY] = extent;
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+
+    // Create middle handles
+    this.#createHandle([centerX, minY], HandleType.STRETCH_S);
+    this.#createHandle([maxX, centerY], HandleType.STRETCH_E);
+    this.#createHandle([centerX, maxY], HandleType.STRETCH_N);
+    this.#createHandle([minX, centerY], HandleType.STRETCH_W);
+  }
+
+  /**
+   * Creates a rotation handle above the feature.
+   *
+   * @param extent - The extent of the feature
+   */
+  #createRotateHandle(extent: Extent): void {
+    const [minX, , maxX, maxY] = extent;
+    const centerX = (minX + maxX) / 2;
+    const offset = this.#getMapBasedPadding() * 2;
+
+    const lineStart: Coordinate = [centerX, maxY];
+    const lineEnd: Coordinate = [centerX, maxY + offset];
+
+    // Create line from top stretch to rotate handle
+    const line = new Feature({
+      geometry: new LineString([lineStart, lineEnd]),
+      handleType: HandleType.ROTATE_LINE,
+    });
+    line.setStyle(ROTATE_LINE_STYLE);
+    this.handleSource.addFeature(line);
+
+    // Create rotate handle at end of line
+    this.#createHandle(lineEnd, HandleType.ROTATE);
+  }
+
+  /**
+   * Creates a delete handle for the feature.
+   *
+   * @param extent - The extent of the feature
+   */
+  #createDeleteHandle(extent: Extent): void {
+    const [, minY, maxX] = extent;
+    const offset = this.#getMapBasedPadding() * 1.3;
+
+    const deletePos: Coordinate = [maxX + offset, minY - offset];
+    this.#createHandle(deletePos, HandleType.DELETE);
+  }
+
+  /**
+   * Creates vertex handles for LineString and Polygon geometries.
+   *
+   * @param geometry - The geometry to create vertex handles for
+   */
+  #createVertexHandles(geometry: LineString | Polygon): void {
+    let coordinates: Coordinate[];
+
+    if (geometry instanceof LineString) {
+      coordinates = geometry.getCoordinates();
+    } else {
+      // For polygons, use the exterior ring
+      [coordinates] = geometry.getCoordinates();
+    }
+
+    // Create vertex handles
+    coordinates.forEach((coord, index) => {
+      // Skip the last coordinate for polygons (it's the same as the first)
+      if (geometry instanceof Polygon && index === coordinates.length - 1) return;
+
+      const vertexHandle = new Feature({
+        geometry: new Point(coord),
+        handleType: HandleType.VERTEX,
+        vertexIndex: index,
+      });
+
+      vertexHandle.set('feature', this.selectedFeature);
+      vertexHandle.setStyle(VERTEX_STYLE);
+      this.handleSource.addFeature(vertexHandle);
+    });
+
+    // Create edge midpoint handles for adding vertices
+    for (let i = 0; i < coordinates.length - 1; i++) {
+      const start = coordinates[i];
+      const end = coordinates[i + 1];
+      const midpoint: Coordinate = [(start[0] + end[0]) / 2, (start[1] + end[1]) / 2];
+
+      const midpointHandle = new Feature({
+        geometry: new Point(midpoint),
+        handleType: HandleType.EDGE_MIDPOINT,
+        edgeIndex: i,
+      });
+
+      midpointHandle.set('feature', this.selectedFeature);
+      midpointHandle.setStyle(EDGE_MIDPOINT_STYLE);
+      this.handleSource.addFeature(midpointHandle);
+    }
+  }
+
+  // #endregion HANDLE CREATION - PRIVATE
+
+  // #region HANDLERS
+
+  /**
+   * Handles when a feature is removed from the collection.
+   *
+   * @param event - The event containing the removed feature
+   */
+  #handleFeatureRemove(event: { element: Feature }): void {
+    const feature = event.element;
+
+    // If this was the selected feature, clear the selection
+    if (this.selectedFeature === feature) {
+      this.clearSelection();
+    }
+  }
+
+  /**
+   * Handles translation of a feature.
+   *
+   * @param deltaX - The change in X coordinate
+   * @param deltaY - The change in Y coordinate
+   */
+  #handleTranslate(deltaX: number, deltaY: number): void {
+    if (!this.selectedFeature || !this.startGeometry) return;
+
+    // Clone the original geometry
+    const geometry = this.startGeometry.clone();
+
+    // Translate the geometry
+    if (geometry instanceof Point) {
+      const coords = geometry.getCoordinates();
+      geometry.setCoordinates([coords[0] + deltaX, coords[1] + deltaY]);
+    } else if (geometry instanceof LineString) {
+      const coords = geometry.getCoordinates();
+      geometry.setCoordinates(coords.map((coord) => [coord[0] + deltaX, coord[1] + deltaY]));
+    } else if (geometry instanceof Polygon) {
+      const coords = geometry.getCoordinates();
+      geometry.setCoordinates(coords.map((ring) => ring.map((coord) => [coord[0] + deltaX, coord[1] + deltaY])));
+    }
+
+    // Update the feature with the new geometry
+    this.selectedFeature.setGeometry(geometry);
+
+    // Update text editor overlay position if it exists
+    if (this.#textEditOverlay && OLTransform.#isTextFeature(this.selectedFeature)) {
+      const newCoords = (geometry as Point).getCoordinates();
+      this.#textEditOverlay.setPosition(newCoords);
+    }
+
+    // Update the center
+    if (this.center) {
+      this.center = [this.center[0] + deltaX, this.center[1] + deltaY];
+    }
+  }
+
+  /**
+   * Handles rotation of a feature.
+   *
+   * @param coordinate - The current coordinate
+   */
+  #handleRotate(coordinate: Coordinate): void {
+    if (!this.selectedFeature || !this.startGeometry || !this.center || !this.startCoordinate) return;
+
+    // Calculate the angle between the start point and the current point
+    const startAngle = Math.atan2(this.startCoordinate[1] - this.center[1], this.startCoordinate[0] - this.center[0]);
+
+    const currentAngle = Math.atan2(coordinate[1] - this.center[1], coordinate[0] - this.center[0]);
+
+    // Calculate the rotation angle
+    this.angle = currentAngle - startAngle;
+
+    // Clone the original geometry
+    const geometry = this.startGeometry.clone();
+
+    // For text features, update the text style with rotation
+    if (OLTransform.#isTextFeature(this.selectedFeature)) {
+      this.#handleTextRotate(coordinate);
+      return;
+    }
+
+    // Rotate the geometry
+    const { center } = this;
+    if (geometry instanceof Point) {
+      const coords = geometry.getCoordinates();
+      const rotatedCoords = OLTransform.rotateCoordinate(coords, this.center, this.angle);
+      geometry.setCoordinates(rotatedCoords);
+    } else if (geometry instanceof LineString) {
+      const coords = geometry.getCoordinates();
+      const rotatedCoords = coords.map((coord) => OLTransform.rotateCoordinate(coord, center, this.angle));
+      geometry.setCoordinates(rotatedCoords);
+    } else if (geometry instanceof Polygon) {
+      const coords = geometry.getCoordinates();
+      const rotatedCoords = coords.map((ring) => ring.map((coord) => OLTransform.rotateCoordinate(coord, center, this.angle)));
+      geometry.setCoordinates(rotatedCoords);
+    }
+
+    // Update the feature with the new geometry
+    this.selectedFeature.setGeometry(geometry);
+  }
+
+  /**
+   * Handles scaling of a feature.
+   *
+   * @param coordinate - The current coordinate
+   * @param handleType - The type of handle being dragged
+   * @param ctrlKey - If the ctrlKey is being pressed to maintain the ratio
+   */
+  #handleScale(coordinate: Coordinate, handleType: HandleType, ctrlKey = false): void {
+    if (!this.selectedFeature || !this.startGeometry) return;
+
+    // Handle text scaling differently
+    if (OLTransform.#isTextFeature(this.selectedFeature)) {
+      this.#handleTextScale(coordinate, handleType);
+      return;
+    }
+
+    // Get the extent of the original geometry
+    const extent = this.startGeometry.getExtent();
+    const [minX, minY, maxX, maxY] = extent;
+    const width = maxX - minX;
+    const height = maxY - minY;
+
+    // Calculate scale factors based on the handle being dragged
+    let scaleX = 1;
+    let scaleY = 1;
+    let anchorPoint: Coordinate;
+
+    switch (handleType) {
+      case HandleType.SCALE_NE:
+        scaleX = (coordinate[0] - minX) / width;
+        scaleY = (coordinate[1] - minY) / height;
+        anchorPoint = [minX, minY]; // SW corner fixed
+        break;
+
+      case HandleType.SCALE_SE:
+        scaleX = (coordinate[0] - minX) / width;
+        scaleY = (maxY - coordinate[1]) / height;
+        anchorPoint = [minX, maxY]; // NW corner fixed
+        break;
+
+      case HandleType.SCALE_SW:
+        scaleX = (maxX - coordinate[0]) / width;
+        scaleY = (maxY - coordinate[1]) / height;
+        anchorPoint = [maxX, maxY]; // NE corner fixed
+        break;
+
+      case HandleType.SCALE_NW:
+        scaleX = (maxX - coordinate[0]) / width;
+        scaleY = (coordinate[1] - minY) / height;
+        anchorPoint = [maxX, minY]; // SE corner fixed
+        break;
+      default:
+        return;
+    }
+
+    // Ensure positive scale factors
+    scaleX = Math.max(0.1, scaleX);
+    scaleY = Math.max(0.1, scaleY);
+
+    // If keeping aspect ratio, use the minimum scale factor for both
+    if (this.options.keepAspectRatio || ctrlKey) {
+      const minScale = Math.min(scaleX, scaleY);
+      scaleX = minScale;
+      scaleY = minScale;
+    }
+
+    // Clone the original geometry
+    const geometry = this.startGeometry.clone();
+
+    // Scale the geometry
+    if (geometry instanceof Point) {
+      const coords = geometry.getCoordinates();
+      const scaledCoords = OLTransform.scaleCoordinate(coords, anchorPoint, scaleX, scaleY);
+      geometry.setCoordinates(scaledCoords);
+    } else if (geometry instanceof LineString) {
+      const coords = geometry.getCoordinates();
+      const scaledCoords = coords.map((coord) => OLTransform.scaleCoordinate(coord, anchorPoint, scaleX, scaleY));
+      geometry.setCoordinates(scaledCoords);
+    } else if (geometry instanceof Polygon) {
+      const coords = geometry.getCoordinates();
+      const scaledCoords = coords.map((ring) => ring.map((coord) => OLTransform.scaleCoordinate(coord, anchorPoint, scaleX, scaleY)));
+      geometry.setCoordinates(scaledCoords);
+    }
+
+    // Update the feature with the new geometry
+    this.selectedFeature.setGeometry(geometry);
+  }
+
+  /**
+   * Handles stretching of a feature.
+   *
+   * @param coordinate - The current coordinate
+   * @param handleType - The type of handle being dragged
+   */
+  #handleStretch(coordinate: Coordinate, handleType: HandleType): void {
+    if (!this.selectedFeature || !this.startGeometry) return;
+
+    // Get the extent of the original geometry
+    const extent = this.startGeometry.getExtent();
+    const [minX, minY, maxX, maxY] = extent;
+
+    // Calculate stretch factors
+    let scaleX = 1;
+    let scaleY = 1;
+    let anchorPoint: Coordinate;
+
+    switch (handleType) {
+      case HandleType.STRETCH_N:
+        scaleY = (coordinate[1] - minY) / (maxY - minY);
+        anchorPoint = [(minX + maxX) / 2, minY]; // South edge fixed
+        break;
+
+      case HandleType.STRETCH_E:
+        scaleX = (coordinate[0] - minX) / (maxX - minX);
+        anchorPoint = [minX, (minY + maxY) / 2]; // West edge fixed
+        break;
+
+      case HandleType.STRETCH_S:
+        scaleY = (maxY - coordinate[1]) / (maxY - minY);
+        anchorPoint = [(minX + maxX) / 2, maxY]; // North edge fixed
+        break;
+
+      case HandleType.STRETCH_W:
+        scaleX = (maxX - coordinate[0]) / (maxX - minX);
+        anchorPoint = [maxX, (minY + maxY) / 2]; // East edge fixed
+        break;
+      default:
+        return;
+    }
+
+    // Ensure positive scale factors
+    scaleX = Math.max(0.1, scaleX);
+    scaleY = Math.max(0.1, scaleY);
+
+    // Clone and scale the geometry
+    const geometry = this.startGeometry.clone();
+    if (geometry instanceof Point) {
+      const coords = geometry.getCoordinates();
+      const scaledCoords = OLTransform.scaleCoordinate(coords, anchorPoint, scaleX, scaleY);
+      geometry.setCoordinates(scaledCoords);
+    } else if (geometry instanceof LineString) {
+      const coords = geometry.getCoordinates();
+      const scaledCoords = coords.map((coord) => OLTransform.scaleCoordinate(coord, anchorPoint, scaleX, scaleY));
+      geometry.setCoordinates(scaledCoords);
+    } else if (geometry instanceof Polygon) {
+      const coords = geometry.getCoordinates();
+      const scaledCoords = coords.map((ring) => ring.map((coord) => OLTransform.scaleCoordinate(coord, anchorPoint, scaleX, scaleY)));
+      geometry.setCoordinates(scaledCoords);
+    }
+
+    // Update the feature with the new geometry
+    this.selectedFeature.setGeometry(geometry);
+  }
+
+  /**
+   * Handles double-click events for text editing.
+   *
+   * @param event - The map browser event
+   * @returns Whether the event was handled
+   */
+  #handleDoubleClick(event: MapBrowserEvent<PointerEvent>): boolean {
+    const { map } = event;
+    const features = map.getFeaturesAtPixel(event.pixel, { hitTolerance: this.options.hitTolerance });
+
+    if (features && features.length > 0) {
+      const feature = features[0] as Feature;
+      if (this.features.getArray().includes(feature) && OLTransform.#isTextFeature(feature)) {
+        // Prevent default zoom behaviour
+        event.preventDefault();
+        event.stopPropagation();
+
+        // Select the feature if not already selected
+        if (this.selectedFeature !== feature) {
+          this.selectFeature(feature);
+        }
+        // Show text editor
+        this.showTextEditor();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Handles moving a vertex.
+   *
+   * @param coordinate - The new coordinate
+   * @param vertexHandle - The vertex handle being dragged
+   */
+  #handleVertexMove(coordinate: Coordinate, vertexHandle?: Feature): void {
+    if (!this.selectedFeature || !vertexHandle) return;
+
+    const geometry = this.selectedFeature.getGeometry();
+    if (geometry instanceof Circle) {
+      const isCenter = vertexHandle.get('isCircleCenter');
+      const isEdge = vertexHandle.get('isCircleEdge');
+
+      if (isCenter) {
+        // Move the circle center
+        geometry.setCenter(coordinate);
+      } else if (isEdge) {
+        // Resize the circle
+        const center = geometry.getCenter();
+        const newRadius = Math.sqrt((coordinate[0] - center[0]) ** 2 + (coordinate[1] - center[1]) ** 2);
+        geometry.setRadius(newRadius);
+      }
+      return;
+    }
+
+    const vertexIndex = vertexHandle.get('vertexIndex');
+
+    if (geometry instanceof LineString) {
+      const coords = geometry.getCoordinates();
+      coords[vertexIndex] = coordinate;
+      geometry.setCoordinates(coords);
+    } else if (geometry instanceof Polygon) {
+      const coords = geometry.getCoordinates();
+      coords[0][vertexIndex] = coordinate;
+      // move last vertex too if it's the first vertex for a polygon
+      if (vertexIndex === 0) {
+        coords[0][coords[0].length - 1] = coordinate;
+      }
+
+      geometry.setCoordinates(coords);
+    }
+  }
+
+  /**
+   * Handles adding a new vertex.
+   *
+   * @param coordinate - The coordinate for the new vertex
+   * @param midpointHandle - The midpoint handle being dragged
+   */
+  #handleAddVertex(coordinate: Coordinate, midpointHandle?: Feature): void {
+    if (!this.selectedFeature || !midpointHandle || this.#vertexAdded) return;
+
+    const edgeIndex = midpointHandle.get('edgeIndex');
+    const geometry = this.selectedFeature.getGeometry();
+
+    if (geometry instanceof LineString) {
+      const coords = geometry.getCoordinates();
+      coords.splice(edgeIndex + 1, 0, coordinate);
+      geometry.setCoordinates(coords);
+    } else if (geometry instanceof Polygon) {
+      const coords = geometry.getCoordinates();
+      coords[0].splice(edgeIndex + 1, 0, coordinate);
+      geometry.setCoordinates(coords);
+    }
+
+    this.#vertexAdded = true;
+
+    this.clearHandles();
+  }
+
+  // #endregion HANDLERS
+
+  // #region METHODS - TEXT EDITING - PUBLIC
+
+  /**
+   * Creates a simple text editor for text features
+   */
+  showTextEditor(): void {
+    if (!this.mapViewer?.map || this.#textEditOverlay || !this.selectedFeature) return;
+
+    const geometry = this.selectedFeature.getGeometry();
+    if (!(geometry instanceof Point)) return;
+
+    const position = geometry.getCoordinates();
+    const currentStyle = (this.#originalStyleBeforeHighlight || this.selectedFeature.getStyle()) as DrawerStyle;
+    const currentText = currentStyle.getTextContent() as string;
+    const currentSize = currentStyle.getTextSize();
+    const currentColor = currentStyle.getTextColor();
+    const currentFont = currentStyle.getTextFontFamily();
+
+    // Hide the original text on the map by assigning an empty text style
+    this.#originalTextStyle = currentStyle;
+    this.selectedFeature.setStyle(new DrawerStyle());
+
+    // Create simple text editor element
+    this.#textEditorElement = document.createElement('div');
+    this.#textEditorElement.contentEditable = 'true';
+    this.#textEditorElement.textContent = currentText;
+    this.#textEditorElement.style.cssText = `
+    background: rgba(255, 255, 255, 0.3);
+    border: 2px solid #007cba;
+    border-radius: 3px;
+    border: none;
+    padding: 4px;
+    font-size: ${currentSize}px;
+    font-family: ${currentFont};
+    color: ${currentColor};
+    outline: none;
+    cursor: text;
+    white-space: nowrap;
+    min-width: 50px;
+  `;
+
+    // Create overlay positioned to match map text exactly
+    this.#textEditOverlay = new Overlay({
+      element: this.#textEditorElement,
+      positioning: 'center-center',
+      offset: [0, 0], // Match the original text offsetY
+      stopEvent: false,
+    });
+
+    this.#textEditOverlay.setPosition(position);
+    this.mapViewer.map.addOverlay(this.#textEditOverlay);
+    this.#isTextEditing = true;
+
+    // Add keyboard shortcuts
+    this.#textEditorElement.addEventListener('keydown', (e) => {
+      if (!this.selectedFeature) return;
+      if (e.ctrlKey || e.metaKey) {
+        switch (e.key.toLowerCase()) {
+          case 'b':
+            e.preventDefault();
+            e.stopPropagation();
+            this.#toggleBold();
+            this.onTransformEnd?.(new TransformEvent('transformend', this.selectedFeature));
+            break;
+          case 'i':
+            e.preventDefault();
+            e.stopPropagation();
+            this.#toggleItalic();
+            this.onTransformEnd?.(new TransformEvent('transformend', this.selectedFeature));
+            break;
+          default:
+            return;
+        }
+      }
+
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.#applyTextChanges();
+        this.onTransformEnd?.(new TransformEvent('transformend', this.selectedFeature));
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        this.#cancelTextEditing();
+      }
+    });
+
+    // Focus and select text
+    setTimeout(() => {
+      if (this.#textEditorElement) {
+        this.#textEditorElement.focus();
+        const selection = window.getSelection();
+        if (selection) {
+          const range = document.createRange();
+          range.selectNodeContents(this.#textEditorElement);
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+      }
+    }, TIMEOUT.interactionFocusText);
+  }
+
+  // #endregion METHODS - TEXT EDITING - PUBLIC
+
+  // #region METHODS - TEXT EDITING - PRIVATE
+
+  /**
+   * Calculates the visual extent of text based on its properties.
+   *
+   * @returns The text extent or null if calculation fails
+   */
+  #calculateTextExtent(): Extent | null {
+    if (!this.selectedFeature) return null;
+
+    const geometry = this.selectedFeature.getGeometry();
+    if (!(geometry instanceof Point)) return null;
+
+    const coords = geometry.getCoordinates();
+    const currentStyle = this.selectedFeature.getStyle() as DrawerStyle;
+    const text = currentStyle.getTextContent();
+    const fontSize = currentStyle.getTextSize();
+
+    const resolution = this.mapViewer?.map?.getView().getResolution() || 1;
+
+    const charWidth = fontSize * 0.6;
+    const textWidth = text.length * charWidth;
+    const textHeight = fontSize * 1.2;
+
+    const mapWidth = textWidth * resolution;
+    const mapHeight = textHeight * resolution;
+
+    // Text is centered horizontally
+    const textCenterY = coords[1];
+    const textLeft = coords[0] - mapWidth / 2.5;
+    const textRight = coords[0] + mapWidth / 2.5;
+    const textBottom = textCenterY - mapHeight / 1.25;
+    const textTop = textCenterY + mapHeight / 1.25;
+
+    return [textLeft, textBottom, textRight, textTop];
+  }
+
+  /**
+   * Handles scaling for text features.
+   *
+   * @param coordinate - The current coordinate
+   * @param handleType - The handle type being dragged
+   */
+  #handleTextScale(coordinate: Coordinate, handleType: HandleType): void {
+    if (!this.selectedFeature || !this.startCoordinate) return;
+
+    const textExtent = this.#calculateTextExtent();
+
+    // Use the original text extent from when dragging started (fixed reference)
+    if (!this.#originalTextExtent && textExtent) {
+      this.#originalTextExtent = textExtent;
+      const currentStyle = this.selectedFeature.getStyle() as DrawerStyle;
+      this.#originalTextSize = currentStyle.getTextSize();
+    }
+
+    if (!this.#originalTextExtent) return;
+
+    const [minX, minY, maxX, maxY] = this.#originalTextExtent;
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+
+    // Calculate distance from center to current mouse position
+    const currentDistance = Math.sqrt((coordinate[0] - centerX) ** 2 + (coordinate[1] - centerY) ** 2);
+
+    // Calculate distance from center to the original handle position
+    let originalHandlePos: Coordinate;
+    switch (handleType) {
+      case HandleType.SCALE_SE:
+        originalHandlePos = [maxX, minY];
+        break;
+      case HandleType.SCALE_SW:
+        originalHandlePos = [minX, minY];
+        break;
+      case HandleType.SCALE_NE:
+        originalHandlePos = [maxX, maxY];
+        break;
+      case HandleType.SCALE_NW:
+        originalHandlePos = [minX, maxY];
+        break;
+      default:
+        return;
+    }
+
+    const originalDistance = Math.sqrt((originalHandlePos[0] - centerX) ** 2 + (originalHandlePos[1] - centerY) ** 2);
+
+    // Use a more conservative scaling factor
+    const scaleFactor = Math.max(0.3, currentDistance / originalDistance);
+    const newSize = Math.max(8, Math.round(this.#originalTextSize! * scaleFactor));
+
+    // Only update if size actually changed
+    const currentStyle = this.selectedFeature.getStyle() as DrawerStyle;
+    if (newSize !== currentStyle.getTextSize()) {
+      const drawerText = currentStyle.getDrawerText();
+      if (drawerText) {
+        drawerText.setSize(newSize);
+        this.selectedFeature.changed();
+      }
+
+      // Update text editor element if exists
+      if (this.#textEditorElement) {
+        this.#textEditorElement.style.fontSize = `${newSize}px`;
+      }
+    }
+  }
+
+  /**
+   * Handles rotation for text features.
+   *
+   * @param coordinate - The current coordinate
+   */
+  #handleTextRotate(coordinate: Coordinate): void {
+    if (!this.selectedFeature || !this.center || !this.startCoordinate) return;
+
+    // Calculate the rotation angle
+    const startAngle = Math.atan2(this.startCoordinate[1] - this.center[1], this.startCoordinate[0] - this.center[0]);
+    const currentAngle = Math.atan2(coordinate[1] - this.center[1], coordinate[0] - this.center[0]);
+    const deltaAngle = -(currentAngle - startAngle);
+
+    this.angle = this.#originalTextRotation! + deltaAngle;
+
+    // Update text style with rotation
+    const currentStyle = this.selectedFeature.getStyle() as DrawerStyle;
+    const drawerText = currentStyle.getDrawerText();
+    if (drawerText) {
+      drawerText.setRotation(this.angle);
+      this.selectedFeature.changed();
+    }
+  }
+
+  /**
+   * Toggles bold formatting
+   */
+  #toggleBold(): void {
+    if (!this.#textEditorElement || !this.selectedFeature) return;
+
+    const drawerText = this.#originalTextStyle?.getDrawerText();
+    if (!drawerText) return;
+
+    const isBold = drawerText.getBold();
+    const newBold = !isBold;
+
+    drawerText.setBold(newBold);
+    this.#textEditorElement.style.fontWeight = newBold ? 'bold' : 'normal';
+  }
+
+  /**
+   * Toggles italic formatting
+   */
+  #toggleItalic(): void {
+    if (!this.#textEditorElement || !this.selectedFeature) return;
+
+    const drawerText = this.#originalTextStyle?.getDrawerText();
+    if (!drawerText) return;
+
+    const isItalic = drawerText.getItalic();
+    const newItalic = !isItalic;
+
+    drawerText.setItalic(newItalic);
+    this.#textEditorElement.style.fontStyle = newItalic ? 'italic' : 'normal';
+  }
+
+  /**
+   * Applies text changes and shows final result
+   */
+  #applyTextChanges(): void {
+    if (!this.#textEditorElement || !this.selectedFeature) return;
+
+    const finalText = this.#textEditorElement.innerHTML.replace(/<br\s*\/?>/gi, '\n') || 'Text';
+    const originalStyle = this.#originalTextStyle as DrawerStyle;
+
+    const finalStyle = new DrawerStyle({
+      text: new DrawerText({
+        text: finalText,
+        fill: new Fill({ color: originalStyle.getTextColor() }),
+        stroke: new Stroke({
+          color: originalStyle.getTextHaloColor(),
+          width: originalStyle.getTextHaloWidth(),
+        }),
+        bold: originalStyle.getTextBold() || false,
+        italic: originalStyle.getTextItalic() || false,
+        size: originalStyle.getTextSize(),
+        fontFamily: originalStyle.getTextFontFamily(),
+        rotation: originalStyle.getTextRotation(),
+      }),
+    });
+
+    this.selectedFeature.setStyle(finalStyle);
+    this.#hideTextEditor();
+
+    // Create regular handles after text editing is done
+    this.#createTextHandles();
+  }
+
+  /**
+   * Creates handles around the text's visual extent
+   */
+  #createTextHandles(): void {
+    if (!this.selectedFeature) return;
+
+    const textExtent = this.#calculateTextExtent();
+    if (!textExtent) return;
+
+    const [minX, minY, maxX, maxY] = textExtent;
+
+    // Only clear handles if we're not currently text editing
+    if (!this.#isTextEditing) {
+      this.clearHandles();
+    }
+
+    // Get the center and text rotation
+    this.center = [(minX + maxX) / 2, (minY + maxY) / 2];
+    const currentStyle = this.selectedFeature.getStyle() as DrawerStyle;
+    const textRotation = currentStyle.getTextRotation();
+
+    // Calculate rotated handle positions
+    const corners = [
+      [minX, minY], // SW
+      [maxX, minY], // SE
+      [maxX, maxY], // NE
+      [minX, maxY], // NW
+    ];
+
+    const rotatedCorners = corners.map((corner) => OLTransform.rotateCoordinate(corner, this.center!, -textRotation));
+
+    // Create rotated extent boundary
+    const rotatedBoundary = [rotatedCorners[0], rotatedCorners[1], rotatedCorners[2], rotatedCorners[3], rotatedCorners[0]];
+    const boundaryGeometry = new LineString(rotatedBoundary);
+    const boundary = new Feature({
+      geometry: boundaryGeometry,
+      handleType: HandleType.BOUNDARY,
+    });
+    boundary.setStyle(EXTENT_BOUNDARY_STYLE);
+    this.handleSource.addFeature(boundary);
+
+    // Create rotated scale handles
+    this.#createHandle(rotatedCorners[0], HandleType.SCALE_SW);
+    this.#createHandle(rotatedCorners[1], HandleType.SCALE_SE);
+    this.#createHandle(rotatedCorners[2], HandleType.SCALE_NE);
+    this.#createHandle(rotatedCorners[3], HandleType.SCALE_NW);
+
+    // Add rotation handle if rotation is enabled
+    if (this.options.rotate) {
+      const centerX = (minX + maxX) / 2;
+      const offset = this.#getMapBasedPadding() * 2;
+
+      const lineStart: Coordinate = [centerX, maxY];
+      const lineEnd: Coordinate = [centerX, maxY + offset];
+
+      // Rotate the line positions
+      const rotatedLineStart = OLTransform.rotateCoordinate(lineStart, this.center, -textRotation);
+      const rotatedLineEnd = OLTransform.rotateCoordinate(lineEnd, this.center, -textRotation);
+
+      // Create rotated line from top to rotate handle
+      const line = new Feature({
+        geometry: new LineString([rotatedLineStart, rotatedLineEnd]),
+        handleType: HandleType.ROTATE_LINE,
+      });
+      line.setStyle(ROTATE_LINE_STYLE);
+      this.handleSource.addFeature(line);
+
+      // Create rotate handle at end of rotated line
+      this.#createHandle(rotatedLineEnd, HandleType.ROTATE);
+    }
+
+    // Add delete handle if enabled
+    if (this.options.enableDelete) {
+      const offset = this.#getMapBasedPadding() * 1.3;
+      const deletePos: Coordinate = [maxX + offset, minY - offset];
+
+      // Rotate the delete handle position
+      const rotatedDeletePos = OLTransform.rotateCoordinate(deletePos, this.center, -textRotation);
+      this.#createHandle(rotatedDeletePos, HandleType.DELETE);
+    }
+  }
+
+  /**
+   * Cancels text editing and restores original
+   */
+  #cancelTextEditing(): void {
+    if (!this.selectedFeature) return;
+    if (this.#originalTextStyle) {
+      this.selectedFeature.setStyle(this.#originalTextStyle);
+    }
+    this.#hideTextEditor();
+  }
+
+  /**
+   * Hides and removes the text editor overlay
+   */
+  #hideTextEditor(): void {
+    if (this.#textEditOverlay && this.mapViewer?.map) {
+      this.mapViewer.map.removeOverlay(this.#textEditOverlay);
+      this.#textEditOverlay = undefined;
+      this.#textEditorElement = undefined;
+      this.#originalTextStyle = undefined;
+      this.#isTextEditing = false;
+    }
+  }
+
+  // #endregion METHODS - TEXT EDITING - PRIVATE
+
+  // #region METHODS - UNDO / REDO
+
+  /**
+   * Undoes the last transformation.
+   *
+   * @returns True if undo was successful
+   */
+  undo(callback?: () => void): boolean {
+    if (!this.selectedFeature) return false;
+
+    if (this.#historyIndex <= 0) {
+      this.clearSelection(true); // true to keep the history
+      return false;
+    }
+
+    this.#historyIndex--;
+    const previousGeometry = this.#geometryHistory[this.#historyIndex];
+    this.selectedFeature.setGeometry(previousGeometry.clone());
+    this.updateHandles();
+
+    // Execute callback after state is updated
+    if (callback) callback();
+
+    return true;
+  }
+
+  /**
+   * Redoes the next transformation.
+   *
+   * @returns True if redo was successful
+   */
+  redo(callback?: () => void): boolean {
+    if (!this.selectedFeature || this.#historyIndex >= this.#geometryHistory.length - 1) return false;
+
+    this.#historyIndex++;
+    const nextGeometry = this.#geometryHistory[this.#historyIndex];
+    this.selectedFeature.setGeometry(nextGeometry.clone());
+    this.updateHandles();
+
+    // Execute callback after state is updated
+    if (callback) callback();
+
+    return true;
+  }
+
+  /**
+   * Checks if undo is available.
+   *
+   * @returns True if undo is available
+   */
+  canUndo(): boolean {
+    return this.#historyIndex >= 0;
+  }
+
+  /**
+   * Checks if redo is available.
+   *
+   * @returns True if redo is available
+   */
+  canRedo(): boolean {
+    return this.#historyIndex !== -1 && this.#historyIndex < this.#geometryHistory.length - 1;
+  }
+
+  /**
+   * Saves the current geometry state to history.
+   */
+  #saveToHistory(): void {
+    if (!this.selectedFeature) return;
+
+    const geometry = this.selectedFeature.getGeometry();
+    if (!geometry) return;
+
+    // Remove any history after current index (when undoing then making new changes)
+    this.#geometryHistory = this.#geometryHistory.slice(0, this.#historyIndex + 1);
+
+    // Add current geometry to history
+    this.#geometryHistory.push(geometry.clone());
+    this.#historyIndex++;
+
+    // Limit history size
+    if (this.#geometryHistory.length > this.#maxHistorySize) {
+      this.#geometryHistory.shift();
+      this.#historyIndex--;
+    }
+  }
+
+  /**
+   * Clears the geometry history.
+   */
+  #clearHistory(): void {
+    this.#geometryHistory = [];
+    this.#historyIndex = -1;
+  }
+
+  // #endregion METHODS - UNDO / REDO
+
+  // #region STATIC METHODS
+
+  /**
+   * Gets the cursor style for a handle type.
+   *
+   * @param handleType - The handle type
+   * @returns The cursor style
+   */
+  static getCursorForHandleType(handleType: HandleType): string {
+    switch (handleType) {
+      case HandleType.ROTATE:
+        return 'grab';
+
+      case HandleType.DELETE:
+        return 'pointer';
+
+      case HandleType.VERTEX:
+        return 'grab';
+
+      case HandleType.SCALE_NE:
+        return 'nesw-resize';
+
+      case HandleType.SCALE_SE:
+        return 'nwse-resize';
+
+      case HandleType.SCALE_SW:
+        return 'nesw-resize';
+
+      case HandleType.SCALE_NW:
+        return 'nwse-resize';
+
+      case HandleType.STRETCH_N:
+        return 'ns-resize';
+
+      case HandleType.STRETCH_E:
+        return 'ew-resize';
+
+      case HandleType.STRETCH_S:
+        return 'ns-resize';
+
+      case HandleType.STRETCH_W:
+        return 'ew-resize';
+
+      default:
+        return 'default';
+    }
+  }
+
+  /**
+   * Gets the event type from a handle type.
+   *
+   * @param handleType - The handle type
+   * @param suffix - The event suffix (start, ing, end)
+   * @returns The event type
+   */
+  static getEventTypeFromHandleType(handleType: HandleType, suffix: string): string {
+    switch (handleType) {
+      case HandleType.ROTATE:
+        return `rotate${suffix}`;
+
+      case HandleType.SCALE_NE:
+      case HandleType.SCALE_SE:
+      case HandleType.SCALE_SW:
+      case HandleType.SCALE_NW:
+        return `scale${suffix}`;
+
+      case HandleType.STRETCH_N:
+      case HandleType.STRETCH_E:
+      case HandleType.STRETCH_S:
+      case HandleType.STRETCH_W:
+        return `stretch${suffix}`;
+
+      case HandleType.TRANSLATE:
+        return `translate${suffix}`;
+
+      default:
+        return `transform${suffix}`;
+    }
+  }
+
+  // ? TODO Could these two coordinate functions be moved to a utility file?
+  /**
+   * Rotates a coordinate around a center point by an angle.
+   *
+   * @param coordinate - The coordinate to rotate
+   * @param center - The center point
+   * @param angle - The angle in radians
+   * @returns The rotated coordinate
+   */
+  static rotateCoordinate(coordinate: Coordinate, center: Coordinate, angle: number): Coordinate {
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const dx = coordinate[0] - center[0];
+    const dy = coordinate[1] - center[1];
+
+    return [center[0] + dx * cos - dy * sin, center[1] + dx * sin + dy * cos];
+  }
+
+  /**
+   * Scales a coordinate relative to a fixed point.
+   *
+   * @param coordinate - The coordinate to scale
+   * @param fixedPoint - The fixed point
+   * @param scaleX - The X scale factor
+   * @param scaleY - The Y scale factor
+   * @returns The scaled coordinate
+   */
+  static scaleCoordinate(coordinate: Coordinate, fixedPoint: Coordinate, scaleX: number, scaleY: number): Coordinate {
+    const dx = coordinate[0] - fixedPoint[0];
+    const dy = coordinate[1] - fixedPoint[1];
+
+    return [fixedPoint[0] + dx * scaleX, fixedPoint[1] + dy * scaleY];
+  }
+
+  /**
+   * Checks if a feature is a text feature.
+   *
+   * @param feature - Optional feature to check, defaults to the selected feature
+   * @returns True if it's a text feature
+   */
+  static #isTextFeature(feature: Feature | undefined): boolean {
+    if (!feature) return false;
+
+    const style = feature.getStyle();
+    return style instanceof DrawerStyle && style.isTextStyle();
+  }
+
+  // #endregion STATIC METHODS
+}
+
+/**
+ * Options for the transform interaction
+ */
+export interface TransformBaseOptions {
+  features?: Collection<Feature>;
+  source?: VectorSource;
+  translate?: boolean;
+  scale?: boolean;
+  rotate?: boolean;
+  stretch?: boolean;
+  keepAspectRatio?: boolean;
+  hitTolerance?: number;
+  enableDelete?: boolean;
+  mapViewer?: MapViewer; // MapViewer type
+}
+
+/**
+ * Properties for creating a handle feature.
+ */
+export interface CreateHandleProps {
+  vertexIndex?: number;
+  isCircleCenter?: boolean;
+  isCircleEdge?: boolean;
+}

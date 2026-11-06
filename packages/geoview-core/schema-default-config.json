@@ -1,0 +1,52 @@
+{
+  "configMeta": {
+    "version": "1.0"
+  },
+  "map": {
+    "viewSettings": {
+      "zoomAndCenter": [4.5, [-90, 60]],
+      "projection": 3978
+    },
+    "basemapOptions": {
+      "basemapId": "transport",
+      "shaded": true,
+      "labeled": true
+    },
+    "highlightColor": "aqua",
+    "overlayObjects": {},
+    "listOfGeoviewLayerConfig": []
+  },
+  "components": ["overview-map", "north-arrow"],
+  "overviewMap": {
+    "hideOnZoom": 0
+  },
+  "navBar": ["zoom", "rotation", "fullscreen", "home", "basemap-select"],
+  "appBar": {
+    "tabs": {
+      "core": ["geolocator", "legend", "details", "export"]
+    }
+  },
+  "footerBar": {
+    "tabs": {
+      "core": ["layers", "data-table"]
+    }
+  },
+  "corePackages": [],
+  "globalSettings": {
+    "canRemoveSublayers": true,
+    "disabledLayerTypes": [],
+    "showUnsymbolizedFeatures": true
+  },
+  "serviceUrls": {
+    "geocoreUrl": "https://geocore.api.geo.ca",
+    "rcsUrl": "https://gcgeo.gc.ca/geonetwork/srv/api/v2/docs/",
+    "proxyUrl": "https://maps.canada.ca/wmsproxy/ws/wmsproxy/executeFromProxy",
+    "geolocatorUrl": "https://geolocator.api.geo.ca?keys=geonames,nominatim,locate",
+    "utmZoneUrl": "https://geogratis.gc.ca/services/delimitation/en/utmzone",
+    "ntsSheetUrl": "https://geogratis.gc.ca/services/delimitation/en/nts",
+    "altitudeUrl": "https://geogratis.gc.ca/services/elevation/cdem/altitude"
+  },
+  "theme": "geo.ca",
+  "corePackagesConfig": [],
+  "externalPackages": []
+}

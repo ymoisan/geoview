@@ -1,0 +1,403 @@
+import type { TypeDisplayLanguage } from '@/api/types/map-schema-types';
+import type { TypeLayerEntryConfig, TypeGeoviewLayerConfig, TypeGeoviewLayerType, TypeOfServer } from '@/api/types/layer-schema-types';
+import { CONST_LAYER_TYPES } from '@/api/types/layer-schema-types';
+import type { TypeLayerEntryShell } from '@/api/config/validation-classes/config-base-class';
+import { formatError, NotSupportedError } from '@/core/exceptions/core-exceptions';
+import {
+  LayerGeoCoreServiceFailError,
+  LayerGeoCoreInvalidResponseError,
+  LayerGeoCoreNoLayersError,
+} from '@/core/exceptions/geocore-exceptions';
+import { Fetch } from '@/core/utils/fetch-helper';
+import { EsriDynamic } from '@/geo/layer/geoview-layers/raster/esri-dynamic';
+import { EsriFeature } from '@/geo/layer/geoview-layers/vector/esri-feature';
+import { EsriImage } from '@/geo/layer/geoview-layers/raster/esri-image';
+import { GeoJSON } from '@/geo/layer/geoview-layers/vector/geojson';
+import { GeoTIFF } from '@/geo/layer/geoview-layers/raster/geotiff';
+import { ImageStatic } from '@/geo/layer/geoview-layers/raster/image-static';
+import { KML } from '@/geo/layer/geoview-layers/vector/kml';
+import { OgcFeature } from '@/geo/layer/geoview-layers/vector/ogc-feature';
+import { VectorTiles } from '@/geo/layer/geoview-layers/raster/vector-tiles';
+import { WFS } from '@/geo/layer/geoview-layers/vector/wfs';
+import { WMS } from '@/geo/layer/geoview-layers/raster/wms';
+import { WMTS } from '@/geo/layer/geoview-layers/raster/wmts';
+import { XYZTiles } from '@/geo/layer/geoview-layers/raster/xyz-tiles';
+/** A class to generate GeoView layers config from a URL using a UUID. */
+export class UUIDmapConfigReader {
+  /**
+   * Generates GeoView layers and package configurations (i.e. geochart), from GeoCore API, using a list of UUIDs.
+   *
+   * @param baseUrl - The base url of GeoCore API
+   * @param lang - The language to get the config for
+   * @param uuids - A list of uuids to get the configurations for
+   * @param abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process
+   * @returns A promise that resolves with the layers and geocharts parsed from GeoCore
+   * @throws {LayerGeoCoreServiceFailError} When the Geocore service fails to respond
+   * @throws {LayerGeoCoreInvalidResponseError} When the Geocore service fails to respond with a valid payload
+   * @throws {LayerGeoCoreNoLayersError} When the Geocore service responds a 'valid' payload with missing layers information
+   * @throws {NotSupportedError} When the layer type read in the layerType property from Geocore payload isn't a supported type
+   */
+  static async getGVConfigFromUUIDs(
+    baseUrl: string,
+    lang: TypeDisplayLanguage,
+    uuids: string[],
+    abortSignal?: AbortSignal
+  ): Promise<UUIDmapConfigReaderResponse> {
+    let result;
+    try {
+      // Build the url
+      const url = `${baseUrl}/vcs?lang=${lang}&id=${uuids.toString()}&referrer=${window.location.hostname}`;
+
+      // Fetch the config
+      result = await Fetch.fetchJson<GeoCoreConfigResponseRoot>(url, { signal: abortSignal });
+
+      // Return the parsed response
+      return {
+        layers: this.#getLayerConfigFromResponse(uuids, result, lang),
+        customListOfLayerEntryConfig: this.#getGeocoreCustomListOfLayerEntryConfig(result, lang),
+        geocharts: this.#getGeoChartConfigFromResponse(result, lang),
+        timeSliderConfigs: this.#getTimeSliderConfigFromResponse(result, lang),
+      };
+    } catch (error: unknown) {
+      // If the promise had failed
+      if (!result) throw new LayerGeoCoreServiceFailError(uuids, formatError(error));
+
+      // Re-throw the original error otherwise
+      throw error;
+    }
+  }
+
+  /**
+   * Generates GeoView layers configurations, from Geonetwork RCS API, using a list of UUIDs.
+   *
+   * @param baseUrl - The base url of GeoCore API
+   * @param lang - The language to get the config for
+   * @param uuids - A list of uuids to get the configurations for
+   * @param abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process
+   * @returns A promise that resolves with the layers parsed from Geonetwork RCS
+   * @throws {LayerGeoCoreServiceFailError} When the Geocore service fails to respond
+   * @throws {LayerGeoCoreInvalidResponseError} When the Geocore service fails to respond with a valid payload
+   * @throws {LayerGeoCoreNoLayersError} When the Geocore service responds a 'valid' payload with missing layers information
+   * @throws {NotSupportedError} When the layer type read in the layerType property from Geocore payload isn't a supported type
+   */
+  static async getGVConfigFromUUIDsRCS(
+    baseUrl: string,
+    lang: TypeDisplayLanguage,
+    uuids: string[],
+    abortSignal?: AbortSignal
+  ): Promise<UUIDmapConfigReaderResponse> {
+    let result;
+    try {
+      // Build the url
+      const url = `${baseUrl}/${lang}/${uuids.toString()}`;
+
+      // Fetch the config
+      result = await Fetch.fetchJson<GeoCoreConfigResponseRCSLayers[]>(url, {
+        signal: abortSignal,
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      // Return the parsed response
+      // Mimic the Geocore full response but only fill the rcs. RCS from Geonetwork has no lang, so duplicate the value...
+      return {
+        layers: this.#getLayerConfigFromResponse(uuids, { response: { rcs: { en: result, fr: result }, gcs: [] } }, lang),
+      };
+    } catch (error: unknown) {
+      // If the promise had failed
+      if (!result) throw new LayerGeoCoreServiceFailError(uuids, formatError(error));
+
+      // Re-throw the original error otherwise
+      throw error;
+    }
+  }
+
+  /**
+   * Reads and parses layers configs from uuid request result.
+   *
+   * @param uuids - The uuids to read Geocore API for
+   * @param resultData - The uuid request result
+   * @param lang - The language to use
+   * @returns The layers parsed from uuid result
+   * @throws {LayerGeoCoreInvalidResponseError} When the Geocore service fails to respond with a valid payload
+   * @throws {LayerGeoCoreNoLayersError} When the Geocore service responds a 'valid' payload with missing layers information
+   * @throws {NotSupportedError} When the layer type read in the layerType property from Geocore payload isn't a supported type
+   */
+  static #getLayerConfigFromResponse(
+    uuids: string[],
+    resultData: GeoCoreConfigResponseRoot,
+    lang: TypeDisplayLanguage
+  ): TypeGeoviewLayerConfig[] {
+    // If invalid response
+    if (!resultData || !resultData.response || !resultData.response.rcs || !resultData.response.rcs[lang]) {
+      const errorMessage = resultData?.errorMessage || '<no error description>';
+      throw new LayerGeoCoreInvalidResponseError(uuids, errorMessage);
+    }
+
+    // Make sure it's an array
+    if (!Array.isArray(resultData.response.rcs[lang])) throw new LayerGeoCoreInvalidResponseError(uuids, 'empty object in rcs response');
+
+    // It's an array, it has to contain something
+    if (resultData.response.rcs[lang].length === 0) throw new LayerGeoCoreNoLayersError(uuids);
+
+    const listOfGeoviewLayerConfig: TypeGeoviewLayerConfig[] = [];
+    for (let i = 0; i < resultData.response.rcs[lang].length; i++) {
+      const data = resultData.response.rcs[lang][i];
+
+      if (data?.layers && data.layers.length > 0) {
+        const layer = data.layers[0];
+
+        if (layer) {
+          // Get RCS values and cast them
+          const layerId = layer.id;
+          const layerName = layer.name;
+          const { layerType } = layer;
+          const layerUrl = layer.url;
+          const { serverType } = layer;
+          const layerIsTimeAware = layer.isTimeAware || false;
+          const { layerEntries } = layer;
+
+          // Remove rcs. and .[lang] from geocore response
+          const idClean = `${layerId.split('.')[1]}`;
+
+          const isFeature = layerUrl.indexOf('FeatureServer') > -1;
+
+          let geoviewLayerConfig: TypeGeoviewLayerConfig;
+          if (layerType === CONST_LAYER_TYPES.ESRI_DYNAMIC && !isFeature) {
+            // Redirect
+            geoviewLayerConfig = EsriDynamic.createGeoviewLayerConfig(idClean, layerName, layerUrl, layerIsTimeAware, layerEntries);
+          } else if (isFeature) {
+            // GV: esriFeature layers as they are returned by RCS don't have a layerEntries property. It is undefined.
+            // GV: Everything needed to create the geoview layer is in the URL.
+            // GV: The geoview layer created contains only one layer entry config in the list.
+            const serviceUrl = layerUrl.split('/').slice(0, -1).join('/');
+            const layerIndex = Number(layerUrl.split('/').pop());
+
+            // Redirect
+            geoviewLayerConfig = EsriFeature.createGeoviewLayerConfig(idClean, layerName, serviceUrl, layerIsTimeAware, [
+              {
+                id: layerIndex,
+                index: layerIndex,
+                layerName,
+                source: {
+                  dataAccessPath: layerUrl,
+                },
+              },
+            ]);
+          } else if (layerType === CONST_LAYER_TYPES.ESRI_FEATURE) {
+            // Redirect
+            geoviewLayerConfig = EsriFeature.createGeoviewLayerConfig(idClean, layerName, layerUrl, layerIsTimeAware, layerEntries);
+          } else if (layerType === CONST_LAYER_TYPES.WMS) {
+            // Redirect
+            geoviewLayerConfig = WMS.createGeoviewLayerConfig(
+              idClean,
+              layerName,
+              layerUrl,
+              serverType,
+              layerIsTimeAware,
+              layerEntries,
+              WMS.DEFAULT_WMS_LAYER_GROUP_FULL_SUB_LAYERS
+            );
+          } else if (layerType === CONST_LAYER_TYPES.WFS) {
+            // Redirect
+            geoviewLayerConfig = WFS.createGeoviewLayerConfig(idClean, layerName, layerUrl, layerIsTimeAware, 'all', layerEntries);
+          } else if (layerType === CONST_LAYER_TYPES.OGC_FEATURE) {
+            // Redirect
+            geoviewLayerConfig = OgcFeature.createGeoviewLayerConfig(idClean, layerName, layerUrl, layerIsTimeAware, layerEntries);
+          } else if (layerType === CONST_LAYER_TYPES.WMTS) {
+            // Redirect
+            geoviewLayerConfig = WMTS.createGeoviewLayerConfig(idClean, layerName, layerUrl, layerIsTimeAware, layerEntries);
+          } else if (layerType === CONST_LAYER_TYPES.GEOJSON) {
+            // Redirect
+            geoviewLayerConfig = GeoJSON.createGeoviewLayerConfig(idClean, layerName, layerUrl, layerIsTimeAware, layerEntries);
+          } else if (layerType === CONST_LAYER_TYPES.KML) {
+            // Redirect
+            geoviewLayerConfig = KML.createGeoviewLayerConfig(idClean, layerName, layerUrl, layerIsTimeAware, layerEntries);
+          } else if (layerType === CONST_LAYER_TYPES.XYZ_TILES) {
+            // Redirect
+            geoviewLayerConfig = XYZTiles.createGeoviewLayerConfig(idClean, layerName, layerUrl, layerIsTimeAware, layerEntries);
+          } else if (layerType === CONST_LAYER_TYPES.VECTOR_TILES) {
+            // Redirect
+            geoviewLayerConfig = VectorTiles.createGeoviewLayerConfig(idClean, layerName, layerUrl, layerIsTimeAware, layerEntries);
+          } else if (layerType === CONST_LAYER_TYPES.GEOTIFF) {
+            // Redirect
+            geoviewLayerConfig = GeoTIFF.createGeoviewLayerConfig(idClean, layerName, layerUrl, layerIsTimeAware, layerEntries);
+          } else if (layerType === CONST_LAYER_TYPES.IMAGE_STATIC) {
+            // Redirect
+            geoviewLayerConfig = ImageStatic.createGeoviewLayerConfig(idClean, layerName, layerUrl, layerIsTimeAware, layerEntries);
+          } else if (layerType === CONST_LAYER_TYPES.ESRI_IMAGE) {
+            // GV: ESRI Image layers as they are returned by RCS don't have a layerEntries property. It is undefined.
+            // GV: Everything needed to create the geoview layer is in the URL. The layerId of the layerEntryConfig is not used,
+            // GV: but we need to create a layerEntryConfig in the list for the layer to be displayed.
+            // Redirect
+            geoviewLayerConfig = EsriImage.createGeoviewLayerConfigSimple(idClean, layerName, layerUrl, layerIsTimeAware);
+          } else {
+            // Throw
+            throw new NotSupportedError(`Layer type ${layerType} not supported`);
+          }
+
+          // Add it
+          listOfGeoviewLayerConfig.push(geoviewLayerConfig);
+        }
+      }
+    }
+    return listOfGeoviewLayerConfig;
+  }
+
+  /**
+   * Reads the list of layer entry config from the uuid request result.
+   *
+   * @param resultData - The uuid request result
+   * @param lang - The language to use to read results
+   * @returns The list of layer entry configs, or undefined if not found
+   */
+  static #getGeocoreCustomListOfLayerEntryConfig(
+    resultData: GeoCoreConfigResponseRoot,
+    lang: TypeDisplayLanguage
+  ): TypeLayerEntryConfig[] | undefined {
+    // Check for valid response format
+    if (!resultData?.response?.gcs || !Array.isArray(resultData.response.gcs)) {
+      return undefined;
+    }
+
+    // Only support listOfLayerEntryConfig.
+    const foundListConfig = resultData.response.gcs.find((gcItem) => gcItem?.[lang]?.listOfLayerEntryConfig);
+    if (foundListConfig?.[lang]?.listOfLayerEntryConfig?.length) {
+      return foundListConfig[lang].listOfLayerEntryConfig;
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Reads and parses GeoChart configs from uuid request result.
+   *
+   * @param resultData - The uuid request result
+   * @param lang - The language to use to read results
+   * @returns The list of GeoChart configs
+   */
+  static #getGeoChartConfigFromResponse(resultData: GeoCoreConfigResponseRoot, lang: TypeDisplayLanguage): GeoViewGeoChartConfig[] {
+    // If no geochart information
+    if (!resultData || !resultData.response || !resultData.response.gcs || !Array.isArray(resultData.response.gcs)) return [];
+
+    // Find all Geochart configs
+    const foundConfigs = resultData.response.gcs
+      .flatMap((gcItem) => gcItem?.[lang]?.packages?.geochart)
+      .filter((geochartValue) => !!geochartValue);
+
+    // For each found config, parse
+    const parsedConfigs: GeoViewGeoChartConfig[] = [];
+    foundConfigs.forEach((foundConfig) => {
+      // Clean the GeoCore response (it happened in past some attribute names needed to be trimmed(!))
+      const cleaned = foundConfig.layers;
+      cleaned.propertyDisplay = cleaned.propertyDisplay.trim();
+      cleaned.propertyValue = cleaned.propertyValue.trim();
+
+      // Transform GeoCoreConfig to GeoViewGeoChartConfig
+      parsedConfigs.push({ ...foundConfig, layers: [cleaned] });
+    });
+
+    // Return all configs
+    return parsedConfigs;
+  }
+
+  /**
+   * Reads and parses time-slider configs from uuid request result.
+   *
+   * @param resultData - The uuid request result
+   * @param lang - The language to use to read results
+   * @returns The list of time-slider configs
+   */
+  static #getTimeSliderConfigFromResponse(resultData: GeoCoreConfigResponseRoot, lang: TypeDisplayLanguage): GeoViewTimeSliderConfig[] {
+    // If no time-slider information
+    if (!resultData || !resultData.response || !resultData.response.gcs || !Array.isArray(resultData.response.gcs)) return [];
+
+    // Find all time-slider configs
+    const foundConfigs = resultData.response.gcs
+      .flatMap((gcItem) => gcItem?.[lang]?.packages?.['time-slider'])
+      .filter((tsValue) => !!tsValue);
+
+    // Return all found configs as-is (no transformation needed unlike geochart)
+    return foundConfigs;
+  }
+}
+
+/** The GeoCore response JSON root. */
+export type GeoCoreConfigResponseRoot = {
+  response: GeoCoreConfigResponse;
+  errorMessage?: string;
+};
+
+/** The GeoCore response payload containing RCS and GCS sections. */
+export type GeoCoreConfigResponse = {
+  // GV When Geocore fails, the payload may have an object in the rcs.en property, hence the 'GeoCoreConfigResponseRCSLayers[] | object' typing here
+  rcs: Record<TypeDisplayLanguage, GeoCoreConfigResponseRCSLayers[] | object>;
+  gcs: Record<TypeDisplayLanguage, GeoCoreConfigResponseGCSLayers>[];
+};
+
+/** The RCS response item containing layer definitions. */
+export type GeoCoreConfigResponseRCSLayers = {
+  layers: GeoCoreConfigResponseLayer[];
+};
+
+/** The GCS response item containing layer overrides and package configs. */
+export type GeoCoreConfigResponseGCSLayers = {
+  listOfLayerEntryConfig?: TypeLayerEntryConfig[];
+  packages?: GeoCoreConfigResponsePackages;
+};
+
+export type GeoCoreConfigResponsePackages = {
+  /** The geochart configurations. */
+  geochart: GeoChartGeoCoreConfig[];
+  /** Optional time-slider configurations. */
+  'time-slider'?: GeoViewTimeSliderConfig[];
+};
+
+/** The GeoCore geochart package payload. */
+export type GeoChartGeoCoreConfig = {
+  layers: GeoChartGeoCoreConfigLayer; // For GeoCore, this is not an array.
+};
+
+/** The GeoCore geochart layer payload. */
+export type GeoChartGeoCoreConfigLayer = {
+  layerId: string;
+  propertyValue: string;
+  propertyDisplay: string;
+};
+
+/** The RCS layer payload used to construct GeoView layer configs. */
+export type GeoCoreConfigResponseLayer = {
+  id: string;
+  name: string;
+  layerType: TypeGeoviewLayerType;
+  url: string;
+  serverType?: TypeOfServer;
+  isTimeAware?: boolean;
+  layerEntries: TypeLayerEntryShell[];
+};
+
+/** The GeoChart JSON object expected by GeoView */
+// GV This type is the core equivalent of the homonym 'GeoViewGeoChartConfig' in geoview-geochart\geochart-types.ts
+export type GeoViewGeoChartConfig = {
+  layers: GeoChartGeoCoreConfigLayer[]; // For us, this is an array, compared to GeoCore where it's not.
+};
+
+/** The time-slider config object as returned by GeoCore. */
+export type GeoViewTimeSliderConfig = {
+  /** The slider configuration entries. */
+  sliders: Record<string, unknown>[];
+};
+
+/** The type representing the GeoCore parsed response */
+export type UUIDmapConfigReaderResponse = {
+  /** The parsed layer configurations. */
+  layers: TypeGeoviewLayerConfig[];
+  /** Optional parsed custom list of layer entry config from GCS. */
+  customListOfLayerEntryConfig?: TypeLayerEntryConfig[];
+  /** Optional geochart configurations. */
+  geocharts?: GeoViewGeoChartConfig[];
+  /** Optional time-slider configurations. */
+  timeSliderConfigs?: GeoViewTimeSliderConfig[];
+};

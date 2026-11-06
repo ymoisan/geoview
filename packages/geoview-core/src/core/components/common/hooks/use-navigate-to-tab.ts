@@ -1,0 +1,83 @@
+import { useCallback } from 'react';
+import {
+  useStoreUIActiveFooterBarTab,
+  useStoreUIFooterBarComponents,
+  useStoreUIAppbarComponents,
+} from '@/core/stores/states/ui-state';
+import { scrollIfNotVisible } from '@/core/utils/utilities';
+import { getGVElementById } from '@/core/utils/dom-helper';
+import { logger } from '@/core/utils/logger';
+import type { TypeValidAppBarCoreProps, TypeValidFooterBarTabsCoreProps } from '@/api/types/map-schema-types';
+import { TIMEOUT } from '@/core/utils/constant';
+import { useStoreGeoViewMapId } from '@/core/stores';
+import { useUIController } from '@/core/controllers/use-controllers';
+
+/** Options for navigating to a tab. */
+interface NavigateToTabOptions {
+  /** The layer path to select after navigation (optional) */
+  layerPath?: string;
+  /** Delay before executing post-navigation actions in ms (default: 350) */
+  delay?: number;
+}
+
+/**
+ * Custom hook for navigating to footer or appbar tabs with common functionality.
+ *
+ * Handles opening the tab, collapsing/expanding footer, and scrolling behavior.
+ */
+export function useNavigateToTab(tabId: string, onNavigate?: (layerPath: string) => void): (options?: NavigateToTabOptions) => void {
+  // Store
+  const uiController = useUIController();
+  const { isOpen: isFooterOpen } = useStoreUIActiveFooterBarTab();
+  const footerBarComponents = useStoreUIFooterBarComponents();
+  const appBarComponents = useStoreUIAppbarComponents();
+  const mapId = useStoreGeoViewMapId();
+
+  // Check if tab exists in footer or appbar
+  const hasFooterTab = footerBarComponents.includes(tabId as TypeValidFooterBarTabsCoreProps);
+  const hasAppBarTab = appBarComponents.includes(tabId as TypeValidAppBarCoreProps);
+  const hasTab = hasFooterTab || hasAppBarTab;
+
+  return useCallback(
+    (options: NavigateToTabOptions = {}): void => {
+      // TODO: seems the option for time out is never used different than default, consider removing it
+      const { layerPath, delay = TIMEOUT.shortcutToTab } = options;
+
+      if (!hasTab) {
+        logger.logWarning(`Tab "${tabId}" not found in footer or appbar components`);
+        return;
+      }
+
+      // If there are 2 components with the same tab (app bar or footer), prefer footer
+      if (hasFooterTab) {
+        // Open footer tab
+        uiController.setActiveFooterBarTab(tabId);
+        if (!isFooterOpen) uiController.setFooterBarIsOpen(true);
+
+        setTimeout(() => {
+          // Execute callback if provided
+          if (onNavigate && layerPath) {
+            onNavigate(layerPath);
+          }
+
+          // Scroll the footer into view
+          const footer = getGVElementById(mapId, 'tabsContainer');
+          if (footer) {
+            scrollIfNotVisible(footer, 'start');
+          }
+        }, delay);
+      } else if (hasAppBarTab) {
+        // Open appBar tab
+        uiController.setActiveAppBarTab(tabId, true, false);
+
+        setTimeout(() => {
+          // Execute callback if provided
+          if (onNavigate && layerPath) {
+            onNavigate(layerPath);
+          }
+        }, delay);
+      }
+    },
+    [hasTab, hasFooterTab, hasAppBarTab, tabId, uiController, isFooterOpen, onNavigate, mapId]
+  );
+}

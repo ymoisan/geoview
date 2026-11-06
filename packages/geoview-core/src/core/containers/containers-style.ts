@@ -1,0 +1,140 @@
+import type { Theme } from '@mui/material/styles';
+import type { SxStyles } from '@/ui/style/types';
+
+/**
+ * Get custom sx classes for the focus trap container.
+ *
+ * @param theme - The theme object
+ * @returns The sx classes object
+ */
+export const getFocusTrapSxClasses = (theme: Theme): SxStyles => {
+  return {
+    trap: {
+      display: 'flex',
+      justifyContent: 'center',
+      alignItems: 'center',
+      position: 'absolute',
+      top: '0px',
+      left: '0px',
+      width: '100%',
+      zIndex: theme.zIndex.focusDialog,
+      overflow: 'hidden',
+    },
+    modalButton: {
+      width: 'initial',
+      textTransform: 'none',
+      '&:focus-visible': {
+        boxShadow: 'none',
+      },
+    },
+  };
+};
+
+/**
+ * Get custom sx classes for the shell container.
+ *
+ * @param theme - The theme object
+ * @param appHeight - The application height in pixels
+ * @returns The sx classes object
+ */
+export const getShellSxClasses = (theme: Theme, appHeight: number): SxStyles => ({
+  all: {
+    height: '100%',
+    width: '100%',
+
+    '& .layer-icon': {
+      padding: theme.spacing(0.5),
+      borderRadius: 0,
+      border: '1px solid',
+      borderColor: theme.palette.geoViewColor?.grey.dark[100],
+      boxShadow: 2,
+      background: theme.palette.geoViewColor?.white,
+      objectFit: 'scale-down',
+      width: '35px',
+      height: '35px',
+      marginRight: theme.spacing(1.25),
+    },
+
+    '& a[href]': {
+      color: theme.palette.geoViewColor?.primary.main,
+      '*:hover': {
+        color: theme.palette.geoViewColor?.primary.dark[300],
+      },
+    },
+
+    '& *::-webkit-scrollbar': {
+      width: '8px',
+      height: '8px',
+    },
+    '& *::-webkit-scrollbar-track': {
+      background: theme.palette.geoViewColor?.secondary.darken(0.5, 0.5),
+      borderRadius: '5px',
+    },
+    '& *::-webkit-scrollbar-thumb': {
+      background: theme.palette.geoViewColor?.secondary.darken(0.5),
+      borderRadius: '5px',
+    },
+
+    '.bordered': {
+      border: `1px solid ${theme.palette.geoViewColor?.bgColor.darken(0.5, 0.5)}`,
+      boxShadow: `0px 12px 9px -13px ${theme.palette.geoViewColor?.bgColor.darken(0.2, 0.5)}`,
+    },
+    '.bordered-primary': {
+      border: `1px solid ${theme.palette.geoViewColor?.primary.darken(0.1, 0.9)}`,
+      boxShadow: `0px 12px 9px -13px ${theme.palette.geoViewColor?.bgColor.dark[200]}`,
+    },
+  },
+  shell: {
+    boxSizing: 'border-box',
+    scrollMarginTop: '20px',
+    display: 'flex',
+    flexDirection: 'column',
+    top: '0px',
+    right: '0px',
+    left: '0px',
+    bottom: '0px',
+    overflow: 'clip',
+    zIndex: 0,
+    height: '100%',
+  },
+  mapShellContainer: {
+    boxSizing: 'border-box',
+    display: 'flex',
+    flexDirection: 'row',
+    height: `${appHeight}px`,
+    width: '100%',
+    position: 'relative',
+    alignItems: 'stretch',
+    zIndex: 0,
+    containerType: 'size',
+    containerName: 'map',
+  },
+  mapContainer: {
+    boxSizing: 'border-box',
+    display: 'flex',
+    flexDirection: 'column',
+    height: '100%',
+    width: '100%',
+    position: 'relative',
+    alignItems: 'stretch',
+  },
+  skip: {
+    position: 'absolute',
+    left: -1000,
+    height: '1px',
+    width: '1px',
+    textAlign: 'left',
+    overflow: 'hidden',
+    backgroundColor: theme.palette.geoViewColor?.white,
+    zIndex: theme.zIndex.tooltip,
+
+    '&:active, &:focus': {
+      left: '0px',
+      zIndex: theme.zIndex.tooltip,
+      width: 'auto',
+      height: 'auto',
+      overflow: 'visible',
+      padding: theme.spacing(0.5),
+    },
+  },
+});

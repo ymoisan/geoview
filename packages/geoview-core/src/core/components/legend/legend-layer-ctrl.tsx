@@ -1,0 +1,331 @@
+import { useMemo, useCallback } from 'react';
+
+import { useTranslation } from 'react-i18next';
+
+import { useTheme } from '@mui/material';
+import {
+  Box,
+  IconButton,
+  Stack,
+  VisibilityOutlinedIcon,
+  HighlightOutlinedIcon,
+  ZoomInSearchIcon,
+  Typography,
+  VisibilityOffOutlinedIcon,
+  HighlightIcon,
+  CenterFocusScaleIcon,
+  LayersIcon,
+} from '@/ui';
+import {
+  useStoreLayerHighlightedLayer,
+  useStoreLayerChildPaths,
+  useStoreLayerItems,
+  useStoreLayerControls,
+  useStoreLayerStatus,
+  useStoreLayerEntryType,
+  useStoreLayerName,
+  getStoreLayerLegendLayerByPath,
+  getStoreLayerParentHidden,
+  useStoreLayerIsParentHiddenOnMap,
+  useStoreLayerInVisibleRange,
+  useStoreLayerVisible,
+} from '@/core/stores/states/layer-state';
+import { useStoreUIFooterBarComponents, useStoreUIAppbarComponents, useStoreUIActiveTrapGeoView } from '@/core/stores/states/ui-state';
+import type { TypeLegendItem } from '@/core/components/layers/types';
+import { getSxClasses } from './legend-styles';
+import { logger } from '@/core/utils/logger';
+import { useNavigateToTab } from '@/core/components/common/hooks/use-navigate-to-tab';
+import { useStoreGeoViewMapId } from '@/core/stores/geoview-store';
+import { useLayerController } from '@/core/controllers/use-controllers';
+
+// TODO: WCAG Issue #3332 - Consider disabling Zoom to Layer button when it's already zoomed to that layer's extent
+// TODO: WCAG - Consider showing Show in Time Slider button in WCAG mode (requires re-working WCAG UX)
+
+interface SecondaryControlsProps {
+  layerPath: string;
+}
+
+type ControlActions = {
+  handleZoomToLayerVisibleScale: (event: React.MouseEvent) => void;
+  handleToggleVisibility: (event: React.MouseEvent) => boolean;
+  handleHighlightLayer: (event: React.MouseEvent) => void;
+  handleZoomTo: (event: React.MouseEvent) => void;
+};
+
+/**
+ * Builds memoized control action handlers for layer operations.
+ *
+ * Performance optimization: Only depends on layerPath for stable memoization.
+ * State values (visibility, parentHidden, etc.) are read imperatively from the store
+ * inside each handler when executed, preventing callback recreation on every state change.
+ *
+ * @param layerPath - The layer path identifier
+ * @returns Object containing memoized handler functions
+ */
+const useControlActions = (layerPath: string): ControlActions => {
+  // Store
+  const mapId = useStoreGeoViewMapId();
+  const layerController = useLayerController();
+
+  /**
+   * Builds the memoized control action handlers.
+   */
+  return useMemo(() => {
+    logger.logTraceUseMemo('LEGEND-LAYER-CTRL - useCtrlActions', layerPath, mapId);
+    return {
+      /**
+       * Handles zooming to the layer's visible scale range.
+       */
+      handleZoomToLayerVisibleScale: (event: React.MouseEvent): void => {
+        event.stopPropagation();
+        // Read current state values when handler executes
+        const layer = getStoreLayerLegendLayerByPath(mapId, layerPath);
+
+        // Check visibility range
+        const isInVisibleRange = layer?.inVisibleRange || false;
+
+        const isZoomToVisibleScaleCapable = !isInVisibleRange && layer?.entryType !== 'group';
+        if (!isZoomToVisibleScaleCapable) {
+          return;
+        }
+        layerController.zoomToLayerVisibleScale(layerPath);
+      },
+
+      /**
+       * Handles toggling the layer visibility on or off.
+       */
+      handleToggleVisibility: (event: React.MouseEvent): boolean => {
+        event.stopPropagation();
+        // Read current state values when handler executes
+        const layer = getStoreLayerLegendLayerByPath(mapId, layerPath);
+        const isInVisibleRange = layer?.inVisibleRange;
+        const parentHidden = getStoreLayerParentHidden(mapId, layerPath);
+
+        if (!isInVisibleRange || parentHidden || layer?.layerStatus === 'error') {
+          return false;
+        }
+        return layerController.setOrToggleLayerVisibility(layerPath);
+      },
+
+      /**
+       * Handles toggling the layer highlight on or off.
+       */
+      handleHighlightLayer: (event: React.MouseEvent): void => {
+        event.stopPropagation();
+        // Read current state values when handler executes
+        const layer = getStoreLayerLegendLayerByPath(mapId, layerPath);
+        const isInVisibleRange = layer?.inVisibleRange || false;
+        const parentHidden = getStoreLayerParentHidden(mapId, layerPath);
+        const isVisible = layer?.visible || false;
+
+        if (!isInVisibleRange || parentHidden || !isVisible || layer?.layerStatus === 'error') {
+          return;
+        }
+        layerController.setHighlightLayer(layerPath);
+      },
+
+      /**
+       * Handles zooming to the layer's geographic extent.
+       */
+      handleZoomTo: (event: React.MouseEvent): void => {
+        event.stopPropagation();
+        // Read current state values when handler executes
+        const layer = getStoreLayerLegendLayerByPath(mapId, layerPath);
+        const isInVisibleRange = layer?.inVisibleRange || false;
+        const parentHidden = getStoreLayerParentHidden(mapId, layerPath);
+        const isVisible = layer?.visible || false;
+
+        const isZoomToLayerDisabled = !isInVisibleRange || parentHidden || !isVisible || layer?.layerStatus === 'error';
+        if (isZoomToLayerDisabled) {
+          return;
+        }
+        layerController.zoomToLayerExtent(layerPath).catch((error: unknown) => {
+          logger.logPromiseFailed('in zoomToLayerExtent in legend-layer.handleZoomTo', error);
+        });
+      },
+    };
+  }, [layerPath, mapId, layerController]);
+};
+
+/**
+ * Creates a subtitle for the layer based on child count or parent visibility state.
+ *
+ * @param layerPath - The path to the layer
+ * @param childPaths - Array of child layer paths
+ * @param items - Array of legend items for the layer
+ * @returns A localized subtitle string describing layer state (parent hidden, child count, or item count)
+ */
+const useSubtitle = (layerPath: string, childPaths: string[], items: TypeLegendItem[]): string => {
+  // Hooks
+  const { t } = useTranslation();
+  const parentHidden = useStoreLayerIsParentHiddenOnMap(layerPath);
+
+  return useMemo(() => {
+    logger.logTraceUseMemo('LEGEND-LAYER-CTRL - useSubtitle', childPaths.length, items);
+    if (parentHidden) return t('layers.parentHidden');
+
+    if (childPaths.length) {
+      return t('legend.subLayersCount', { count: childPaths.length });
+    }
+    if (items.length > 1) {
+      return t('legend.itemsCount', { count: items.filter((item) => item.isVisible).length, totalCount: items.length });
+    }
+    return '';
+  }, [childPaths.length, items, parentHidden, t]);
+};
+
+/**
+ * Creates the secondary control buttons for a legend layer.
+ *
+ * Not memoized to force re-render from layers panel modifications.
+ *
+ * @param props - Properties defined in SecondaryControlsProps interface
+ * @returns The secondary controls element
+ */
+export function SecondaryControls({ layerPath }: SecondaryControlsProps): JSX.Element {
+  // Add store actions for selecting layer and UI
+  const footerBarComponents = useStoreUIFooterBarComponents();
+  const appBarComponents = useStoreUIAppbarComponents();
+  const hasFooterLayersTab = footerBarComponents.includes('layers');
+  const hasAppBarLayersTab = appBarComponents.includes('layers');
+  const hasLayersTab = hasFooterLayersTab || hasAppBarLayersTab;
+  const layerController = useLayerController();
+
+  // Use navigate hook
+  const navigateToLayers = useNavigateToTab('layers', (lyrPath) => {
+    layerController.setSelectedLayerPath(lyrPath);
+  });
+
+  // #region Handlers
+
+  /**
+   * Handles navigating to the layers panel and selecting the layer.
+   */
+  const handleNavigateToLayers = useCallback(
+    (event: React.MouseEvent): void => {
+      // Stop propagation to prevent AppBar's onScrollShellIntoView from firing
+      event.stopPropagation();
+      navigateToLayers({ layerPath });
+    },
+    [navigateToLayers, layerPath]
+  );
+
+  // #endregion
+
+  // Log
+  logger.logTraceRender('components/legend/legend-layer-ctrl', layerPath);
+
+  // Hooks
+  const { t } = useTranslation();
+  const theme = useTheme();
+  const memoSxClasses = useMemo(() => {
+    logger.logTraceUseMemo('LEGEND-LAYER-CTRL - memoSxClasses', theme);
+    return getSxClasses(theme);
+  }, [theme]);
+  const layerEntryType = useStoreLayerEntryType(layerPath);
+  const layerChildPaths = useStoreLayerChildPaths(layerPath);
+  const layerItems = useStoreLayerItems(layerPath);
+  const layerControls = useStoreLayerControls(layerPath);
+  const layerStatus = useStoreLayerStatus(layerPath);
+  const isVisible = useStoreLayerVisible(layerPath);
+  const isInVisibleRange = useStoreLayerInVisibleRange(layerPath);
+  const parentHidden = useStoreLayerIsParentHiddenOnMap(layerPath);
+  const highlightedLayer = useStoreLayerHighlightedLayer();
+  const isFocusTrap = useStoreUIActiveTrapGeoView();
+  const layerName = useStoreLayerName(layerPath) ?? layerPath;
+
+  // Is visibility button disabled?
+  const isLayerVisibleCapable = layerControls?.visibility ?? false;
+
+  // Is highlight button disabled?
+  const isLayerHighlightCapable = layerControls?.highlight ?? false;
+
+  // Is zoom to extent button disabled?
+  const isLayerZoomToExtentCapable = layerControls?.zoom ?? false;
+
+  // Is zoom to visible scale button visible?
+  const isZoomToVisibleScaleCapable = !isInVisibleRange && layerEntryType !== 'group';
+  const isZoomToVisibleScaleButton = layerControls?.visibleScale ?? false;
+
+  // Is zoom to layer button disabled?
+  const isZoomToLayerDisabled = !isInVisibleRange || parentHidden || !isVisible || layerStatus === 'error';
+
+  // Component helper
+  const controls = useControlActions(layerPath);
+  const subTitle = useSubtitle(layerPath, layerChildPaths || [], layerItems || []);
+
+  return (
+    <Stack direction="row" sx={memoSxClasses.layerStackContainer}>
+      {!!subTitle.length && <Typography sx={memoSxClasses.layerStackSubtitle}>{subTitle}</Typography>}
+      <Box sx={memoSxClasses.layerStackIcons} role="group" aria-label={`${t('legend.layerControls')} - ${layerName}`}>
+        {/* Button to select layer in panel and scroll to footer
+            Hidden in WCAG mode - keyboard users can Tab to layer panel instead
+          */}
+        {hasLayersTab && !isFocusTrap && (
+          <Box sx={memoSxClasses.buttonDivider}>
+            <IconButton
+              tooltip={t('legend.selectLayerAndScroll')}
+              className="buttonOutline"
+              onClick={handleNavigateToLayers}
+              aria-label={`${t('legend.selectLayerAndScroll')} - ${layerName}`} // WCAG - Provide descriptive aria-label for screen readers
+            >
+              <LayersIcon />
+            </IconButton>
+          </Box>
+        )}
+        {isZoomToVisibleScaleButton && (
+          <IconButton
+            edge="end"
+            tooltip={t('layers.zoomVisibleScale')}
+            className={`buttonOutline`}
+            onClick={controls.handleZoomToLayerVisibleScale}
+            aria-label={
+              isZoomToVisibleScaleCapable
+                ? `${layerName} - ${t('layers.outOfVisibleRange')}. ${t('layers.zoomVisibleScale')}`
+                : `${t('layers.zoomVisibleScale')} - ${layerName}`
+            } // WCAG - Explicitly announce out-of-range state for screen readers
+            aria-disabled={!isZoomToVisibleScaleCapable} // WCAG - used instead of disabled to allow button to retain focus after keyboard press
+          >
+            <CenterFocusScaleIcon />
+          </IconButton>
+        )}
+        {isLayerVisibleCapable && (
+          <IconButton
+            edge={isInVisibleRange ? false : 'end'}
+            tooltip={t('layers.toggleVisibility')}
+            className="buttonOutline"
+            onClick={controls.handleToggleVisibility}
+            aria-label={`${t('layers.toggleVisibility')} - ${layerName}`} // WCAG - Provide descriptive aria-label for screen readers
+            aria-pressed={isVisible}
+            aria-disabled={!isInVisibleRange || parentHidden || layerStatus === 'error'} // WCAG - used instead of disabled to allow button to be discoverable by screen readers
+          >
+            {isVisible ? <VisibilityOutlinedIcon /> : <VisibilityOffOutlinedIcon />}
+          </IconButton>
+        )}
+        {isLayerHighlightCapable && (
+          <IconButton
+            tooltip={t('legend.highlightLayer')}
+            className="buttonOutline"
+            onClick={controls.handleHighlightLayer}
+            aria-label={`${t('legend.highlightLayer')} - ${layerName}`} // WCAG - Provide descriptive aria-label for icon button tooltips
+            aria-pressed={highlightedLayer === layerPath}
+            aria-disabled={!isInVisibleRange || parentHidden || !isVisible || layerStatus === 'error'} // WCAG - used instead of disabled to allow button to be discoverable by screen readers
+          >
+            {highlightedLayer === layerPath ? <HighlightIcon /> : <HighlightOutlinedIcon />}
+          </IconButton>
+        )}
+        {isLayerZoomToExtentCapable && (
+          <IconButton
+            tooltip={t('legend.zoomTo')}
+            className="buttonOutline"
+            onClick={controls.handleZoomTo}
+            aria-label={`${t('legend.zoomTo')} - ${layerName}`} // WCAG - Provide descriptive aria-label for icon button tooltips
+            aria-disabled={isZoomToLayerDisabled} // WCAG - used instead of disabled to allow button to be discoverable by screen readers
+          >
+            <ZoomInSearchIcon />
+          </IconButton>
+        )}
+      </Box>
+    </Stack>
+  );
+}

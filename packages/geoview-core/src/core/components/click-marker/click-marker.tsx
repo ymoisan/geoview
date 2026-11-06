@@ -1,0 +1,81 @@
+import { useEffect, useRef, memo } from 'react';
+
+import type { Coordinate } from 'ol/coordinate';
+import { Box, ClickMapMarker } from '@/ui';
+
+import { useStoreMapClickMarker, useStoreMapClickCoordinates } from '@/core/stores/states/map-state';
+import { logger } from '@/core/utils/logger';
+import { useStoreGeoViewMapId } from '@/core/stores/geoview-store';
+import { useMapController } from '@/core/controllers/use-controllers';
+
+/** Represents a click marker placed on the map at the user's click location. */
+export type TypeClickMarker = {
+  lonlat: Coordinate;
+  symbology?: unknown;
+};
+
+/**
+ * Displays a marker at the click location when a user clicks on the map.
+ *
+ * @returns The click marker element
+ */
+export const ClickMarker = memo((): JSX.Element => {
+  logger.logTraceRender('components/click-marker/click-marker');
+
+  // State
+  const mapId = useStoreGeoViewMapId();
+  const clickMarkerRef = useRef<HTMLDivElement>(null);
+
+  // Store
+  const clickMarker = useStoreMapClickMarker();
+  const clickCoordinates = useStoreMapClickCoordinates();
+  const mapController = useMapController();
+
+  /**
+   * Registers the click marker overlay ref on mount.
+   */
+  useEffect(() => {
+    // Log
+    logger.logTraceUseEffect('CLICK-MARKER - setOverlayClickMarkerRef');
+
+    // Set the click marker overlay
+    mapController.setClickMarkerOverlayRef(clickMarkerRef.current!);
+  }, [mapController]);
+
+  /**
+   * Shows the click marker when click coordinates change.
+   */
+  useEffect(() => {
+    // Log
+    logger.logTraceUseEffect('CLICK-MARKER - clickCoordinates');
+
+    if (clickCoordinates) {
+      mapController.clickMarkerIconShow({ lonlat: clickCoordinates.lonlat });
+    }
+  }, [clickCoordinates, mapController]);
+
+  return (
+    <Box
+      ref={clickMarkerRef}
+      id={`${mapId}-clickmarker`}
+      sx={{ position: 'absolute', visibility: clickMarker !== undefined ? 'visible' : 'hidden' }}
+    >
+      <ClickMapMarker
+        sx={{
+          animation: 'opacity 1s ease-in',
+          '@keyframes opacity': {
+            from: {
+              opacity: 0,
+            },
+            to: {
+              opacity: 1,
+            },
+          },
+        }}
+        fontSize="large"
+        color="warning"
+      />
+    </Box>
+  );
+});
+ClickMarker.displayName = 'ClickMarker';

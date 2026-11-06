@@ -1,0 +1,118 @@
+import type { Theme } from '@mui/material/styles';
+import type { SxStyles } from '@/ui/style/types';
+import { getFocusIndicatorStyles } from '@/ui/style/themeOptionsGenerator';
+import { geoViewColors as defaultGeoViewColors } from '@/ui/style/default';
+
+/**
+ * Gets custom sx classes for the map.
+ *
+ * @param theme - The MUI theme object
+ * @returns The sx classes object
+ */
+export const getSxClasses = (theme: Theme): SxStyles => ({
+  mapContainer: {
+    boxSizing: 'border-box',
+    display: 'flex',
+    flexDirection: 'column',
+    width: '100%',
+    height: '100%',
+    position: 'relative',
+
+    '& .ol-viewport': {
+      // Target OpenLayers viewport directly
+      height: '100% !important',
+      position: 'absolute',
+      width: '100%',
+      backgroundColor: 'white !important', // Keep viewport background white to avoid black backgound in fullscreen
+    },
+
+    '& .ol-viewport:active': {
+      cursor: 'grabbing',
+    },
+
+    // FIX: Hide duplicate overview maps that can appear during window resize.
+    // Only the last overview map instance should be visible.
+    '& .ol-overlaycontainer-stopevent .ol-overviewmap:not(:last-child)': {
+      display: 'none',
+    },
+
+    '& .ol-overviewmap.ol-custom-overviewmap': {
+      bottom: 'auto',
+      left: 'auto',
+      right: '10px', // Adding 2px to the usual 8px to account for the box shadow
+      top: '10px', // Adding 2px to the usual 8px to account for the box shadow
+      padding: theme.spacing(0),
+      position: 'absolute',
+      borderRadius: 4,
+
+      '& .ol-overviewmap-map': {
+        border: 'none',
+        display: 'block !important',
+        WebkitTransition: '300ms linear',
+        MozTransition: '300ms linear',
+        OTransition: '300ms linear',
+        msTransition: '300ms linear',
+        transition: '300ms linear',
+      },
+      '&.ol-uncollapsible': {
+        bottom: 'auto',
+        left: 'auto',
+        right: 100,
+        top: 100,
+        margin: theme.spacing(0.75),
+      },
+      '&:not(.ol-collapsed)': {
+        boxShadow: '0 1px 5px rgb(0 0 0 / 65%)',
+        borderRadius: '4px',
+        border: 'none',
+      },
+      '&:is(.ol-collapsed)': {
+        boxShadow: '0 1px 5px rgb(0 0 0 / 65%)',
+        borderRadius: 4,
+        border: 'none',
+      },
+      '& button': {
+        zIndex: 100,
+        position: 'absolute',
+        top: 0,
+        right: 0,
+        left: 'auto !important',
+        bottom: 'auto !important',
+        backgroundColor: '#cccccc',
+      },
+      // Override ol.css' .ol-control button:hover/:focus (higher specificity needed to win over ol.css)
+      '& button:focus': {
+        outline: 0,
+      },
+      '& button:focus-visible': {
+        borderRadius: '50%',
+        ...getFocusIndicatorStyles(theme.palette.geoViewColor ?? defaultGeoViewColors),
+      },
+      '&::before': {
+        content: '""',
+        display: 'block',
+        position: 'absolute',
+        width: 0,
+        height: 0,
+        borderRadius: 2,
+        zIndex: 100,
+        right: 0,
+        top: 0,
+      },
+      '& .ol-overviewmap-box': {
+        backgroundColor: 'rgba(0, 0, 0, 0.2)',
+      },
+      '& .ol-viewport': {
+        borderRadius: '4px',
+        '& .ol-layer': {
+          backgroundColor: '#FFF',
+        },
+      },
+    },
+  },
+  progressBar: {
+    width: '100%',
+    position: 'absolute',
+    '> span': { height: '4px' },
+  },
+});

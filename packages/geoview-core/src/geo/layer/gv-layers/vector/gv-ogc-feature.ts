@@ -1,0 +1,54 @@
+import type VectorSource from 'ol/source/Vector';
+import { AbstractGVVector } from '@/geo/layer/gv-layers/vector/abstract-gv-vector';
+import type { OgcFeatureLayerEntryConfig } from '@/api/config/validation-classes/vector-validation-classes/ogc-layer-entry-config';
+import type { TypeOutfieldsType } from '@/api/types/map-schema-types';
+import type { TypeLayerMetadataOGC } from '@/api/types/layer-schema-types';
+
+/**
+ * Manages an OGC-Feature layer.
+ */
+export class GVOGCFeature extends AbstractGVVector {
+  /**
+   * Constructs a GVOGCFeature layer to manage an OpenLayer layer.
+   *
+   * @param olSource - The OpenLayer source.
+   * @param layerConfig - The layer configuration.
+   */
+  // The constructor is not useless, it narrows down the accepted parameter type.
+  // eslint-disable-next-line @typescript-eslint/no-useless-constructor
+  constructor(olSource: VectorSource, layerConfig: OgcFeatureLayerEntryConfig) {
+    super(olSource, layerConfig);
+  }
+
+  // #region OVERRIDES
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer configuration specific to this layer.
+   */
+  override getLayerConfig(): OgcFeatureLayerEntryConfig {
+    // Call parent and cast
+    return super.getLayerConfig() as OgcFeatureLayerEntryConfig;
+  }
+
+  // #endregion OVERRIDES
+
+  // #region STATIC
+
+  /**
+   * Returns field type of the given field name using the provided OGC Feature metadata.
+   *
+   * @param layerMetadata - The OGC Feature metadata.
+   * @param fieldName - The field name to get the field type information.
+   * @returns The field type information for the given field name.
+   */
+  static getFieldType(layerMetadata: TypeLayerMetadataOGC | undefined, fieldName: string): TypeOutfieldsType {
+    const fieldEntryType = layerMetadata?.[fieldName].type.split(':').slice(-1)[0];
+    if (fieldEntryType === 'date') return 'date';
+    if (['int', 'number'].includes(fieldEntryType!)) return 'number';
+    return 'string';
+  }
+
+  // #endregion STATIC
+}

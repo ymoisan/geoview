@@ -1,0 +1,12 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "geoview-core/*": ["../geoview-core/src/*"]
+    }
+  },
+  "include": ["src", "../global.d.ts"],
+  "exclude": ["node_modules", "dist", "build"],
+  "references": [{ "path": "../geoview-core" }]
+}

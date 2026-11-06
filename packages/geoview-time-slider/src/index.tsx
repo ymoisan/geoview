@@ -1,0 +1,306 @@
+import React from 'react'; // GV This import is to validate that we're on the right React at the end of the file
+import type { TypeTabs } from 'geoview-core/ui/tabs/tabs';
+import { AbstractGVLayer } from 'geoview-core/geo/layer/gv-layers/abstract-gv-layer';
+import { getStoreTimeSliderLayer } from 'geoview-core/core/stores/states/time-slider-state';
+import { TimeSliderIcon } from 'geoview-core/ui';
+import { DateMgt, type TimeIANA, type TypeDisplayDateFormat } from 'geoview-core/core/utils/date-mgt';
+import { FooterPlugin } from 'geoview-core/api/plugin/footer-plugin';
+import { logger } from 'geoview-core/core/utils/logger';
+
+import { TimeSliderPanel } from './time-slider-panel';
+import schema from '../schema.json';
+import defaultConfig from '../default-config-time-slider-panel.json';
+import type { ConfigProps } from './time-slider-types';
+
+/** Properties for the slider filter configuration. */
+export interface SliderFilterProps {
+  /** The title displayed for the slider filter. */
+  title: string;
+
+  /** The description displayed for the slider filter. */
+  description: string;
+
+  /** The available time range values. */
+  range: string[];
+
+  /** The minimum and maximum timestamps. */
+  minAndMax: number[];
+
+  /** The temporal field used by the filter. */
+  field: string;
+
+  /** Whether the slider uses a single handle. */
+  singleHandle: boolean;
+
+  /** The current slider values. */
+  values: number[];
+
+  /** Whether time filtering is enabled. */
+  filtering: boolean;
+
+  /** The animation delay in milliseconds. */
+  delay: number;
+
+  /** Whether the slider handles are locked. */
+  locked: boolean;
+
+  /** Whether playback is reversed. */
+  reversed: boolean;
+}
+
+/**
+ * Time slider plugin.
+ */
+class TimeSliderPlugin extends FooterPlugin {
+  /**
+   * Returns the schema that is defined for this package.
+   *
+   * @returns The schema for this package
+   */
+  override schema(): unknown {
+    return schema;
+  }
+
+  /**
+   * Returns the default config for this package.
+   *
+   * @returns The default config
+   */
+  override defaultConfig(): unknown {
+    return defaultConfig;
+  }
+
+  /**
+   * Overrides the default translations for the Plugin.
+   *
+   * @returns The translations object for the particular Plugin
+   */
+  override defaultTranslations(): Record<string, unknown> {
+    return {
+      en: {
+        timeSlider: {
+          title: 'Time Slider',
+          panel: {
+            noLayers: 'No layers with temporal data',
+          },
+          slider: {
+            animationControls: 'Animation controls',
+            unlockRight: 'Unlock right handle',
+            unlockLeft: 'Unlock left handle',
+            lockRight: 'Lock right handle',
+            lockLeft: 'Lock left handle',
+            filter: 'Time Filtering',
+            disableFilter: 'Disable Time Filtering',
+            enableFilter: 'Enable Time Filtering',
+            pauseAnimation: 'Pause animation',
+            playAnimation: 'Play animation',
+            back: 'Back',
+            forward: 'Forward',
+            reset: 'Reset to default range',
+            changeDirection: 'Change animation direction',
+            reverseAnimation: 'Reverse animation',
+            timeDelay: 'Animation delay',
+            stepValue: 'Step value',
+            hour: 'Hour',
+            day: 'Day',
+            week: 'Week',
+            month: 'Month',
+            year: 'Year',
+            to: 'to',
+            date: 'Date for {{name}}',
+            startDate: 'Start date for {{name}}',
+            endDate: 'End date for {{name}}',
+          },
+        },
+      },
+      fr: {
+        timeSlider: {
+          title: 'Curseur Temporel',
+          panel: {
+            noLayers: 'Pas de couches avec des données temporelles',
+          },
+          slider: {
+            animationControls: "Contrôles d'animation",
+            unlockRight: 'Déverrouiller la poignée droite',
+            unlockLeft: 'Déverrouiller la poignée gauche',
+            lockRight: 'Verrouiller la poignée droite',
+            lockLeft: 'Verrouiller la poignée gauche',
+            filter: 'Filtrage temporel',
+            disableFilter: 'Désactiver le filtrage temporel',
+            enableFilter: 'Activer le filtrage temporel',
+            pauseAnimation: `Pause de l'animation`,
+            playAnimation: `Jouer l'animation`,
+            back: 'Retour',
+            forward: 'En avant',
+            reset: 'Réinitialiser à la plage par défaut',
+            changeDirection: `Changer la direction de l'animation`,
+            reverseAnimation: `Inverser l'animation`,
+            timeDelay: `Délai d'animation`,
+            stepValue: 'Valeur du saut',
+            hour: 'Heure',
+            day: 'Jour',
+            week: 'Semaine',
+            month: 'Mois',
+            year: 'Année',
+            to: 'à',
+            date: 'Date pour {{name}}',
+            startDate: 'Date de début pour {{name}}',
+            endDate: 'Date de fin pour {{name}}',
+          },
+        },
+      },
+    };
+  }
+
+  /**
+   * Overrides the getConfig in order to return the right type.
+   *
+   * @returns The time slider config
+   */
+  override getConfig(): ConfigProps {
+    // Redirect
+    return super.getConfig() as ConfigProps;
+  }
+
+  /**
+   * Overrides the creation of the content properties of this TimeSlider Footer Plugin.
+   *
+   * @returns The TypeTabs for the TimeSlider Footer Plugin
+   */
+  override onCreateContentProps(): TypeTabs {
+    return {
+      id: 'time-slider',
+      value: this.value!,
+      label: 'timeSlider.title',
+      icon: <TimeSliderIcon />,
+      // Config is not needed as the store keeps track of values
+      content: <TimeSliderPanel mapId={this.mapViewer.mapId} />,
+    };
+  }
+
+  /**
+   * Overrides the addition of the TimeSlider Footer Plugin to make sure to set the time slider configs in the store and apply filters.
+   */
+  override onAdd(): void {
+    // Call parent
+    super.onAdd();
+
+    // Wait for the map to be ready
+    this.mapViewer
+      .waitForMapReady()
+      .then(() => {
+        // Initialize the time slider, layers will be registered for the time slider as they load.
+        this.initTimeSliderPlugin();
+      })
+      .catch((error: unknown) => {
+        // Log error
+        logger.logPromiseFailed('Time Slider Plugin - Error initializing Time Slider Plugin', error);
+      });
+  }
+
+  /**
+   * Initializes the Time Slider Plugin once the layers are all 'processed'.
+   */
+  initTimeSliderPlugin(): void {
+    // Now the layerTimeDimension should be good on the layers
+    const orderedLayerPaths = this.controllerRegistry.layerController.getLayerEntryLayerPaths();
+    const initialTimeSliderLayerPaths = this.#filterTimeSliderLayers(orderedLayerPaths);
+    if (initialTimeSliderLayerPaths) {
+      initialTimeSliderLayerPaths.forEach((layerPath) => {
+        // Skip layers already registered by tryRegisterLayer (which uses VCS-merged config from mapFeaturesConfig)
+        if (getStoreTimeSliderLayer(this.mapViewer.mapId, layerPath)) return;
+
+        // Get the layer
+        const layer = this.controllerRegistry.layerController.getGeoviewLayerIfExists(layerPath);
+
+        // If the layer was found and of right type
+        if (layer instanceof AbstractGVLayer) {
+          // Get the time slider config for the layer
+          const timesliderConfig = this.getConfig().sliders.find((slider) => slider.layerPaths.includes(layerPath));
+
+          // Check and add time slider layer when needed
+          this.controllerRegistry.timeSliderController?.checkInitTimeSliderLayerAndApplyFilters(layer, timesliderConfig);
+        }
+      });
+    }
+  }
+
+  /**
+   * Sets the date display format for a given layer.
+   * This controls how date values are rendered in the time slider UI.
+   * @param layerPath - Path identifying the target layer
+   * @param displayDateFormat - Date format configuration to apply
+   */
+  setDisplayDateFormat(layerPath: string, displayDateFormat: TypeDisplayDateFormat | string): void {
+    // Make sure of the input format
+    let displayDateFormatToSet: TypeDisplayDateFormat = displayDateFormat as TypeDisplayDateFormat;
+    if (typeof displayDateFormat === 'string') displayDateFormatToSet = { en: displayDateFormat, fr: displayDateFormat };
+
+    // Save to the store
+    this.controllerRegistry.timeSliderController?.setDisplayDateFormat(layerPath, displayDateFormatToSet);
+  }
+
+  /**
+   * Sets the date display format for a given layer.
+   * This controls how date values are rendered in the time slider UI.
+   * @param layerPath - Path identifying the target layer
+   * @param displayDateFormat - Date format configuration to apply
+   */
+  setDisplayDateFormatShort(layerPath: string, displayDateFormat: TypeDisplayDateFormat | string): void {
+    // Make sure of the input format
+    let displayDateFormatToSet: TypeDisplayDateFormat = displayDateFormat as TypeDisplayDateFormat;
+    if (typeof displayDateFormat === 'string') displayDateFormatToSet = { en: displayDateFormat, fr: displayDateFormat };
+
+    // Save to the store
+    this.controllerRegistry.timeSliderController?.setDisplayDateFormatShort(layerPath, displayDateFormatToSet);
+  }
+
+  /**
+   * Sets the time zone used to display date values for a given layer.
+   * The provided time zone must be a valid and supported IANA time zone.
+   * @param layerPath - Path identifying the target layer
+   * @param displayDateTimezone - IANA time zone identifier (e.g. 'America/Toronto', 'Europe/Paris', 'UTC')
+   * @throws {InvalidTimezoneError} If the time zone is not a valid or supported IANA identifier.
+   */
+  setDisplayDateTimezone(layerPath: string, displayDateTimezone: TimeIANA): void {
+    // Validate the timezone before sending it in the store in order to protect the ui
+    DateMgt.validateTimezone(displayDateTimezone);
+
+    // Save to the store
+    this.controllerRegistry.timeSliderController?.setDisplayDateTimezone(layerPath, displayDateTimezone);
+  }
+
+  /**
+   * Filters an array of legend layers to get usable time slider layer paths.
+   *
+   * @param layerPaths - Array of layer paths to filter
+   * @returns A list of usable layer paths
+   */
+  #filterTimeSliderLayers(layerPaths: string[]): string[] {
+    // Return the layer paths for the layers that have a time dimension
+    return layerPaths.filter((layerPath) => {
+      // Get the layer
+      const layer = this.controllerRegistry.layerController.getGeoviewLayerIfExists(layerPath);
+
+      // If of the right type
+      if (layer instanceof AbstractGVLayer) {
+        // Return true if the layer has a time dimension
+        return !!layer.getTimeDimension();
+      }
+
+      // No time dimension for the layer
+      return false;
+    });
+  }
+}
+
+export default TimeSliderPlugin;
+
+// GV This if condition took over 3 days to investigate. It was giving errors on the app.geo.ca website with
+// GV some conflicting reacts being loaded on the page for some obscure reason.
+// Check if we're on the right react
+if (React === window.cgpv.reactUtilities.react) {
+  // Keep a reference to the Time Slider Plugin as part of the geoviewPlugins property stored in the window object
+  window.geoviewPlugins = window.geoviewPlugins || {};
+  window.geoviewPlugins['time-slider'] = TimeSliderPlugin;
+} // Else ignore, don't keep it on the window, wait for the right react load

@@ -1,0 +1,249 @@
+import type { Feature } from 'ol';
+import type { ReadOptions } from 'ol/format/Feature';
+import type { Options as SourceOptions } from 'ol/source/Vector';
+import type { Projection as OLProjection } from 'ol/proj';
+
+import { AbstractGeoViewVector } from '@/geo/layer/geoview-layers/vector/abstract-geoview-vector';
+import type { TypeGeoviewLayerConfig } from '@/api/types/layer-schema-types';
+import { CONST_LAYER_TYPES } from '@/api/types/layer-schema-types';
+import { KmlLayerEntryConfig } from '@/api/config/validation-classes/vector-validation-classes/kml-layer-entry-config';
+import type { VectorLayerEntryConfig } from '@/api/config/validation-classes/vector-layer-entry-config';
+import { GVKML } from '@/geo/layer/gv-layers/vector/gv-kml';
+import type { ConfigBaseClass, TypeLayerEntryShell } from '@/api/config/validation-classes/config-base-class';
+import { GeoUtilities, type SourceFeaturesInfo } from '@/geo/utils/utilities';
+import type { DisplayDateMode } from '@/api/types/map-schema-types';
+
+export interface TypeKmlLayerConfig extends Omit<TypeGeoviewLayerConfig, 'listOfLayerEntryConfig'> {
+  geoviewLayerType: typeof CONST_LAYER_TYPES.KML;
+  listOfLayerEntryConfig: KmlLayerEntryConfig[];
+}
+
+/**
+ * Class used to add KML layer to the map.
+ */
+export class KML extends AbstractGeoViewVector {
+  /**
+   * Constructs a KML Layer configuration processor.
+   *
+   * @param layerConfig - The layer configuration
+   */
+  // The constructor is not useless, it narrows down the accepted parameter type.
+  // eslint-disable-next-line @typescript-eslint/no-useless-constructor
+  constructor(layerConfig: TypeKmlLayerConfig) {
+    super(layerConfig);
+  }
+
+  // #region OVERRIDES
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer configuration specific to this layer
+   */
+  override getGeoviewLayerConfig(): TypeKmlLayerConfig {
+    return super.getGeoviewLayerConfig() as TypeKmlLayerConfig;
+  }
+
+  /**
+   * Overrides the way a geoview layer config initializes its layer entries.
+   *
+   * @returns A promise that resolves once the layer entries have been initialized
+   */
+  protected override async onInitLayerEntries(): Promise<TypeGeoviewLayerConfig> {
+    // Get the folder url
+    const idx = this.getMetadataAccessPath().lastIndexOf('/');
+    const rootUrl = this.getMetadataAccessPath().substring(0, idx);
+    const id = this.getMetadataAccessPath().substring(idx + 1);
+
+    // Calls fetchServiceMetadata which delegates to this class's overridden onFetchServiceMetadata (may use a proxy fallback and store the proxyUrl on the instance)
+    await this.fetchServiceMetadata();
+
+    // Redirect
+    return Promise.resolve(KML.createGeoviewLayerConfig(this.getGeoviewLayerId(), this.getGeoviewLayerName(), rootUrl, false, [{ id }]));
+  }
+
+  /**
+   * Overrides the way the layer metadata is processed.
+   *
+   * @param layerConfig - The layer entry configuration to process
+   * @param displayDateMode - The display date mode to use for processing time dimensions in the metadata
+   * @param mapProjection - Optional map projection
+   * @param abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process
+   * @returns A promise that resolves once the layer entry configuration has gotten its metadata processed
+   */
+  protected override onProcessLayerMetadata(
+    layerConfig: VectorLayerEntryConfig,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    displayDateMode: DisplayDateMode,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    mapProjection?: OLProjection,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    abortSignal?: AbortSignal
+  ): Promise<VectorLayerEntryConfig> {
+    // Initialize the layer metadata from the service metadata
+    KML.initLayerMetadata(layerConfig);
+
+    // Return the layer config
+    return Promise.resolve(layerConfig);
+  }
+
+  /**
+   * Overrides the loading of the vector features for the layer by fetching KML data and converting it
+   * into OpenLayers {@link Feature} feature instances.
+   *
+   * @param layerConfig - The configuration object for the vector layer, containing source and data access information
+   * @param sourceOptions - The OpenLayers vector source options associated with the layer
+   * @param readOptions - Options controlling how features are read, including the target `featureProjection`
+   * @returns A promise that resolves to an array of OpenLayers features
+   */
+  protected override async onCreateVectorSourceLoadFeatures(
+    layerConfig: VectorLayerEntryConfig,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    sourceOptions: SourceOptions<Feature>,
+    readOptions: ReadOptions
+  ): Promise<SourceFeaturesInfo> {
+    // Query; surface a specific message if the KML source can't be loaded (e.g. unreachable/404)
+    const responseData = await AbstractGeoViewVector.fetchSourceForLayer(layerConfig, () =>
+      AbstractGeoViewVector.fetchText(layerConfig.getDataAccessPath(false), layerConfig.getSource().postSettings)
+    );
+
+    // Read the features
+    return GeoUtilities.readFeaturesFromKML(responseData, readOptions.dataProjection, readOptions.featureProjection);
+  }
+
+  /**
+   * Overrides the creation of the GV Layer.
+   *
+   * @param layerConfig - The layer entry configuration
+   * @returns The GV Layer
+   */
+  protected override onCreateGVLayer(layerConfig: KmlLayerEntryConfig): GVKML {
+    // Create the source
+    const source = this.createVectorSource(layerConfig);
+    // Create the GV Layer
+    const gvLayer = new GVKML(source, layerConfig);
+    // Return it
+    return gvLayer;
+  }
+
+  // #endregion OVERRIDES
+
+  // #region STATIC PUBLIC METHODS
+
+  /**
+   * Creates a configuration object for a KML Feature layer.
+   *
+   * This function constructs a `TypeKmlLayerConfig` object that describes an KML Feature layer
+   * and its associated entry configurations based on the provided parameters.
+   *
+   * @param geoviewLayerId - A unique identifier for the GeoView layer
+   * @param geoviewLayerName - The display name of the GeoView layer
+   * @param metadataAccessPath - The full service URL to the layer endpoint
+   * @param isTimeAware - Indicates whether the layer supports time-based filtering
+   * @param layerEntries - An array of layer entries objects to be included in the configuration
+   * @returns The constructed configuration object for the KML Feature layer
+   */
+  static createGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string | undefined,
+    metadataAccessPath: string,
+    isTimeAware: boolean | undefined,
+    layerEntries: TypeLayerEntryShell[]
+  ): TypeKmlLayerConfig {
+    const geoviewLayerConfig: TypeKmlLayerConfig = {
+      geoviewLayerId,
+      geoviewLayerName,
+      metadataAccessPath,
+      geoviewLayerType: CONST_LAYER_TYPES.KML,
+      isTimeAware,
+      listOfLayerEntryConfig: [],
+    };
+    geoviewLayerConfig.listOfLayerEntryConfig = layerEntries.map((layerEntry) => {
+      // TODO: REFACTOR IMPORTANT - This spreading should be rewritten like explained in GeoJSON file. Search id : 59026aa9
+
+      const layerEntryConfig = new KmlLayerEntryConfig({
+        geoviewLayerConfig,
+        layerId: `${layerEntry.id}`,
+        ...(layerEntry.layerName && { layerName: `${layerEntry.layerName}` }),
+        source: {
+          dataAccessPath: layerEntry.source?.dataAccessPath,
+        },
+      });
+      return layerEntryConfig;
+    });
+
+    // Return it
+    return geoviewLayerConfig;
+  }
+
+  /**
+   * Initializes a GeoView layer configuration for a KML layer.
+   *
+   * This method creates a basic TypeGeoviewLayerConfig using the provided
+   * ID, name, and metadata access path URL. It then initializes the layer entries by calling
+   * `initGeoViewLayerEntries`, which may involve fetching metadata or sublayer info.
+   *
+   * @param geoviewLayerId - A unique identifier for the layer
+   * @param geoviewLayerName - The display name of the layer
+   * @param metadataAccessPath - The full service URL to the layer endpoint
+   * @param isTimeAware - Indicates whether the layer supports time-based filtering
+   * @returns A promise that resolves to an initialized GeoView layer configuration with layer entries
+   */
+  static initGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string,
+    metadataAccessPath: string,
+    isTimeAware?: boolean
+  ): Promise<TypeGeoviewLayerConfig> {
+    // Create the Layer config
+    const myLayer = new KML({ geoviewLayerId, geoviewLayerName, metadataAccessPath, isTimeAware } as TypeKmlLayerConfig);
+    return myLayer.initGeoViewLayerEntries();
+  }
+
+  /**
+   * Initializes the metadata for a KML layer entry configuration.
+   *
+   * This method processes the service metadata and sets the relevant information on the layer entry configuration.
+   *
+   * @param layerConfig - The KML layer entry configuration to initialize with metadata
+   */
+  static initLayerMetadata(layerConfig: VectorLayerEntryConfig): void {
+    // Process the feature info configuration and attach the config to the instance for access by parent class
+    layerConfig.setLayerMetadata(layerConfig);
+  }
+
+  /**
+   * Processes a KML GeoviewLayerConfig and returns a promise
+   * that resolves to an array of `ConfigBaseClass` layer entry configurations.
+   *
+   * This method:
+   * 1. Creates a Geoview layer configuration using the provided parameters.
+   * 2. Instantiates a layer with that configuration.
+   * 3. Processes the layer configuration and returns the result.
+   *
+   * @param geoviewLayerId - The unique identifier for the GeoView layer
+   * @param geoviewLayerName - The display name for the GeoView layer
+   * @param url - The URL of the service endpoint
+   * @param layerEntries - An array of layer entry shells to include in the configuration
+   * @param isTimeAware - Indicates if the layer is time aware
+   * @returns A promise that resolves to an array of layer configurations
+   */
+  static processGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string,
+    url: string,
+    layerEntries: TypeLayerEntryShell[],
+    isTimeAware: boolean
+  ): Promise<ConfigBaseClass[]> {
+    // Create the Layer config
+    const layerConfig = KML.createGeoviewLayerConfig(geoviewLayerId, geoviewLayerName, url, isTimeAware, layerEntries);
+
+    // Create the class from geoview-layers package
+    const myLayer = new KML(layerConfig);
+
+    // Process it
+    return AbstractGeoViewVector.processConfig(myLayer);
+  }
+
+  // #endregion STATIC PUBLIC METHODS
+}

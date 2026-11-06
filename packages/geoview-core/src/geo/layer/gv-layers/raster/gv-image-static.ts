@@ -1,0 +1,171 @@
+import ImageLayer from 'ol/layer/Image';
+import type Static from 'ol/source/ImageStatic';
+import type { Options as ImageOptions } from 'ol/layer/BaseImage';
+import type { Extent } from 'ol/extent';
+import type { Projection as OLProjection } from 'ol/proj';
+
+import { logger } from '@/core/utils/logger';
+import type { ImageStaticLayerEntryConfig } from '@/api/config/validation-classes/raster-validation-classes/image-static-layer-entry-config';
+import { GeoviewRenderer } from '@/geo/utils/renderer/geoview-renderer';
+import { AbstractGVRaster } from '@/geo/layer/gv-layers/raster/abstract-gv-raster';
+import { Projection } from '@/geo/utils/projection';
+import { GeoUtilities } from '@/geo/utils/utilities';
+import { Fetch } from '@/core/utils/fetch-helper';
+import { CONST_LAYER_TYPES, type TypeLegend } from '@/api/types/layer-schema-types';
+
+/**
+ * Manages an Image static layer.
+ */
+export class GVImageStatic extends AbstractGVRaster {
+  /**
+   * Constructs a GVImageStatic layer to manage an OpenLayer layer.
+   *
+   * @param olSource - The OpenLayer source.
+   * @param layerConfig - The layer configuration.
+   */
+  constructor(olSource: Static, layerConfig: ImageStaticLayerEntryConfig) {
+    super(olSource, layerConfig);
+
+    // Create the image layer options.
+    const staticImageOptions: ImageOptions<Static> = { source: olSource };
+
+    // Init the layer options with initial settings
+    AbstractGVRaster.initOptionsWithInitialSettings(staticImageOptions, layerConfig);
+
+    // Create and set the OpenLayer layer
+    this.setOLLayer(new ImageLayer(staticImageOptions));
+  }
+
+  // #region OVERRIDES
+
+  /**
+   * Overrides the parent method to return a more specific OpenLayers layer type (covariant return).
+   *
+   * @returns The strongly-typed OpenLayers type.
+   */
+  override getOLLayer(): ImageLayer<Static> {
+    // Call parent and cast
+    return super.getOLLayer() as ImageLayer<Static>;
+  }
+
+  /**
+   * Overrides the parent class's method to return a more specific OpenLayers source type (covariant return).
+   *
+   * @returns The Static source instance associated with this layer.
+   */
+  protected override getOLSource(): Static {
+    // Get source from OL
+    return super.getOLSource() as Static;
+  }
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer configuration specific to this layer.
+   */
+  override getLayerConfig(): ImageStaticLayerEntryConfig {
+    // Call parent and cast
+    return super.getLayerConfig() as ImageStaticLayerEntryConfig;
+  }
+
+  /**
+   * Overrides the fetching of the legend for a static image layer.
+   *
+   * @returns A promise that resolves with the legend of the layer or null
+   */
+  override async onFetchLegend(): Promise<TypeLegend | null> {
+    // Get the config
+    const layerConfig = this.getLayerConfig();
+
+    try {
+      // Get legend image
+      const legendImage = await GVImageStatic.#getLegendImage(layerConfig);
+
+      // If legend image was read
+      if (legendImage) {
+        // Legend was read, load the image
+        const image = await GeoviewRenderer.loadImage(legendImage);
+
+        // If image was loaded
+        if (image) {
+          // Return legend information
+          return {
+            type: CONST_LAYER_TYPES.IMAGE_STATIC,
+            legend: GeoviewRenderer.createCanvasFromImage(image),
+          };
+        }
+      }
+
+      // No good
+      return {
+        type: CONST_LAYER_TYPES.IMAGE_STATIC,
+        legend: null,
+      };
+    } catch (error: unknown) {
+      logger.logError(`Error getting legend for ${layerConfig.layerPath}`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Overrides the way to initialize the bounds for this layer type.
+   *
+   * @param projection - The projection to initialize the bounds into.
+   * @param stops - The number of stops to use to generate the extent.
+   * @returns A promise that resolves with the layer bounding box or undefined when not found
+   */
+  override async onInitBounds(projection: OLProjection, stops: number): Promise<Extent | undefined> {
+    // Wait for the source to be ready, just in case the caller is early
+    await this.waitForSourceReady();
+
+    // Get the OpenLayers source (not the configured source property)
+    const source = this.getOLSource();
+
+    // Get the source projection
+    const sourceProjection = source.getProjection() ?? undefined;
+
+    // Get the layer bounds
+    let sourceExtent = source.getImageExtent();
+
+    // If both found
+    if (sourceExtent && sourceProjection) {
+      // Transform extent to given projection
+      sourceExtent = Projection.transformExtentFromProj(sourceExtent, sourceProjection, projection, stops);
+      sourceExtent = GeoUtilities.validateExtent(sourceExtent, projection.getCode());
+    }
+
+    // Return the calculated layer bounds
+    return sourceExtent;
+  }
+
+  // #endregion OVERRIDES
+
+  // #region STATIC METHODS
+
+  /**
+   * Gets the legend image of a layer.
+   *
+   * @param layerConfig - The layer configuration.
+   * @returns A promise that resolves with the image data URL or null when not found
+   */
+  static #getLegendImage(layerConfig: ImageStaticLayerEntryConfig): Promise<string | null> {
+    const promisedImage = new Promise<string | null>((resolve) => {
+      const legendUrl = layerConfig.getDataAccessPath().toLowerCase().startsWith('http:')
+        ? `https${layerConfig.getDataAccessPath().slice(4)}`
+        : layerConfig.getDataAccessPath();
+
+      // Fetch the blob
+      Fetch.fetchBlob(legendUrl, { credentials: 'omit' })
+        .then((blob) => GeoviewRenderer.readBlobAsDataUrl(blob))
+        .then((dataUrl) => resolve(dataUrl))
+        .catch(() => {
+          // Failed, but resolve nonetheless with a warning
+          logger.logWarning(`The legend could not be fetched for static image ${layerConfig.layerPath}`);
+          resolve(null);
+        });
+    });
+    return promisedImage;
+  }
+
+  // #endregion STATIC METHODS
+}

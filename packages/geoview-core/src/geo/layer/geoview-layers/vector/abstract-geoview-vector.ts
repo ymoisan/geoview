@@ -1,0 +1,360 @@
+import type Feature from 'ol/Feature';
+import type { Options as SourceOptions } from 'ol/source/Vector';
+import { all, bbox } from 'ol/loadingstrategy';
+import type { Projection as OLProjection } from 'ol/proj';
+import type { Extent } from 'ol/extent';
+import { getUid } from 'ol/util';
+import type { ReadOptions } from 'ol/format/Feature';
+
+import type { TypeOutfields, TypeOutfieldsType } from '@/api/types/map-schema-types';
+import type { TypePostSettings } from '@/api/types/layer-schema-types';
+import type { VectorLayerEntryConfig } from '@/api/config/validation-classes/vector-layer-entry-config';
+import { DateMgt } from '@/core/utils/date-mgt';
+import { logger } from '@/core/utils/logger';
+import { Fetch } from '@/core/utils/fetch-helper';
+import { formatError } from '@/core/exceptions/core-exceptions';
+import { LayerSourceFailedToLoadError } from '@/core/exceptions/layer-exceptions';
+import { AbstractGeoViewLayer } from '@/geo/layer/geoview-layers/abstract-geoview-layers';
+import { LayerFilters } from '@/geo/layer/gv-layers/layer-filters';
+import { GVVectorSource } from '@/geo/layer/source/vector-source';
+import { GeoviewRenderer } from '@/geo/utils/renderer/geoview-renderer';
+import { EMPTY_FETCH_RESULT, type FetchWithProxyResult, type SourceFeaturesInfo } from '@/geo/utils/utilities';
+
+/**
+ * The AbstractGeoViewVector class.
+ */
+export abstract class AbstractGeoViewVector extends AbstractGeoViewLayer {
+  /** The maximum delay to wait before we warn about the features fetch taking a long time */
+  static readonly DEFAULT_WAIT_SLOW_FETCH_WARNING = 15 * 1000; // 15 seconds
+
+  // GV Order of these keywords matter, preference will be given in this order
+  static readonly EXCLUDED_HEADERS_LAT = ['latitude', 'lat', 'y', 'ycoord', 'latitude|latitude', 'latitude | latitude'];
+  static readonly EXCLUDED_HEADERS_LNG = ['longitude', 'lon', 'x', 'xcoord', 'longitude|longitude', 'longitude | longitude'];
+  static readonly EXCLUDED_HEADERS_GEN = ['geometry', 'geom'];
+  static readonly EXCLUDED_HEADERS_STYLE = ['styleUrl'];
+  static readonly EXCLUDED_HEADERS = this.EXCLUDED_HEADERS_LAT.concat(this.EXCLUDED_HEADERS_LNG)
+    .concat(this.EXCLUDED_HEADERS_GEN)
+    .concat(this.EXCLUDED_HEADERS_STYLE);
+
+  static readonly MAX_ESRI_FEATURES = 200000;
+
+  // #region OVERRIDES
+
+  /**
+   * Mustoverride function to load vector features for a layer during vector source creation.
+   *
+   * This abstract method defines the contract for retrieving and converting
+   * raw vector data into OpenLayers {@link Feature} instances. Concrete subclasses
+   * must implement the logic required to fetch data from the underlying service
+   * (e.g. WFS, GeoJSON, CSV) and transform it into features compatible with the
+   * vector source.
+   * The returned features are typically added to the vector source as part of
+   * its initialization or loading lifecycle.
+   *
+   * @param layerConfig - The configuration object describing the vector layer, including its data source and access parameters
+   * @param sourceOptions - The OpenLayers vector source options associated with the layer
+   * @param readOptions - Options controlling how features are read, including the target `featureProjection`
+   * @returns A promise that resolves to an array of OpenLayers features created from the underlying data source
+   * @throws {LayerTooManyEsriFeatures} When the layer has too many features
+   */
+  protected abstract onCreateVectorSourceLoadFeatures(
+    layerConfig: VectorLayerEntryConfig,
+    sourceOptions: SourceOptions<Feature>,
+    readOptions: ReadOptions
+  ): Promise<SourceFeaturesInfo>;
+
+  /**
+   * Overrides the way the metadata is fetched.
+   *
+   * @param _abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process (not implemented)
+   * @returns A promise that resolves with no metadata (vector layers fetch metadata in subclasses)
+   */
+  protected override onFetchServiceMetadata(_abortSignal?: AbortSignal): Promise<FetchWithProxyResult<unknown>> {
+    // None
+    return Promise.resolve(EMPTY_FETCH_RESULT);
+  }
+
+  /**
+   * Overridable function to create a source configuration for the vector layer.
+   *
+   * @param layerConfig - The layer entry configuration
+   * @param sourceOptions - The source options (default: { strategy: all })
+   * @returns The source configuration that will be used to create the vector layer
+   */
+  protected onCreateVectorSource(layerConfig: VectorLayerEntryConfig, sourceOptions: SourceOptions<Feature>): GVVectorSource {
+    // If any attributions
+    if (layerConfig.getAttributions()?.length || 0 > 0) {
+      // eslint-disable-next-line no-param-reassign
+      sourceOptions.attributions = layerConfig.getAttributions();
+    }
+
+    // Prepare the sourceOptions
+    // eslint-disable-next-line prefer-const
+    let vectorSource: GVVectorSource;
+
+    // Set loading strategy option
+    // eslint-disable-next-line no-param-reassign
+    sourceOptions.strategy = layerConfig.getSource().strategy === 'bbox' ? bbox : all;
+
+    // eslint-disable-next-line no-param-reassign
+    sourceOptions.loader = (extent: Extent, _resolution: number, projection: OLProjection, successCallback, failureCallback): void => {
+      // GV Use void IIFE so the outer function stays sync and avoids @typescript-eslint/no-misused-promises
+      void (async (): Promise<void> => {
+        try {
+          // Clear last error if any
+          vectorSource.clearLoaderError();
+
+          // The read options
+          const options: ReadOptions = { dataProjection: layerConfig.getSource().dataProjection, featureProjection: projection, extent };
+
+          // Grab the features to load in the source
+          const sourceFeaturesInfo = await this.onCreateVectorSourceLoadFeatures(layerConfig, sourceOptions, options);
+          const { features, dataProjection } = sourceFeaturesInfo;
+
+          // Keep the read options that were used to interpret the source data
+          vectorSource.setDataProjection(dataProjection);
+
+          // Only keep the features that fit the initial filter
+          const layerFilters = new LayerFilters(layerConfig.getLayerFilter());
+          const filterEquation = layerFilters.getFilterEquation();
+          const featuresFiltered = features.filter((feature) => GeoviewRenderer.featureRespectsFilterEquation(feature, filterEquation));
+
+          // Parse the feature metadata
+          AbstractGeoViewVector.#processFeatureMetadata(featuresFiltered, layerConfig);
+
+          // Normalize the date fields
+          AbstractGeoViewVector.#normalizeDateFields(features, layerConfig);
+
+          // If the strategy is 'bbox'
+          if (sourceOptions.strategy === bbox) {
+            // Clear the previously fetched features or they'll get stacked up.
+            // GV Do this right before readding features so that the features flicker as less as possible on the map
+            vectorSource.clear(true);
+          }
+
+          // Add the features in the source
+          vectorSource.addFeatures(featuresFiltered);
+
+          // Call the success callback with the features. This will trigger the onLoaded callback on the layer object (though it
+          // seems not to call it everytime, OL issue? if issue persists, maybe we want to setLayerStatus to loaded here?)
+          successCallback?.(featuresFiltered);
+        } catch (error: unknown) {
+          // Set the error
+          vectorSource.setLoaderError(formatError(error));
+
+          // Call the failed callback, this will trigger the onError callback on the layer object (which will put the layerStatus to error)
+          // and this will remove the failed extent so that OpenLayers may retry loading it later.
+          failureCallback?.();
+        }
+      })();
+    };
+
+    // Create the vector source with the source options
+    vectorSource = new GVVectorSource(sourceOptions);
+
+    // Return the vector source which is still being loaded asynchronously
+    return vectorSource;
+  }
+
+  // #endregion OVERRIDES
+
+  // #region PUBLIC METHODS
+
+  /**
+   * Creates a VectorSource from a layer config.
+   *
+   * @param layerConfig - Configuration object for the vector tile layer
+   * @returns An initialized VectorSource ready for use in a layer
+   */
+  createVectorSource(layerConfig: VectorLayerEntryConfig): GVVectorSource {
+    // Redirect
+    return this.onCreateVectorSource(layerConfig, {});
+  }
+
+  // #endregion PUBLIC METHODS
+
+  // #region STATIC METHODS
+
+  /**
+   * Fetches text data from the given URL using settings defined in the vector source configuration.
+   *
+   * Supports both GET and POST requests depending on the presence of `postSettings`.
+   *
+   * @param url - The URL to fetch data from
+   * @param postSettings - Optional POST settings from the layer config
+   * @returns A promise that resolves to the fetched text response
+   */
+  static fetchText(url: string, postSettings?: TypePostSettings): Promise<string> {
+    // Default to a GET request
+    const fetchOptions: RequestInit = { method: 'GET' };
+
+    // If postSettings are defined, switch to POST and include headers and body
+    if (postSettings) {
+      fetchOptions.method = 'POST';
+      fetchOptions.headers = postSettings.header;
+      fetchOptions.body = JSON.stringify(postSettings.data);
+    }
+
+    // Execute the fetch using the provided options and return the response text
+    return Fetch.fetchText(url, fetchOptions);
+  }
+
+  /**
+   * Executes a source fetch for a vector layer and, on failure, throws a specific error naming the layer.
+   *
+   * Wraps any fetch error in a {@link LayerSourceFailedToLoadError} so a source that can't be loaded (e.g. an
+   * unreachable or missing URL) surfaces an actionable message instead of a generic layer error.
+   *
+   * @param layerConfig - The layer entry config the fetch is for
+   * @param fetcher - The function performing the actual fetch
+   * @returns A promise that resolves with the fetched data
+   * @throws {LayerSourceFailedToLoadError} When the fetch fails (the original error is preserved as the cause)
+   */
+  protected static async fetchSourceForLayer<T>(layerConfig: VectorLayerEntryConfig, fetcher: () => Promise<T>): Promise<T> {
+    try {
+      return await fetcher();
+    } catch (error: unknown) {
+      throw new LayerSourceFailedToLoadError(layerConfig.getLayerNameCascade(), formatError(error));
+    }
+  }
+
+  /**
+   * Fetches json data from the given URL using settings defined in the vector source configuration.
+   *
+   * Supports both GET and POST requests depending on the presence of `postSettings`.
+   *
+   * @param url - The URL to fetch data from
+   * @param postSettings - Optional POST settings from the layer config
+   * @returns A promise that resolves to the fetched JSON response
+   */
+  static fetchJson(url: string, postSettings?: TypePostSettings): Promise<unknown> {
+    // Default to a GET request
+    const fetchOptions: RequestInit = { method: 'GET' };
+
+    // If postSettings are defined, switch to POST and include headers and body
+    if (postSettings) {
+      fetchOptions.method = 'POST';
+      fetchOptions.headers = postSettings.header;
+      fetchOptions.body = JSON.stringify(postSettings.data);
+    }
+
+    // Execute the fetch using the provided options and return the response text
+    return Fetch.fetchJson(url, fetchOptions);
+  }
+
+  /**
+   * This method sets the outfields and aliasFields of the source feature info.
+   *
+   * @param headers - An array of field names
+   * @param firstRow - The first row of data
+   * @param excludedHeaders - The headers to exclude from feature info
+   * @param layerConfig - The vector layer entry to configure
+   */
+  protected static processFeatureInfoConfig(
+    headers: string[],
+    firstRow: string[],
+    excludedHeaders: string[],
+    layerConfig: VectorLayerEntryConfig
+  ): void {
+    // Get the outfields
+    let outfields = layerConfig.getOutfields();
+
+    // Process undefined outfields or aliasFields
+    if (!outfields?.length) {
+      // Create it
+      outfields = [];
+
+      // Loop
+      headers.forEach((header, index) => {
+        // Skip excluded headers and unnamed/blank fields; an empty name yields a column with a falsy id, which MRT rejects
+        if (excludedHeaders.includes(header) || !header.trim()) return;
+
+        // Skip complex fields
+        if (firstRow[index] && typeof firstRow[index] === 'object' && !Array.isArray(firstRow[index])) {
+          logger.logWarning(`Skipping field '${header}' as it is a complex field`);
+          return;
+        }
+
+        let type = 'string' as TypeOutfieldsType;
+        if (firstRow[index] && firstRow[index] !== '' && Number(firstRow[index])) type = 'number';
+
+        const newOutfield: TypeOutfields = {
+          name: header,
+          alias: header,
+          type: type,
+        };
+        outfields!.push(newOutfield);
+      });
+
+      // Set it
+      layerConfig.setOutfields(outfields);
+    }
+
+    // Initialize the aliases
+    layerConfig.initOutfieldsAliases();
+
+    // Vector layer only queryable if there are fields
+    layerConfig.initQueryableSource(outfields.length > 0);
+  }
+
+  /**
+   * Processes metadata for a set of features by assigning unique IDs and initializing feature info configuration if needed.
+   *
+   * @param features - The array of vector features to process.
+   * @param layerConfig - The configuration object for the vector layer.
+   */
+  static #processFeatureMetadata(features: Feature[], layerConfig: VectorLayerEntryConfig): void {
+    // Process feature info from config using the first feature properties.
+    // GV This is essentially a second attempt to fill the outFields and various feature info
+    // GV information in case those weren't initialized with the metadata and are still missing
+    if (features.length > 0) {
+      const sample = features[0];
+      const props = sample.getProperties();
+
+      // Use the sample feature's keys and values to infer featureInfo configuration, excluding any blacklisted headers.
+      this.processFeatureInfoConfig(Object.keys(props), Object.values(props), this.EXCLUDED_HEADERS, layerConfig);
+    }
+
+    // Get the field name that uniquely identifies each feature (OID) from the layer configuration.
+    // TODO: Check - OBJECTID should likely not be sent here by default for an abstract-geoview-vector class which
+    // TO.DOCONT: might very well not be Esri based (leaving it as it was for now, because #getEsriOidField (replaced) was doing this).
+    const oidField = layerConfig.getOutfieldsPKNameOrDefault('OBJECTID');
+
+    // Assign a unique ID to each feature using the OID field if available, otherwise fall back to OpenLayers' getUid().
+    features.forEach((feature) => {
+      const id = feature.get(oidField) ?? getUid(feature);
+      feature.setId(id);
+    });
+  }
+
+  /**
+   * Normalizes all date fields in the provided features to a standard millisecond timestamp format.
+   *
+   * @param features - The features whose date fields should be normalized.
+   * @param layerConfig - The layer configuration containing metadata about the date fields.
+   */
+  static #normalizeDateFields(features: Feature[], layerConfig: VectorLayerEntryConfig): void {
+    // Get all fields declared as type 'date' in the feature info config
+    const dateFields = layerConfig.getOutfields()?.filter((f) => f.type === 'date');
+    if (!dateFields?.length) return;
+
+    // Iterate over each feature to normalize its date fields
+    features.forEach((feature) => {
+      dateFields.forEach((field) => {
+        // Read the value
+        const value = feature.get(field.name);
+
+        // If the value is defined and not null
+        if (value && value !== null) {
+          feature.set(
+            field.name,
+            DateMgt.convertToMilliseconds(value, layerConfig.getServiceDateFormat(), layerConfig.getServiceDateTimezone()),
+            true
+          );
+        }
+      });
+    });
+  }
+
+  // #endregion STATIC METHODS
+}

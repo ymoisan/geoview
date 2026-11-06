@@ -1,0 +1,328 @@
+import type { Options as SourceOptions } from 'ol/source/GeoTIFF';
+import type { Projection as OLProjection } from 'ol/proj';
+import GeoTIFFSource from 'ol/source/GeoTIFF';
+
+import type { ConfigBaseClass, TypeLayerEntryShell } from '@/api/config/validation-classes/config-base-class';
+import { AbstractGeoViewLayer } from '@/geo/layer/geoview-layers/abstract-geoview-layers';
+import { AbstractGeoViewRaster } from '@/geo/layer/geoview-layers/raster/abstract-geoview-raster';
+import type { TypeGeoviewLayerConfig, TypeMetadataGeoTIFF } from '@/api/types/layer-schema-types';
+import { CONST_LAYER_ENTRY_TYPES, CONST_LAYER_TYPES } from '@/api/types/layer-schema-types';
+
+import { GeoTIFFLayerEntryConfig } from '@/api/config/validation-classes/raster-validation-classes/geotiff-layer-entry-config';
+
+import { GVGeoTIFF } from '@/geo/layer/gv-layers/tile/gv-geotiff';
+import { logger } from '@/core/utils/logger';
+import { generateId, extractGeotiffColorMap } from '@/core/utils/utilities';
+import { Fetch } from '@/core/utils/fetch-helper';
+import type { DisplayDateMode } from '@/api/types/map-schema-types';
+import { EMPTY_FETCH_RESULT, type FetchWithProxyResult } from '@/geo/utils/utilities';
+
+export interface TypeGeoTIFFLayerConfig extends Omit<TypeGeoviewLayerConfig, 'listOfLayerEntryConfig'> {
+  geoviewLayerType: typeof CONST_LAYER_TYPES.GEOTIFF;
+  listOfLayerEntryConfig: GeoTIFFLayerEntryConfig[];
+}
+
+/**
+ * A class to add GeoTIFF layer.
+ */
+export class GeoTIFF extends AbstractGeoViewRaster {
+  /**
+   * Constructs a GeoTIFF Layer configuration processor.
+   *
+   * @param layerConfig - The layer configuration
+   */
+  // The constructor is not useless, it narrows down the accepted parameter type.
+  // eslint-disable-next-line @typescript-eslint/no-useless-constructor
+  constructor(layerConfig: TypeGeoTIFFLayerConfig) {
+    super(layerConfig);
+  }
+
+  // #region OVERRIDES
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer configuration specific to this layer.
+   */
+  override getGeoviewLayerConfig(): TypeGeoTIFFLayerConfig {
+    return super.getGeoviewLayerConfig() as TypeGeoTIFFLayerConfig;
+  }
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed metadata specific to this layer.
+   */
+  override getMetadata(): TypeMetadataGeoTIFF | undefined {
+    return super.getMetadata() as TypeMetadataGeoTIFF | undefined;
+  }
+
+  /**
+   * Overrides the way the metadata is fetched.
+   *
+   * @param _abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process (not implemented)
+   * @returns A promise that resolves with the fetched metadata and proxy information
+   * @throws {LayerServiceMetadataUnableToFetchError} When the metadata fetch fails or contains an error
+   */
+  protected override async onFetchServiceMetadata(_abortSignal?: AbortSignal): Promise<FetchWithProxyResult<unknown>> {
+    // If metadataAccessPath does not point to a .tif file, we try to fetch metadata
+    const metadataAccessPath = this.getMetadataAccessPath();
+
+    try {
+      // GV: This is currently only for datacube sources that provide a JSON metadata file
+      if (metadataAccessPath && !metadataAccessPath.endsWith('.tif')) {
+        const url = metadataAccessPath.endsWith('/') ? metadataAccessPath.slice(0, -1) : metadataAccessPath;
+
+        // Fetch it and return
+        return { data: await Fetch.fetchJson<TypeMetadataGeoTIFF>(url, { signal: _abortSignal }) };
+      }
+
+      // The metadataAccessPath didn't seem like it was containing actual metadata, so it was skipped
+      logger.logWarning(
+        `The metadataAccessPath '${metadataAccessPath}' didn't seem like it was containing actual metadata, so it was skipped`
+      );
+
+      // None
+      return EMPTY_FETCH_RESULT;
+    } catch (error: unknown) {
+      // Error likely means there is no metadata to fetch
+      logger.logWarning(
+        `The metadataAccessPath '${metadataAccessPath}' didn't seem like it was containing actual metadata, so it was skipped. Error: ${error}`
+      );
+      return EMPTY_FETCH_RESULT;
+    }
+  }
+
+  /**
+   * Overrides the way a geoview layer config initializes its layer entries.
+   *
+   * @returns A promise resolved once the layer entries have been initialized.
+   */
+  protected override onInitLayerEntries(): Promise<TypeGeoviewLayerConfig> {
+    // Redirect
+    return Promise.resolve(
+      GeoTIFF.createGeoviewLayerConfig(
+        this.getGeoviewLayerId(),
+        this.getGeoviewLayerName(),
+        this.getMetadataAccessPathIfExists(),
+        this.getGeoviewLayerConfig().isTimeAware,
+        []
+      )
+    );
+  }
+
+  /**
+   * Overrides the way the layer metadata is processed.
+   *
+   * @param layerConfig - The layer entry configuration to process.
+   * @param displayDateMode - The display date mode to use for processing time dimensions in the metadata.
+   * @param mapProjection - Optional map projection.
+   * @param abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process.
+   * @returns A promise that the layer entry configuration has gotten its metadata processed.
+   */
+  protected override async onProcessLayerMetadata(
+    layerConfig: GeoTIFFLayerEntryConfig,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    displayDateMode: DisplayDateMode,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    mapProjection?: OLProjection,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    abortSignal?: AbortSignal
+  ): Promise<GeoTIFFLayerEntryConfig> {
+    const metadata = this.getMetadata();
+    if (metadata) {
+      // Set the metadata
+      layerConfig.setServiceMetadata(metadata);
+
+      // If the data access path points to the layerId, and there's a classification asset, use that as data access path
+      if (
+        layerConfig.hasDataAccessPath() &&
+        layerConfig.getDataAccessPath().endsWith(layerConfig.layerId) &&
+        layerConfig.getDataAccessPath().startsWith(this.getMetadataAccessPath()) &&
+        metadata.assets?.[layerConfig.layerId]?.href
+      ) {
+        // Update the data access path
+        layerConfig.setDataAccessPath(metadata.assets[layerConfig.layerId].href);
+      }
+
+      // If there's a projection
+      if (metadata.properties['proj:epsg']) {
+        // Set the projection as read from metadata
+        await layerConfig.initProjectionFromMetadata(metadata.properties['proj:epsg']);
+      }
+    }
+
+    // Extract embedded color map from the GeoTIFF if present
+    try {
+      const colorMap = await extractGeotiffColorMap(layerConfig.getDataAccessPath());
+      if (colorMap) {
+        layerConfig.setEmbeddedColorMap(colorMap);
+      }
+    } catch (error: unknown) {
+      logger.logWarning(`Failed to extract color map for layer ${layerConfig.layerPath}`, error);
+    }
+
+    return Promise.resolve(layerConfig);
+  }
+
+  /**
+   * Overrides the creation of the GV Layer
+   *
+   * @param layerConfig - The layer entry configuration.
+   * @returns The GV Layer
+   */
+  protected override onCreateGVLayer(layerConfig: GeoTIFFLayerEntryConfig): GVGeoTIFF {
+    // Create the source
+    const source = GeoTIFF.createGeoTIFFSource(layerConfig);
+
+    // Create the GV Layer with WebGL layer
+    const gvLayer = new GVGeoTIFF(source, layerConfig);
+
+    // Return the layer immediately
+    return gvLayer;
+  }
+
+  // #endregion OVERRIDES
+
+  // #region STATIC METHODS
+
+  /**
+   * Creates a GeoTIFF source from a layer config.
+   *
+   * @param layerConfig - The configuration for the GeoTIFF layer.
+   * @returns A fully configured GeoTIFF source.
+   * @throws {LayerDataAccessPathMandatoryError} When the Data Access Path was undefined, likely because initDataAccessPath wasn't called.
+   */
+  static createGeoTIFFSource(layerConfig: GeoTIFFLayerEntryConfig): GeoTIFFSource {
+    const hasColorMap = layerConfig.hasEmbeddedColorMap();
+    const sourceOptions: SourceOptions = {
+      sources: [{ url: layerConfig.getDataAccessPath(), overviews: layerConfig.getSource().overviews }],
+      // When an embedded color map exists, disable normalization so raw integer pixel values can index the palette
+      normalize: !hasColorMap,
+      // Use nearest-neighbor interpolation for palette data to avoid blending between class indices
+      interpolate: !hasColorMap,
+    };
+
+    return new GeoTIFFSource(sourceOptions);
+  }
+
+  /**
+   * Initializes a GeoView layer configuration for a GeoTIFF layer.
+   *
+   * This method creates a basic TypeGeoviewLayerConfig using the provided
+   * ID, name, and metadata access path URL. It then initializes the layer entries by calling
+   * `initGeoViewLayerEntries`, which may involve fetching metadata or sublayer info.
+   *
+   * @param geoviewLayerId - A unique identifier for the layer.
+   * @param geoviewLayerName - The display name of the layer.
+   * @param metadataAccessPath - The full service URL to the layer endpoint.
+   * @param isTimeAware - Indicates whether the layer supports time-based filtering.
+   * @returns A promise that resolves to an initialized GeoView layer configuration with layer entries.
+   */
+  static initGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string,
+    metadataAccessPath: string,
+    isTimeAware?: boolean
+  ): Promise<TypeGeoviewLayerConfig> {
+    // Create the Layer config
+    const myLayer = new GeoTIFF({
+      geoviewLayerId,
+      geoviewLayerName:
+        geoviewLayerName === 'tempoName' || !geoviewLayerName ? metadataAccessPath.split('/').pop()?.split('.')[0] : geoviewLayerName,
+      metadataAccessPath,
+      isTimeAware,
+    } as TypeGeoTIFFLayerConfig);
+    return myLayer.initGeoViewLayerEntries();
+  }
+
+  /**
+   * Creates a configuration object for a GeoTIFF layer.
+   *
+   * This function constructs a `TypeGeoTIFFConfig` object that describes an GeoTIFF layer
+   * and its associated entry configurations based on the provided parameters.
+   *
+   * @param geoviewLayerId - A unique identifier for the GeoView layer.
+   * @param geoviewLayerName - The display name of the GeoView layer.
+   * @param metadataAccessPath - The URL or path to access metadata.
+   * @param isTimeAware - Indicates whether the layer supports time-based filtering.
+   * @param layerEntries - An array of layer entries objects to be included in the configuration.
+   * @returns The constructed configuration object for the GeoTIFF layer.
+   */
+  static createGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string | undefined,
+    metadataAccessPath: string | undefined,
+    isTimeAware: boolean | undefined,
+    layerEntries: TypeLayerEntryShell[]
+  ): TypeGeoTIFFLayerConfig {
+    const geoviewLayerConfig: TypeGeoTIFFLayerConfig = {
+      geoviewLayerId,
+      geoviewLayerName,
+      metadataAccessPath,
+      geoviewLayerType: CONST_LAYER_TYPES.GEOTIFF,
+      isTimeAware,
+      listOfLayerEntryConfig: [],
+    };
+    if (layerEntries.length) {
+      geoviewLayerConfig.listOfLayerEntryConfig = layerEntries.map((layerEntry) => {
+        // TODO: REFACTOR IMPORTANT - This spreading should be rewritten like explained in GeoJSON file. Search id : 59026aa9
+
+        const layerEntryConfig = new GeoTIFFLayerEntryConfig({
+          geoviewLayerConfig,
+          layerId: `${layerEntry.id}`,
+          ...(layerEntry.layerName && { layerName: `${layerEntry.layerName}` }),
+        });
+        return layerEntryConfig;
+      });
+    } else {
+      geoviewLayerConfig.listOfLayerEntryConfig = [
+        new GeoTIFFLayerEntryConfig({
+          geoviewLayerConfig,
+          schemaTag: CONST_LAYER_TYPES.GEOTIFF,
+          entryType: CONST_LAYER_ENTRY_TYPES.RASTER_TILE,
+          layerId: metadataAccessPath?.split('/').pop() || generateId(18),
+          layerName: geoviewLayerName,
+        }),
+      ];
+    }
+
+    // Return it
+    return geoviewLayerConfig;
+  }
+
+  /**
+   * Processes a GeoTIFF GeoviewLayerConfig and returns a promise
+   * that resolves to an array of `ConfigBaseClass` layer entry configurations.
+   *
+   * This method:
+   * 1. Creates a Geoview layer configuration using the provided parameters.
+   * 2. Instantiates a layer with that configuration.
+   * 3. Processes the layer configuration and returns the result.
+   *
+   * @param geoviewLayerId - The unique identifier for the GeoView layer.
+   * @param geoviewLayerName - The display name for the GeoView layer.
+   * @param url - The URL of the service endpoint.
+   * @param layerEntries - An array of layer entry shells to include in the configuration.
+   * @param isTimeAware - Indicates if the layer is time aware.
+   * @returns A promise that resolves to an array of layer configurations.
+   */
+  static processGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string,
+    url: string,
+    layerEntries: TypeLayerEntryShell[],
+    isTimeAware: boolean
+  ): Promise<ConfigBaseClass[]> {
+    // Create the Layer config
+    const layerConfig = GeoTIFF.createGeoviewLayerConfig(geoviewLayerId, geoviewLayerName, url, isTimeAware, layerEntries);
+
+    // Create the class from geoview-layers package
+    const myLayer = new GeoTIFF(layerConfig);
+
+    // Process it
+    return AbstractGeoViewLayer.processConfig(myLayer);
+  }
+
+  // #endregion STATIC METHODS
+}

@@ -1,0 +1,186 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useStoreAppGeolocatorServiceURL, useStoreAppDisplayLanguage } from '@/core/stores/states/app-state';
+import { cleanPostalCode, getDecimalDegreeItem } from '@/core/components/geolocator/utilities';
+import type { GeoListItem } from '@/core/components/geolocator/geolocator';
+import { logger } from '@/core/utils/logger';
+import { Fetch } from '@/core/utils/fetch-helper';
+import { RequestAbortedError } from '@/core/exceptions/core-exceptions';
+import { TIMEOUT } from '@/core/utils/constant';
+
+/** Return type for the useGeolocator hook. */
+interface UseGeolocatorReturn {
+  /** Array of geolocation results */
+  data: GeoListItem[] | undefined;
+  /** Loading state during requests */
+  isLoading: boolean;
+  /** Current search input value */
+  searchValue: string;
+  /** Error value */
+  error: boolean;
+  /** Function to update search value */
+  setSearchValue: (value: string) => void;
+  /** Function to trigger geolocation search */
+  getGeolocations: (searchTerm: string) => void;
+  /** Function to reset the hook state */
+  resetState: () => void;
+}
+
+/**
+ * Provides geolocation search functionality with debounced requests.
+ *
+ * @returns The geolocator state and actions
+ */
+export const useGeolocator = (): UseGeolocatorReturn => {
+  logger.logTraceCore('GEOLOCATOR - useGeolocator');
+
+  // States
+  const [data, setData] = useState<GeoListItem[] | undefined>();
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [theError, setTheError] = useState<boolean>(false);
+  const [searchValue, setSearchValue] = useState<string>('');
+
+  // Store
+  const displayLanguage = useStoreAppDisplayLanguage();
+  const geolocatorServiceURL = useStoreAppGeolocatorServiceURL();
+
+  // Refs
+  const searchValueRef = useRef(searchValue);
+  searchValueRef.current = searchValue;
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const fetchTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  /**
+   * Resets the hook state and aborts any pending request.
+   */
+  const resetState = useCallback((): void => {
+    setData(undefined);
+    setTheError(false);
+    setIsLoading(false);
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+
+    // Cleanup function uses the captured timer reference
+    if (fetchTimerRef.current) {
+      clearTimeout(fetchTimerRef.current);
+    }
+  }, []);
+
+  /**
+   * Aborts the request after a timeout when loading.
+   */
+  useEffect(() => {
+    if (isLoading) {
+      // Store the current timer reference
+      const timer = setTimeout(() => {
+        if (abortControllerRef.current) {
+          abortControllerRef.current.abort();
+        }
+        setData(undefined);
+        setTheError(true);
+        setIsLoading(false);
+        logger.logError('GEOLOCATOR - search timeout error');
+      }, TIMEOUT.geolocationReturn);
+
+      fetchTimerRef.current = timer;
+
+      // Cleanup function uses the captured timer reference
+      return () => {
+        clearTimeout(timer);
+      };
+    }
+
+    return () => {};
+  }, [isLoading]);
+
+  /**
+   * Cleans up state on unmount.
+   */
+  useEffect(() => {
+    return () => {
+      resetState();
+    };
+  }, [resetState]);
+
+  /**
+   * Fetches geolocation results for a search term.
+   *
+   * @param searchTerm - The term to search for
+   * @returns A promise that resolves when the fetch completes
+   */
+  const fetchGeolocations = useCallback(
+    async (searchTerm: string): Promise<void> => {
+      try {
+        // Check if it is a postal code and return clean term
+        const cleanSearchTerm = cleanPostalCode(searchTerm);
+        setIsLoading(true);
+
+        if (abortControllerRef.current) {
+          abortControllerRef.current.abort();
+          clearTimeout(fetchTimerRef.current);
+        }
+
+        const newAbortController = new AbortController();
+        abortControllerRef.current = newAbortController;
+
+        const currentUrl = `${geolocatorServiceURL}&lang=${displayLanguage}`;
+        const result = await Fetch.fetchJson<GeoListItem[]>(`${currentUrl}&q=${encodeURIComponent(`${cleanSearchTerm}*`)}`, {
+          signal: abortControllerRef.current.signal,
+        });
+
+        // If cleanSearchTerm is a coordinate, add it to the list
+        const ddSupport = getDecimalDegreeItem(cleanSearchTerm);
+        if (ddSupport) result.unshift(ddSupport);
+
+        setData(result);
+      } finally {
+        setIsLoading(false);
+        clearTimeout(fetchTimerRef.current);
+      }
+    },
+    [geolocatorServiceURL, displayLanguage]
+  );
+
+  /**
+   * Triggers geolocation search and handles errors.
+   *
+   * @param searchTerm - The term to search for
+   */
+  const getGeolocations = useCallback(
+    (searchTerm: string): void => {
+      fetchGeolocations(searchTerm).catch((error: unknown) => {
+        // If aborted response
+        if (error instanceof RequestAbortedError) {
+          // Cancel...
+          return;
+        }
+
+        // Handle or log any errors here if needed
+        setTheError(true);
+        setData(undefined);
+        logger.logError('GEOLOCATOR - search failed', error);
+      });
+    },
+    [fetchGeolocations]
+  );
+
+  /**
+   * Re-fetches results when the display language changes.
+   */
+  useEffect(() => {
+    logger.logTraceUseEffect('GEOLOCATOR - change language', displayLanguage);
+
+    // Re-fetch with the current search value using the updated language
+    getGeolocations(searchValueRef.current);
+  }, [displayLanguage, getGeolocations]);
+
+  return {
+    data,
+    isLoading,
+    searchValue,
+    error: theError,
+    setSearchValue,
+    getGeolocations,
+    resetState,
+  };
+};

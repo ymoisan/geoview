@@ -1,0 +1,55 @@
+import type { GeoChartConfig, ChartType } from 'geochart';
+import type { GeoViewGeoChartConfig as GeoViewGeoChartCoreConfig } from 'geoview-core/api/config/reader/uuid-config-reader';
+
+/**
+ * Definition of options used for the layers definition in the plugin.
+ */
+export type GeoViewGeoChartConfigLayer = {
+  layerId: string;
+  propertyValue: string;
+  propertyDisplay?: string;
+};
+
+/**
+ * Definition of options for all charts.
+ */
+export type GeoViewGeoChartRootConfig = {
+  charts: GeoViewGeoChartConfig[];
+};
+
+/**
+ * Definition of options for each type of chart used for by the plugin.
+ */
+// GV This type is the geoview-geochart equivalent of the homonym 'GeoViewGeoChartConfig' in geoview-core\utils\reader\uuid-config-reader.ts
+export type GeoViewGeoChartConfig = GeoChartConfig<ChartType> & {
+  layers: GeoViewGeoChartConfigLayer[];
+};
+
+/**
+ * Definition of options for all charts used by the plugin.
+ */
+export type PluginGeoChartConfig = {
+  charts: GeoViewGeoChartConfig[];
+};
+
+/**
+ * Explicit function to convert the GeoviewGeochart config from geoview-geochart package to type-equivalent type in the geoview-core package.
+ *
+ * @param chartConfigObject - The config
+ * @returns The core type-equivalent of the objects
+ */
+export function convertGeoViewGeoChartConfigToCore(chartConfigObject: GeoViewGeoChartConfig): GeoViewGeoChartCoreConfig {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Bridge between two intentionally divergent type definitions - crash Github build
+  return chartConfigObject as any;
+}
+
+/**
+ * Explicit function to convert the GeoviewGeochart config from geoview-core package to type-equivalent type in the geoview-geochart package.
+ *
+ * @param chartConfigObject - The config
+ * @returns The geoview-geochart type-equivalent of the objects
+ */
+export function convertGeoViewGeoChartConfigFromCore(chartConfigObject: GeoViewGeoChartCoreConfig): GeoViewGeoChartConfig {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Bridge between two intentionally divergent type definitions - crash Github build
+  return chartConfigObject as any;
+}

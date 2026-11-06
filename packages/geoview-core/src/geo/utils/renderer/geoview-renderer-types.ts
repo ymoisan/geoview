@@ -1,0 +1,127 @@
+import type { TypeFillStyle } from '@/api/types/map-schema-types';
+
+/** Default color palette used when generating layer styles without explicit color assignments. */
+export const defaultColor = [
+  '#800000',
+  '#008000',
+  '#000080',
+  '#808000',
+  '#800080',
+  '#008080',
+  '#ff0000',
+  '#00ff00',
+  '#0000ff',
+  '#ffff00',
+  '#ff00ff',
+  '#00ffff',
+  '#ffa500',
+  '#faebd7',
+  '#7fffd4',
+  '#ffe4c4',
+  '#deb887',
+  '#d2691e',
+  '#ff7f50',
+  '#6495ed',
+  '#fff8dc',
+  '#dc143c',
+  '#b8860b',
+  '#a9a9a9',
+  '#006400',
+  '#bdb76b',
+  '#8b008b',
+  '#556b2f',
+  '#ff8c00',
+  '#9932cc',
+  '#8b0000',
+  '#e9967a',
+  '#8fbc8f',
+  '#483d8b',
+  '#2f4f4f',
+  '#00ced1',
+  '#9400d3',
+  '#ff1493',
+  '#00bfff',
+  '#696969',
+  '#1e90ff',
+  '#b22222',
+  '#fffaf0',
+  '#228b22',
+  '#dcdcdc',
+  '#ffd700',
+  '#adff2f',
+  '#ff69b4',
+  '#cd5c5c',
+  '#4b0082',
+  '#f0e68c',
+  '#e6e6fa',
+  '#7cfc00',
+  '#add8e6',
+  '#f08080',
+  '#e0ffff',
+  '#90ee90',
+  '#ffb6c1',
+  '#20b2aa',
+  '#87cefa',
+  '#ba55d3',
+  '#9370db',
+  '#3cb371',
+  '#ffdead',
+];
+
+/** Represents a single line segment in a fill pattern, defined by a start and end point. */
+export type FillPatternLine = { moveTo: [number, number]; lineTo: [number, number] };
+
+/** Maps each fill style to its corresponding array of fill pattern line segments. */
+export type FillPatternSettings = Record<TypeFillStyle, FillPatternLine[] | []>;
+
+/** Node types used in the filter expression parser. */
+export enum NodeType {
+  unprocessedNode,
+  keyword,
+  variable,
+  string,
+  number,
+  unary,
+  binary,
+  group,
+}
+
+/** Represents a single node in the parsed filter expression tree. */
+export type FilterNodeType = { nodeType: NodeType; nodeValue: null | string | number | boolean | string[] | number[] };
+
+/** Binary operator keywords recognized by the filter expression parser. */
+export const binaryKeywords = ['is', 'is not', 'in', 'like', 'and', 'or', '<', '<=', '=', '<>', '>', '>=', '||', '/', '*', ','];
+
+/** Unary operator keywords recognized by the filter expression parser. */
+export const unaryKeywords = ['not', 'upper', 'lower', 'date'];
+
+/** Grouping keywords recognized by the filter expression parser. */
+export const groupKeywords = ['(', ')'];
+
+/** Operator precedence table for the filter expression parser (higher priority binds tighter). */
+export const operatorPriority = [
+  { key: 'date', priority: 15 },
+  { key: 'upper', priority: 15 },
+  { key: 'lower', priority: 15 },
+  { key: 'u+', priority: 15 },
+  { key: 'u-', priority: 15 },
+  { key: '*', priority: 14 },
+  { key: '/', priority: 14 },
+  { key: '+', priority: 13 },
+  { key: '-', priority: 13 },
+  { key: '||', priority: 13 },
+  { key: ',', priority: 12 },
+  { key: '=', priority: 11 },
+  { key: '<', priority: 10 },
+  { key: '>', priority: 9 },
+  { key: '<=', priority: 8 },
+  { key: '>=', priority: 7 },
+  { key: '<>', priority: 6 },
+  { key: 'is not', priority: 5 },
+  { key: 'is', priority: 5 },
+  { key: 'like', priority: 4 },
+  { key: 'in', priority: 3 },
+  { key: 'not', priority: 2 },
+  { key: 'and', priority: 1 },
+  { key: 'or', priority: 0 },
+];

@@ -1,0 +1,68 @@
+import { useTranslation } from 'react-i18next';
+import { useTheme } from '@mui/material/styles';
+import { useCallback } from 'react';
+
+import { getSxClasses } from './data-table-style';
+import { Switch } from '@/ui';
+import { useStoreDataTableLayerSettings } from '@/core/stores/states/data-table-state';
+import { useMapController, useDataTableController } from '@/core/controllers/use-controllers';
+
+import { logger } from '@/core/utils/logger';
+
+interface FilterDataToExtentProps {
+  layerPath: string;
+}
+
+/**
+ * Creates a toggle switch to filter data table rows to the current map extent.
+ *
+ * @param props - Properties defined in FilterDataToExtentProps interface
+ * @returns The filter data to extent toggle element
+ */
+function FilterDataToExtent(props: FilterDataToExtentProps): JSX.Element {
+  const { layerPath } = props;
+  // Log
+  logger.logTraceRender('components/data-table/filter-data-extent');
+
+  // Hook
+  const { t } = useTranslation();
+  const theme = useTheme();
+  const sxClasses = getSxClasses(theme);
+
+  const datatableSettings = useStoreDataTableLayerSettings();
+  const mapController = useMapController();
+  const dataTableController = useDataTableController();
+
+  // #region Handlers
+
+  /**
+   * Handles when the filter toggle is changed.
+   *
+   * Toggles the filter state and very slightly nudges the map extent to trigger data-table filtering.
+   */
+  const handleFilterToggle = useCallback((): void => {
+    // Toggle the filter state
+    const newFilterState = !datatableSettings[layerPath].filterDataToExtent;
+    dataTableController.setFilterDataToExtent(layerPath, newFilterState);
+
+    // TODO: CHECK - Do we really need this nudge? Seems to be working without it in some tests? Clarify why needed in some cases..
+    // Very slightly nudge the map center to trigger extent-based filtering
+    // Alternate direction to prevent long-term drift
+    const offset = newFilterState ? 0.00001 : -0.00001;
+    mapController.nudgeMapCenter(offset, 0);
+  }, [dataTableController, layerPath, datatableSettings, mapController]);
+
+  // #endregion
+
+  return (
+    <Switch
+      size="small"
+      onChange={handleFilterToggle}
+      checked={datatableSettings[layerPath].filterDataToExtent}
+      sx={sxClasses.filterMap}
+      label={t('dataTable.filterDataToExtent')}
+    />
+  );
+}
+
+export default FilterDataToExtent;

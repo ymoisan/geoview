@@ -1,0 +1,71 @@
+import type { ChangeEvent } from 'react';
+import { useTranslation } from 'react-i18next';
+import { CloseIcon, AppBarUI, IconButton, Toolbar, InputAdornment } from '@/ui';
+import { SearchIcon } from '@/ui/icons';
+import { StyledInputField } from '@/core/components/geolocator/geolocator-style';
+import { logger } from '@/core/utils/logger';
+
+/** Props for the GeolocatorBar component. */
+interface GeolocatorBarProps {
+  /** Current search input value */
+  searchValue: string;
+  /** Called when search input changes */
+  onChange: (event: ChangeEvent<HTMLInputElement>) => void;
+  /** Called when search is triggered (via button or form submit) */
+  onSearch: () => void;
+  /** Called when reset/clear button is clicked */
+  onReset: () => void;
+  /** Loading state to disable search while fetching */
+  isLoading: boolean;
+  /** Ref for the search input element */
+  inputRef?: React.RefObject<HTMLInputElement | null>;
+}
+
+/**
+ * Creates the geolocator search bar component.
+ *
+ * @param props - Properties defined in GeolocatorBarProps interface
+ * @returns The geolocator bar
+ */
+export function GeolocatorBar({ searchValue, onChange, onSearch, onReset, isLoading, inputRef }: GeolocatorBarProps): JSX.Element {
+  logger.logTraceRender('components/geolocator/geolocator-bar');
+
+  // Hooks
+  const { t } = useTranslation();
+
+  return (
+    <AppBarUI position="static" component="div">
+      <Toolbar variant="dense" disableGutters>
+        <form
+          role="search"
+          aria-label={t('geolocator.searchFormLabel')}
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!isLoading) onSearch();
+          }}
+        >
+          <StyledInputField
+            type="search"
+            startAdornment={
+              <InputAdornment position="start">
+                <SearchIcon />
+              </InputAdornment>
+            }
+            slotProps={{
+              input: {
+                'aria-label': t('geolocator.searchInputLabel'),
+              },
+            }}
+            placeholder={t('geolocator.search')}
+            onChange={onChange}
+            value={searchValue}
+            inputRef={inputRef}
+          />
+          <IconButton edge="end" aria-label={t('geolocator.searchClose')} className="buttonOutline" size="small" onClick={onReset}>
+            <CloseIcon />
+          </IconButton>
+        </form>
+      </Toolbar>
+    </AppBarUI>
+  );
+}

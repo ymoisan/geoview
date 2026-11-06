@@ -1,0 +1,891 @@
+import type { Extent } from 'ol/extent';
+import { XYZ, OSM, VectorTile } from 'ol/source';
+import TileGrid from 'ol/tilegrid/TileGrid';
+import type BaseLayer from 'ol/layer/Base';
+import TileLayer from 'ol/layer/Tile';
+import VectorTileLayer from 'ol/layer/VectorTile';
+import MVT from 'ol/format/MVT';
+import type OLMap from 'ol/Map';
+import { OverviewMap as OLOverviewMap } from 'ol/control';
+
+import { applyStyle } from 'ol-mapbox-style';
+
+import type { TypeBasemapOptions, TypeValidMapProjectionCodes, TypeDisplayLanguage } from '@/api/types/map-schema-types';
+import type { TypeLod } from '@/api/types/layer-schema-types';
+import { delay, getLocalizedMessage } from '@/core/utils/utilities';
+import type {
+  TypeBasemapProps,
+  TypeBasemapLayer,
+  BasemapCreationList,
+  BasemapCreation,
+  BasemapJsonResponse,
+} from '@/geo/layer/basemap/basemap-types';
+import { Projection } from '@/geo/utils/projection';
+import { getStoreMapCurrentBasemapOptionsOrInitial } from '@/core/stores/states/map-state';
+import type { MapController } from '@/core/controllers/map-controller';
+import { logger } from '@/core/utils/logger';
+import type { EventDelegateBase } from '@/api/events/event-helper';
+import EventHelper from '@/api/events/event-helper';
+import {
+  GeoViewError,
+  BasemapTakingLongTimeError,
+  BasemapLayerCreationError,
+  CoreBasemapCreationError,
+  OverviewMapCreationError,
+} from '@/core/exceptions/geoview-exceptions';
+import type { MapViewer } from '@/geo/map/map-viewer';
+import { Fetch } from '@/core/utils/fetch-helper';
+
+/**
+ * A class to get a Basemap for a define projection and language. For the moment, a list maps are available and
+ * can be filtered by projection (currently only WM and LCC projections are listed,
+ * in case other projections needed, they need to be added to the list).
+ */
+export class BasemapApi {
+  /** The maximum delay to wait before we warn about the basemap taking a long time */
+  static DEFAULT_WAIT_PERIOD_BASEMAP_WARNING = 10 * 1000; // 10 seconds
+
+  /** Indicates if the basemap has been created successfully */
+  created = false;
+
+  /** The active basemap */
+  activeBasemap?: TypeBasemapProps;
+
+  /** The default origin */
+  defaultOrigin?: number[];
+
+  /** The default resolutions */
+  defaultResolutions?: number[];
+
+  /** The default extent */
+  defaultExtent?: Extent;
+
+  /** The overview map basemap */
+  overviewMap?: TypeBasemapProps;
+
+  /** The overview map control */
+  overviewMapCtrl?: OLOverviewMap;
+
+  /** The basemap options passed from the map config */
+  basemapOptions: TypeBasemapOptions;
+
+  /** The map viewer */
+  #mapViewer: MapViewer;
+
+  /** The map controller */
+  #mapController: MapController;
+
+  /**
+   * Initializes the basemap API.
+   *
+   * @param mapViewer - The map viewer
+   * @param mapController - The map controller
+   * @param basemapOptions - The basemap option properties, passed in from map config
+   */
+  constructor(mapViewer: MapViewer, mapController: MapController, basemapOptions: TypeBasemapOptions) {
+    // Keep the properties
+    this.#mapViewer = mapViewer;
+    this.#mapController = mapController;
+    this.basemapOptions = basemapOptions;
+  }
+
+  /** The basemap creation configuration list */
+  basemapsList: BasemapCreationList = {
+    3978: {
+      transport: {
+        url: 'https://tiles.arcgis.com/tiles/HsjBaDykC1mjhXz9/arcgis/rest/services/CBMT_CBCT_3978_V_OSM/VectorTileServer',
+        jsonUrl: 'https://tiles.arcgis.com/tiles/HsjBaDykC1mjhXz9/arcgis/rest/services/CBMT_CBCT_3978_V_OSM/VectorTileServer?f=json',
+        styleUrl:
+          'https://nrcan-rncan.maps.arcgis.com/sharing/rest/content/items/b2bba07183154bc7a0b0073be80474f7/resources/styles/root.json',
+      },
+      simple: {
+        url: 'https://tiles.arcgis.com/tiles/HsjBaDykC1mjhXz9/arcgis/rest/services/Simple_V/VectorTileServer',
+        jsonUrl: 'https://tiles.arcgis.com/tiles/HsjBaDykC1mjhXz9/arcgis/rest/services/Simple_V/VectorTileServer?f=json',
+        styleUrl:
+          'https://tiles.arcgis.com/tiles/HsjBaDykC1mjhXz9/arcgis/rest/services/Simple_V/VectorTileServer/resources/styles/root.json',
+      },
+      shaded: {
+        url: 'https://maps-cartes.services.geo.ca/server2_serveur2/rest/services/BaseMaps/CBME_CBCE_HS_RO_3978/MapServer/WMTS/tile/1.0.0/CBMT_CBCT_GEOM_3978/default/default028mm/{z}/{y}/{x}.jpg',
+        jsonUrl: 'https://maps-cartes.services.geo.ca/server2_serveur2/rest/services/BaseMaps/CBME_CBCE_HS_RO_3978/MapServer?f=json',
+      },
+      label: {
+        url: 'https://tiles.arcgis.com/tiles/HsjBaDykC1mjhXz9/arcgis/rest/services/CBMT_CBCT_3978_V_OSM/VectorTileServer',
+        jsonUrl: 'https://tiles.arcgis.com/tiles/HsjBaDykC1mjhXz9/arcgis/rest/services/CBMT_CBCT_3978_V_OSM/VectorTileServer?f=json',
+        styleUrl: {
+          en: 'https://nrcan-rncan.maps.arcgis.com/sharing/rest/content/items/5e29be10a78547a3a6a219ccf7bd42d0/resources/styles/root.json',
+          fr: 'https://nrcan-rncan.maps.arcgis.com/sharing/rest/content/items/667be32b4489469cbccc551144d457be/resources/styles/root.json',
+        },
+      },
+      imagery: {
+        url: 'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        jsonUrl: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/?f=json',
+      },
+    },
+    3857: {
+      transport: {
+        url: 'https://tiles.arcgis.com/tiles/HsjBaDykC1mjhXz9/arcgis/rest/services/CBMT_CBCT_3857_V_OSM/VectorTileServer',
+        jsonUrl: 'https://tiles.arcgis.com/tiles/HsjBaDykC1mjhXz9/arcgis/rest/services/CBMT_CBCT_3857_V_OSM/VectorTileServer?f=json',
+        styleUrl:
+          'https://nrcan-rncan.maps.arcgis.com/sharing/rest/content/items/516e82031eee4e97a71652ebb0e94879/resources/styles/root.json',
+      },
+      simple: {
+        url: 'https://tiles.arcgis.com/tiles/HsjBaDykC1mjhXz9/arcgis/rest/services/Simple_3857/VectorTileServer',
+        jsonUrl: 'https://tiles.arcgis.com/tiles/HsjBaDykC1mjhXz9/arcgis/rest/services/Simple_3857/VectorTileServer?f=json',
+        styleUrl:
+          'https://tiles.arcgis.com/tiles/HsjBaDykC1mjhXz9/arcgis/rest/services/Simple_3857/VectorTileServer/resources/styles/root.json',
+      },
+      shaded: {
+        url: 'https://maps-cartes.services.geo.ca/server2_serveur2/rest/services/BaseMaps/CBME_CBCE_HS_RO_3978/MapServer/WMTS/tile/1.0.0/CBMT_CBCT_GEOM_3978/default/default028mm/{z}/{y}/{x}.jpg',
+        jsonUrl: 'https://maps-cartes.services.geo.ca/server2_serveur2/rest/services/BaseMaps/CBME_CBCE_HS_RO_3978/MapServer?f=json',
+      },
+      label: {
+        url: 'https://tiles.arcgis.com/tiles/HsjBaDykC1mjhXz9/arcgis/rest/services/CBMT_CBCT_3857_V_OSM/VectorTileServer',
+        jsonUrl: 'https://tiles.arcgis.com/tiles/HsjBaDykC1mjhXz9/arcgis/rest/services/CBMT_CBCT_3857_V_OSM/VectorTileServer?f=json',
+        styleUrl: {
+          en: 'https://nrcan-rncan.maps.arcgis.com/sharing/rest/content/items/50cb5f2dfaaf4ccb88f37be2d8e5661e/resources/styles/root.json',
+          fr: 'https://nrcan-rncan.maps.arcgis.com/sharing/rest/content/items/0d77943ff03e43fc933b411f80c9b835/resources/styles/root.json',
+        },
+      },
+      imagery: {
+        url: 'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        jsonUrl: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/?f=json',
+      },
+    },
+  };
+
+  /** Callback delegates for the basemap changed event */
+  #onBasemapChangedHandlers: BasemapChangedDelegate[] = [];
+
+  /** Callback delegates for the basemap error event */
+  #onBasemapErrorHandlers: BasemapErrorDelegate[] = [];
+
+  /** Callback delegates for the overview map control visibility changed event */
+  #onOverviewMapControlVisibilityChangedHandlers: OverviewMapControlVisibilityChangedDelegate[] = [];
+
+  // #region OVERVIEW MAP
+
+  /**
+   * Gets or creates the overview map control.
+   *
+   * @param olMap - The OpenLayers map instance
+   * @param toggleButton - The toggle button element for the overview map
+   * @returns The overview map control
+   */
+  initOverviewMapControl(olMap: OLMap, toggleButton: HTMLDivElement): OLOverviewMap {
+    if (this.overviewMapCtrl) {
+      return this.overviewMapCtrl;
+    }
+
+    const overviewMapControl = new OLOverviewMap({
+      className: 'ol-overviewmap ol-custom-overviewmap',
+      layers: this.createOverviewMapLayers(),
+      collapseLabel: toggleButton,
+      label: toggleButton,
+      collapsed: false,
+      rotateWithView: true,
+      tipLabel: '',
+    });
+
+    this.overviewMapCtrl = overviewMapControl;
+    olMap.removeControl(this.overviewMapCtrl);
+    olMap.addControl(this.overviewMapCtrl);
+    return overviewMapControl;
+  }
+
+  /**
+   * Creates the layers for the overview map.
+   *
+   * @returns The array of base layers for the overview map
+   */
+  createOverviewMapLayers(): BaseLayer[] {
+    const newLayers: BaseLayer[] = [];
+    this.overviewMap?.layers.forEach((layer) => {
+      // create a tile layer for this basemap layer
+      let tileLayer;
+      if (layer.source instanceof VectorTile) {
+        tileLayer = new VectorTileLayer({
+          opacity: layer.opacity,
+          source: layer.source,
+          declutter: true,
+        });
+
+        const tileGrid = layer.source.getTileGrid();
+        if (tileGrid) {
+          applyStyle(tileLayer, layer.styleUrl, {
+            resolutions: tileGrid.getResolutions(),
+          }).catch((error: unknown) => logger.logError(error));
+        }
+      } else {
+        tileLayer = new TileLayer({
+          opacity: layer.opacity,
+          source: layer.source,
+        });
+      }
+
+      if (tileLayer) {
+        // add this layer to the basemap group
+        tileLayer.set(this.#mapViewer.mapId, 'basemap');
+        newLayers.push(tileLayer);
+      }
+    });
+    return newLayers;
+  }
+
+  /**
+   * Creates and sets the overview map basemap.
+   *
+   * @returns A promise that resolves when the overview map basemap has been created and set
+   */
+  async setOverviewMap(): Promise<void> {
+    // Only create overview map for supported projections (3857 and 3978)
+    const projectionCode = this.#mapViewer.getProjectionNumber();
+    if (projectionCode !== 3857 && projectionCode !== 3978) return;
+
+    try {
+      // Create the Core Basemap
+      this.overviewMap = await this.createCoreBasemap({ basemapId: 'transport', shaded: false, labeled: false });
+    } catch (error: unknown) {
+      // Emit about the error
+      this.#emitBasemapError({ error: error instanceof GeoViewError ? error : new OverviewMapCreationError() });
+    }
+
+    // Overview Map Control
+    if (this.overviewMapCtrl) {
+      // switches to layers of the correct projection (important for vector tiles)
+      this.overviewMapCtrl.getOverviewMap().setLayers(this.createOverviewMapLayers());
+    }
+  }
+
+  /**
+   * Gets the visibility state of the overview map control.
+   *
+   * @returns True if the overview map control is visible, false otherwise
+   */
+  getOverviewMapControlVisibility(): boolean {
+    return !!this.overviewMapCtrl?.getMap();
+  }
+
+  /**
+   * Sets the visibility of the overview map control.
+   *
+   * @param olMap - The OpenLayers map instance
+   * @param visible - Whether the overview map control should be visible
+   */
+  setOverviewMapControlVisibility(olMap: OLMap, visible: boolean): void {
+    if (visible) {
+      this.overviewMapCtrl?.setMap(olMap);
+    } else {
+      this.overviewMapCtrl?.setMap(null);
+    }
+
+    // Emit about it
+    this.#emitOverviewMapControlVisibilityChanged({ visible });
+  }
+
+  /**
+   * Waits until the overview map visibility matches the expected state.
+   *
+   * Sync-checks first, then subscribes to the visibility-changed event until the condition is met.
+   *
+   * @param expectedVisible - The expected visibility state to wait for
+   * @returns A promise that resolves once the visibility matches the expected state
+   */
+  waitForOverviewMapVisibility(expectedVisible: boolean): Promise<void> {
+    // Sync check
+    if (this.getOverviewMapControlVisibility() === expectedVisible) return Promise.resolve();
+
+    // Subscribe via onceOverviewMapControlVisibilityChangedPromise with a filter matching the expected state
+    return this.onceOverviewMapControlVisibilityChanged((event) => event.visible === expectedVisible).then(() => {});
+  }
+
+  // #endregion
+
+  // #region CREATE BASEMAPS
+
+  /**
+   * Creates a basemap layer.
+   *
+   * @param basemapId - The id of the layer
+   * @param basemapLayer - The basemap layer url and json url
+   * @param opacity - The opacity to use for this layer
+   * @param rest - Whether to do a GET request to get the info from the server
+   * @returns A promise that resolves with the created basemap layer, or null if rest is false or jsonUrl is missing
+   */
+  async #createBasemapLayer(
+    basemapId: string,
+    basemapLayer: BasemapCreation,
+    opacity: number,
+    rest: boolean
+  ): Promise<null | TypeBasemapLayer> {
+    const resolutions: number[] = [];
+    let minZoom = 0;
+    let maxZoom = 23;
+    let extent: Extent = [0, 0, 0, 0];
+    let origin: number[] = [];
+    let urlProj = 0;
+    let copyright = '';
+
+    // Should we do a get request to get the layer information from the server?
+    if (rest && basemapLayer.jsonUrl) {
+      // Get info from server
+      const result = await Fetch.fetchJson<BasemapJsonResponse>(basemapLayer.jsonUrl);
+
+      // Read the information
+      const { minScale, maxScale, fullExtent, tileInfo } = result;
+
+      const lods: { [key: number]: TypeLod } = {};
+
+      // Get resolutions and scale from tile grid info
+      tileInfo.lods?.forEach((lod) => {
+        const { scale, resolution } = lod;
+
+        resolutions.push(resolution);
+
+        lods[scale] = lod;
+      });
+
+      // Set layer origin
+      origin = [tileInfo?.origin?.x || 0, tileInfo?.origin?.y || 0];
+
+      // set minimum zoom for this layer
+      minZoom = lods[minScale] ? lods[minScale].level : 0;
+
+      // Set max zoom for this layer
+      maxZoom = lods[maxScale] ? lods[maxScale].level : 23;
+
+      // Set extent for this layer
+      extent = [fullExtent.xmin, fullExtent.ymin, fullExtent.xmax, fullExtent.ymax];
+
+      // Set copyright text for this layer
+      copyright = result.copyrightText;
+
+      // Set the spatial Reference for this layer
+      urlProj = tileInfo.spatialReference.latestWkid!;
+
+      let source;
+      if (basemapLayer.styleUrl) {
+        const tileSize = [tileInfo.rows, tileInfo.cols];
+        source = new VectorTile({
+          attributions: getLocalizedMessage(this.#mapViewer.getDisplayLanguage(), 'mapctrl.attribution.defaultnrcan'),
+          projection: Projection.PROJECTIONS[urlProj],
+          url: basemapLayer.url,
+          format: new MVT(),
+          tileGrid: new TileGrid({
+            tileSize,
+            extent,
+            origin,
+            resolutions,
+          }),
+        });
+      } else {
+        source = new XYZ({
+          attributions: getLocalizedMessage(this.#mapViewer.getDisplayLanguage(), 'mapctrl.attribution.defaultnrcan'),
+          projection: Projection.PROJECTIONS[urlProj],
+          url: basemapLayer.url,
+          crossOrigin: 'Anonymous',
+          tileGrid: new TileGrid({
+            extent,
+            origin,
+            resolutions,
+          }),
+        });
+      }
+
+      // Return a basemap layer
+      return {
+        basemapId,
+        type: basemapId,
+        url: basemapLayer.url,
+        jsonUrl: basemapLayer.jsonUrl,
+        styleUrl: basemapLayer.styleUrl,
+        source,
+        opacity,
+        origin,
+        extent,
+        resolutions, // ? is this use somewhere, modifying values has no effect. Issue 643
+        minScale: minZoom, // ? is this use somewhere, modifying values has no effect. Issue 643
+        maxScale: maxZoom, // ? is this use somewhere, modifying values has no effect. Issue 643
+        copyright,
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Checks the basemap creation process.
+   *
+   * After a predefined maximum wait period (`DEFAULT_WAIT_PERIOD_BASEMAP_WARNING`), it verifies whether the basemap has been created.
+   * If not, it emits a `BasemapTakingLongTimeError` to notify the system of a potential delay or failure.
+   * This serves as a safeguard against stalled or unresponsive basemap creation.
+   */
+  #startBasemapCreationWatcher(): void {
+    delay(BasemapApi.DEFAULT_WAIT_PERIOD_BASEMAP_WARNING).then(
+      () => {
+        // If the basemap has been created
+        if (this.created) return true;
+
+        // Emit about the error
+        this.#emitBasemapError({ error: new BasemapTakingLongTimeError() });
+
+        return false;
+      },
+      (error: unknown) => logger.logPromiseFailed('Delay in #startBasemapCreationWatcher failed', error)
+    );
+  }
+
+  /**
+   * Creates the core basemap and adds the layers to it.
+   *
+   * @param basemapOptions - The basemap options
+   * @param projection - Optional projection code
+   * @param language - Optional display language
+   * @returns A promise that resolves with the core basemap
+   * @throws {CoreBasemapCreationError} When no basemap layers are created and the basemap is not 'nogeom'
+   */
+  async createCoreBasemap(
+    basemapOptions: TypeBasemapOptions,
+    projection?: TypeValidMapProjectionCodes,
+    language?: TypeDisplayLanguage
+  ): Promise<TypeBasemapProps> {
+    const basemapLayers: TypeBasemapLayer[] = [];
+    const basemaplayerTypes: string[] = [];
+    const defaultOpacity = 1;
+
+    let defaultOrigin: number[] | undefined;
+    let defaultExtent: Extent | undefined;
+    let defaultResolutions: number[] | undefined;
+    let minZoom = 0;
+    let maxZoom = 23;
+
+    // Check if projection is provided for the basemap creation
+    const projectionCode = projection === undefined ? this.#mapViewer.getProjectionNumber() : projection;
+
+    // Check if language is provided for the basemap creation
+    const languageCode = language === undefined ? this.#mapViewer.getDisplayLanguage() : language;
+
+    // Check if basemap options are provided for the basemap creation
+    const coreBasemapOptions = basemapOptions === undefined ? this.basemapOptions : basemapOptions;
+
+    // Start a timer to see if the basemap will get processed after a while
+    this.#startBasemapCreationWatcher();
+
+    if (coreBasemapOptions) {
+      // Create transport layer
+      if (coreBasemapOptions.basemapId === 'transport' && this.basemapsList[projectionCode].transport) {
+        const transportLayer = await this.#createBasemapLayer(
+          'transport',
+          this.basemapsList[projectionCode].transport,
+          defaultOpacity,
+          true
+        ).catch(() => this.#emitBasemapError({ error: new BasemapLayerCreationError('transport') }));
+
+        if (transportLayer) {
+          basemapLayers.push(transportLayer);
+          basemaplayerTypes.push('transport');
+
+          // Set default origin,extent,resolutions from layer
+          defaultOrigin = transportLayer.origin;
+          defaultExtent = transportLayer.extent;
+          defaultResolutions = transportLayer.resolutions;
+          minZoom = transportLayer.minScale;
+          maxZoom = transportLayer.maxScale;
+        }
+      }
+
+      // Create shaded layer
+      if (coreBasemapOptions.shaded && this.basemapsList[projectionCode].shaded) {
+        const shadedLayer = await this.#createBasemapLayer(
+          'shaded',
+          this.basemapsList[projectionCode].shaded,
+          coreBasemapOptions.basemapId === 'transport' ? 0.3 : defaultOpacity,
+          true
+        ).catch(() => this.#emitBasemapError({ error: new BasemapLayerCreationError('shaded') }));
+
+        if (shadedLayer) {
+          basemapLayers.push(shadedLayer);
+          basemaplayerTypes.push('shaded');
+        }
+      }
+
+      // Create simple layer
+      if (coreBasemapOptions.basemapId === 'simple' && this.basemapsList[projectionCode].simple) {
+        const simpleLayer = await this.#createBasemapLayer(
+          'simple',
+          this.basemapsList[projectionCode].simple,
+          coreBasemapOptions.shaded ? 0.75 : defaultOpacity,
+          true
+        ).catch(() => this.#emitBasemapError({ error: new BasemapLayerCreationError('simple') }));
+
+        if (simpleLayer) {
+          basemapLayers.push(simpleLayer);
+          basemaplayerTypes.push('simple');
+
+          // Set default origin,extent,resolutions from layer
+          defaultOrigin = simpleLayer.origin;
+          defaultExtent = simpleLayer.extent;
+          defaultResolutions = simpleLayer.resolutions;
+          minZoom = simpleLayer.minScale;
+          maxZoom = simpleLayer.maxScale;
+        }
+      }
+
+      // Create open street maps layer
+      if (coreBasemapOptions.basemapId === 'osm') {
+        basemapLayers.push({
+          basemapId: 'osm',
+          type: 'osm',
+          source: new OSM({ crossOrigin: 'Anonymous' }),
+          opacity: coreBasemapOptions.shaded ? 0.75 : defaultOpacity,
+          origin: [],
+          extent: [],
+          resolutions: [],
+          minScale: minZoom,
+          maxScale: maxZoom,
+        });
+        basemaplayerTypes.push('osm');
+      }
+
+      // No geometry basemap layer
+      if (coreBasemapOptions.basemapId === 'nogeom') {
+        basemaplayerTypes.push('nogeom');
+      }
+
+      // Create imagery layer
+      if (coreBasemapOptions.basemapId === 'imagery' && this.basemapsList[projectionCode].imagery) {
+        const imageryLayer = await this.#createBasemapLayer(
+          'imagery',
+          this.basemapsList[projectionCode].imagery,
+          coreBasemapOptions.shaded ? 0.75 : defaultOpacity,
+          true
+        ).catch(() => this.#emitBasemapError({ error: new BasemapLayerCreationError('imagery') }));
+
+        if (imageryLayer) {
+          basemapLayers.push(imageryLayer);
+          basemaplayerTypes.push('imagery');
+
+          // Set default origin,extent,resolutions from layer
+          defaultOrigin = imageryLayer.origin;
+          defaultExtent = imageryLayer.extent;
+          defaultResolutions = imageryLayer.resolutions;
+          minZoom = imageryLayer.minScale;
+          maxZoom = imageryLayer.maxScale;
+        }
+      }
+
+      if (basemapLayers.length && coreBasemapOptions.labeled) {
+        // Read the style url
+        const { styleUrl } = this.basemapsList[projectionCode].label;
+        let styleUrlReal: string;
+        if (typeof styleUrl === 'object') {
+          styleUrlReal = styleUrl[languageCode];
+        } else {
+          styleUrlReal = styleUrl!;
+        }
+        const labelLayer = await this.#createBasemapLayer(
+          'label',
+          {
+            url: this.basemapsList[projectionCode].label.url!,
+            jsonUrl: this.basemapsList[projectionCode].label.jsonUrl,
+            styleUrl: styleUrlReal,
+          },
+          0.8,
+          true
+        ).catch(() => this.#emitBasemapError({ error: new BasemapLayerCreationError('labeled') }));
+
+        if (labelLayer) {
+          basemapLayers.push(labelLayer);
+          basemaplayerTypes.push('label');
+        }
+      }
+    }
+
+    if (basemapLayers.length > 0 || (basemapLayers.length === 0 && coreBasemapOptions.basemapId === 'nogeom')) {
+      // Id and type are derived from the basemap type composition (shaded, label, transport, simple)
+      const basemap = {
+        basemapId: basemaplayerTypes.join(''),
+        layers: basemapLayers,
+        type: basemaplayerTypes.join('-'),
+        basemapOptions: coreBasemapOptions,
+        attribution:
+          coreBasemapOptions.basemapId === 'osm'
+            ? ['© OpenStreetMap', getLocalizedMessage(this.#mapViewer.getDisplayLanguage(), 'mapctrl.attribution.defaultnrcan')]
+            : [
+                basemapLayers.find((layer) => coreBasemapOptions.basemapId === layer.basemapId)?.copyright || '',
+                getLocalizedMessage(this.#mapViewer.getDisplayLanguage(), 'mapctrl.attribution.defaultnrcan'),
+              ],
+        zoomLevels: {
+          min: minZoom,
+          max: maxZoom,
+        },
+        defaultExtent,
+        defaultOrigin,
+        defaultResolutions,
+        name: '',
+        description: '',
+        descSummary: '',
+        altText: '',
+        thumbnailUrl: '',
+      };
+
+      // Done
+      this.created = true;
+
+      // Return the basemap
+      return basemap;
+    }
+
+    // Failed
+    throw new CoreBasemapCreationError();
+  }
+
+  // #endregion
+
+  /**
+   * Loads the default basemap that was passed in the map config.
+   *
+   * @param projection - Optional projection code
+   * @param language - Optional display language
+   */
+  async loadDefaultBasemaps(projection?: TypeValidMapProjectionCodes, language?: TypeDisplayLanguage): Promise<void> {
+    // Create the core basemap
+    const basemap = await this.createCoreBasemap(getStoreMapCurrentBasemapOptionsOrInitial(this.#mapViewer.mapId), projection, language);
+
+    // Info used by create custom basemap
+    this.defaultOrigin = basemap?.defaultOrigin;
+    this.defaultResolutions = basemap?.defaultResolutions;
+    this.defaultExtent = basemap?.defaultExtent;
+
+    this.setBasemap(basemap);
+    return this.setOverviewMap();
+  }
+
+  /**
+   * Clears the basemap layers from the map.
+   */
+  clearBasemaps(): void {
+    // Remove previous basemaps
+    const layers = this.#mapViewer.map.getAllLayers();
+
+    // Loop through all layers on the map
+    for (let layerIndex = 0; layerIndex < layers.length; layerIndex++) {
+      const layer = layers[layerIndex];
+
+      // Get group id that this layer belongs to
+      const layerId = layer.get('mapId');
+
+      // Check if the group id matches basemap
+      if (layerId && layerId === 'basemap') {
+        // Remove the basemap layer
+        this.#mapViewer.map.removeLayer(layer);
+      }
+    }
+  }
+
+  /**
+   * Sets the current basemap and updates the basemap layers on the map.
+   *
+   * @param basemap - The basemap to set as active
+   */
+  setBasemap(basemap: TypeBasemapProps): void {
+    // Set active basemap
+    this.activeBasemap = basemap;
+
+    // Set store attribution for the selected basemap or empty string if not provided
+    this.#mapController.setAttribution(basemap ? basemap.attribution : ['']);
+
+    // Update the basemap layers on the map
+    if (basemap?.layers) {
+      // Clear basemaps
+      this.clearBasemaps();
+
+      // Add basemap layers
+      basemap.layers.forEach((layer, index) => {
+        let basemapLayer;
+        if (layer.source instanceof VectorTile) {
+          basemapLayer = new VectorTileLayer({
+            opacity: layer.opacity,
+            source: layer.source,
+            renderMode: 'vector',
+            renderBuffer: 100,
+            updateWhileAnimating: true,
+            updateWhileInteracting: true,
+            // Only declutter labels and add className otherwise (https://github.com/openlayers/openlayers/issues/10096)
+            ...(layer.basemapId === 'label' ? { declutter: true, zIndex: this.basemapOptions.labelZIndex ?? 0 } : { className: 'geom' }),
+          });
+
+          // Apply Style to Vector Tile Basemap
+          const tileGrid = layer.source.getTileGrid();
+          if (tileGrid) {
+            applyStyle(basemapLayer, layer.styleUrl, {
+              resolutions: tileGrid.getResolutions(),
+            }).catch((error: unknown) => logger.logError(error));
+          }
+        } else {
+          basemapLayer = new TileLayer({
+            opacity: layer.opacity,
+            source: layer.source,
+          });
+        }
+
+        // Set this basemap's group id to basemap
+        basemapLayer.set('mapId', 'basemap');
+
+        // Add the basemap layer
+        this.#mapViewer.map.getLayers().insertAt(index, basemapLayer);
+
+        // Render the layer
+        basemapLayer.changed();
+      });
+
+      // Emit basemap changed event
+      this.#emitBasemapChanged({ basemap });
+    }
+  }
+
+  /**
+   * Refreshes the basemap layers
+   */
+  refreshBasemap(): void {
+    this.activeBasemap?.layers.forEach((layer) => {
+      layer.source.refresh();
+    });
+  }
+
+  /**
+   * Emits a basemap changed event to all handlers.
+   *
+   * @param event - The event to be emitted
+   */
+  #emitBasemapChanged(event: BasemapChangedEvent): void {
+    // Emit the basemap changed event for all handlers
+    EventHelper.emitEvent(this, this.#onBasemapChangedHandlers, event);
+  }
+
+  /**
+   * Registers a basemap changed event callback.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   */
+  onBasemapChanged(callback: BasemapChangedDelegate): void {
+    // Register the basemap changed event handler
+    EventHelper.onEvent(this.#onBasemapChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a basemap changed event callback.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offBasemapChanged(callback: BasemapChangedDelegate): void {
+    // Unregister the basemap changed event handler
+    EventHelper.offEvent(this.#onBasemapChangedHandlers, callback);
+  }
+
+  /**
+   * Emits a basemap error event to all handlers.
+   *
+   * @param event - The event to be emitted
+   */
+  #emitBasemapError(event: BasemapErrorEvent): void {
+    // Emit the basemap error event for all handlers
+    EventHelper.emitEvent(this, this.#onBasemapErrorHandlers, event);
+  }
+
+  /**
+   * Registers a basemap error event callback.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   */
+  onBasemapError(callback: BasemapErrorDelegate): void {
+    // Register the basemap error event handler
+    EventHelper.onEvent(this.#onBasemapErrorHandlers, callback);
+  }
+
+  /**
+   * Unregisters a basemap error event callback.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offBasemapError(callback: BasemapErrorDelegate): void {
+    // Unregister the basemap error event handler
+    EventHelper.offEvent(this.#onBasemapErrorHandlers, callback);
+  }
+
+  /**
+   * Emits an overview map control visibility changed event to all handlers.
+   *
+   * @param event - The event to be emitted
+   */
+  #emitOverviewMapControlVisibilityChanged(event: OverviewMapControlVisibilityChangedEvent): void {
+    // Emit the overview map control visibility changed event for all handlers
+    EventHelper.emitEvent(this, this.#onOverviewMapControlVisibilityChangedHandlers, event);
+  }
+
+  /**
+   * Registers a one-shot overview map control visibility changed event handler that resolves a promise.
+   *
+   * @param filter - Optional filter predicate to skip non-matching events without unsubscribing
+   * @returns A promise that resolves with the overview map control visibility changed event
+   */
+  onceOverviewMapControlVisibilityChanged(
+    filter?: (event: OverviewMapControlVisibilityChangedEvent) => boolean
+  ): Promise<OverviewMapControlVisibilityChangedEvent> {
+    return EventHelper.onceEventPromise(this.#onOverviewMapControlVisibilityChangedHandlers, filter);
+  }
+
+  /**
+   * Registers an overview map control visibility changed event callback.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   */
+  onOverviewMapControlVisibilityChanged(callback: OverviewMapControlVisibilityChangedDelegate): void {
+    // Register the overview map control visibility changed event handler
+    EventHelper.onEvent(this.#onOverviewMapControlVisibilityChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters an overview map control visibility changed event callback.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offOverviewMapControlVisibilityChanged(callback: OverviewMapControlVisibilityChangedDelegate): void {
+    // Unregister the overview map control visibility changed event handler
+    EventHelper.offEvent(this.#onOverviewMapControlVisibilityChangedHandlers, callback);
+  }
+}
+
+/**
+ * Define an event for the delegate.
+ */
+export interface BasemapChangedEvent {
+  basemap: TypeBasemapProps;
+}
+
+/**
+ * Define a delegate for the event handler function signature.
+ */
+type BasemapChangedDelegate = EventDelegateBase<BasemapApi, BasemapChangedEvent, void>;
+
+/**
+ * Define an event for the delegate.
+ */
+export interface BasemapErrorEvent {
+  error: GeoViewError;
+}
+
+/**
+ * Define a delegate for the event handler function signature.
+ */
+type BasemapErrorDelegate = EventDelegateBase<BasemapApi, BasemapErrorEvent, void>;
+
+/**
+ * Define an event for the delegate.
+ */
+export interface OverviewMapControlVisibilityChangedEvent {
+  visible: boolean;
+}
+
+/**
+ * Define a delegate for the event handler function signature.
+ */
+type OverviewMapControlVisibilityChangedDelegate = EventDelegateBase<BasemapApi, OverviewMapControlVisibilityChangedEvent, void>;

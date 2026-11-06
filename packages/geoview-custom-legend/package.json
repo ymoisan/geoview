@@ -1,0 +1,27 @@
+{
+  "name": "geoview-custom-legend",
+  "version": "0.1.0",
+  "description": "A custom legend panel for the geoview project",
+  "main": "src/index.tsx",
+  "keywords": [
+    "custom-legend"
+  ],
+  "scripts": {
+    "build": "tsc --build",
+    "build-dev": "tsc --build"
+  },
+  "author": "Ahmed-yacin Farah",
+  "license": "MIT",
+  "peerDependencies": {
+    "geoview-core": "workspace:^2.0.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "zustand": "~5.0.12"
+  },
+  "devDependencies": {
+    "geoview-core": "workspace:^2.0.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^6.0.3"
+  }
+}

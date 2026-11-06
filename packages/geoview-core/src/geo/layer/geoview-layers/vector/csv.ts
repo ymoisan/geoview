@@ -1,0 +1,350 @@
+﻿import { Feature } from 'ol';
+import { Point } from 'ol/geom';
+import type { ReadOptions } from 'ol/format/Feature';
+import type { Projection as OLProjection, ProjectionLike } from 'ol/proj';
+import type { Options as SourceOptions } from 'ol/source/Vector';
+
+import type { ConfigBaseClass, TypeLayerEntryShell } from '@/api/config/validation-classes/config-base-class';
+import { AbstractGeoViewLayer } from '@/geo/layer/geoview-layers/abstract-geoview-layers';
+import { AbstractGeoViewVector } from '@/geo/layer/geoview-layers/vector/abstract-geoview-vector';
+import type { TypeGeoviewLayerConfig } from '@/api/types/layer-schema-types';
+import { CONST_LAYER_TYPES } from '@/api/types/layer-schema-types';
+import { CsvLayerEntryConfig } from '@/api/config/validation-classes/vector-validation-classes/csv-layer-entry-config';
+import type { VectorLayerEntryConfig } from '@/api/config/validation-classes/vector-layer-entry-config';
+import { GVCSV } from '@/geo/layer/gv-layers/vector/gv-csv';
+import { Projection } from '@/geo/utils/projection';
+import { LayerNoGeographicDataInCSVError } from '@/core/exceptions/layer-exceptions';
+import { logger } from '@/core/utils/logger';
+import type { DisplayDateMode } from '@/api/types/map-schema-types';
+import type { SourceFeaturesInfo } from '@/geo/utils/utilities';
+
+export interface TypeCSVLayerConfig extends Omit<TypeGeoviewLayerConfig, 'listOfLayerEntryConfig'> {
+  geoviewLayerType: typeof CONST_LAYER_TYPES.CSV;
+  listOfLayerEntryConfig: CsvLayerEntryConfig[];
+}
+
+/**
+ * Class used to add a CSV layer to the map.
+ */
+export class CSV extends AbstractGeoViewVector {
+  /**
+   * Constructs a CSV Layer configuration processor.
+   *
+   * @param layerConfig - The layer configuration
+   */
+  // The constructor is not useless, it narrows down the accepted parameter type.
+  // eslint-disable-next-line @typescript-eslint/no-useless-constructor
+  constructor(layerConfig: TypeCSVLayerConfig) {
+    super(layerConfig);
+  }
+
+  // #region OVERRIDES
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer configuration specific to this layer
+   */
+  override getGeoviewLayerConfig(): TypeCSVLayerConfig {
+    return super.getGeoviewLayerConfig() as TypeCSVLayerConfig;
+  }
+
+  /**
+   * Overrides the way a geoview layer config initializes its layer entries.
+   *
+   * @returns A promise that resolves once the layer entries have been initialized
+   */
+  protected override onInitLayerEntries(): Promise<TypeGeoviewLayerConfig> {
+    // Get the folder url
+    const idx = this.getMetadataAccessPath().lastIndexOf('/');
+    const rootUrl = this.getMetadataAccessPath().substring(0, idx);
+    const id = this.getMetadataAccessPath().substring(idx + 1);
+
+    // Redirect
+    return Promise.resolve(CSV.createGeoviewLayerConfig(this.getGeoviewLayerId(), this.getGeoviewLayerName(), rootUrl, false, [{ id }]));
+  }
+
+  /**
+   * Overrides the way the layer metadata is processed.
+   *
+   * @param layerConfig - The layer entry configuration to process
+   * @param displayDateMode - The display date mode to use for processing time dimensions in the metadata
+   * @param mapProjection - Optional map projection
+   * @param abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process
+   * @returns A promise that resolves once the layer entry configuration has gotten its metadata processed
+   */
+  protected override onProcessLayerMetadata(
+    layerConfig: VectorLayerEntryConfig,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    displayDateMode: DisplayDateMode,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    mapProjection?: OLProjection,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    abortSignal?: AbortSignal
+  ): Promise<VectorLayerEntryConfig> {
+    // process the feature info configuration and attach the config to the instance for access by parent class
+    layerConfig.setLayerMetadata(layerConfig);
+
+    // Return the layer config
+    return Promise.resolve(layerConfig);
+  }
+
+  /**
+   * Overrides the loading of the vector features for the layer by fetching CSV data and converting it
+   * into OpenLayers {@link Feature} feature instances.
+   *
+   * @param layerConfig - The configuration object for the vector layer, containing source and data access information
+   * @param sourceOptions - The OpenLayers vector source options associated with the layer
+   * @param readOptions - Options controlling how features are read, including the target `featureProjection`
+   * @returns A promise that resolves to an array of OpenLayers features
+   */
+  protected override async onCreateVectorSourceLoadFeatures(
+    layerConfig: VectorLayerEntryConfig,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    sourceOptions: SourceOptions<Feature>,
+    readOptions: ReadOptions
+  ): Promise<SourceFeaturesInfo> {
+    // Cast it to proper type
+    const layerConfigCSV = layerConfig as CsvLayerEntryConfig;
+
+    // Query; surface a specific message if the CSV source can't be loaded (e.g. unreachable/404)
+    const responseData = await AbstractGeoViewVector.fetchSourceForLayer(layerConfig, () =>
+      AbstractGeoViewVector.fetchText(layerConfig.getDataAccessPath(false), layerConfig.getSource().postSettings)
+    );
+
+    // The projection of the data if defined
+    const dataProjection = layerConfigCSV.getSource().dataProjection ?? Projection.PROJECTION_NAMES.LONLAT; // default: 4326 to be able to project the csv data below;
+
+    // Attempt to convert CSV text to OpenLayers features
+    return { features: CSV.convertCsv(responseData, layerConfigCSV, dataProjection, readOptions.featureProjection), dataProjection };
+  }
+
+  /**
+   * Overrides the creation of the GV Layer.
+   *
+   * @param layerConfig - The layer entry configuration
+   * @returns The GV Layer
+   */
+  protected override onCreateGVLayer(layerConfig: CsvLayerEntryConfig): GVCSV {
+    // Create the source
+    const source = this.createVectorSource(layerConfig);
+    // Create the GV Layer
+    const gvLayer = new GVCSV(source, layerConfig);
+    // Return it
+    return gvLayer;
+  }
+
+  // #endregion OVERRIDES
+
+  // #region STATIC PUBLIC METHODS
+
+  /**
+   * Creates a configuration object for a CSV Feature layer.
+   *
+   * This function constructs a `TypeCSVLayerConfig` object that describes a CSV Feature layer
+   * and its associated entry configurations based on the provided parameters.
+   *
+   * @param geoviewLayerId - A unique identifier for the GeoView layer
+   * @param geoviewLayerName - The display name of the GeoView layer
+   * @param metadataAccessPath - The full service URL to the layer endpoint
+   * @param isTimeAware - Indicates whether the layer supports time-based filtering
+   * @param layerEntries - An array of layer entries objects to be included in the configuration
+   * @returns The constructed configuration object for the CSV Feature layer
+   */
+  static createGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string | undefined,
+    metadataAccessPath: string,
+    isTimeAware: boolean | undefined,
+    layerEntries: TypeLayerEntryShell[]
+  ): TypeCSVLayerConfig {
+    const geoviewLayerConfig: TypeCSVLayerConfig = {
+      geoviewLayerId,
+      geoviewLayerName,
+      metadataAccessPath,
+      geoviewLayerType: CONST_LAYER_TYPES.CSV,
+      isTimeAware,
+      listOfLayerEntryConfig: [],
+    };
+    geoviewLayerConfig.listOfLayerEntryConfig = layerEntries.map((layerEntry) => {
+      const layerEntryConfig = new CsvLayerEntryConfig({
+        geoviewLayerConfig,
+        layerId: `${layerEntry.id}`,
+        ...(layerEntry.layerName && { layerName: `${layerEntry.layerName}` }),
+      });
+      return layerEntryConfig;
+    });
+
+    // Return it
+    return geoviewLayerConfig;
+  }
+
+  /**
+   * Initializes a GeoView layer configuration for a CSV layer.
+   *
+   * This method creates a basic TypeGeoviewLayerConfig using the provided
+   * ID, name, and metadata access path URL. It then initializes the layer entries by calling
+   * `initGeoViewLayerEntries`, which may involve fetching metadata or sublayer info.
+   *
+   * @param geoviewLayerId - A unique identifier for the layer
+   * @param geoviewLayerName - The display name of the layer
+   * @param metadataAccessPath - The full service URL to the layer endpoint
+   * @param isTimeAware - Indicates whether the layer supports time-based filtering
+   * @returns A promise that resolves to an initialized GeoView layer configuration with layer entries
+   */
+  static initGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string,
+    metadataAccessPath: string,
+    isTimeAware?: boolean
+  ): Promise<TypeGeoviewLayerConfig> {
+    // Create the Layer config
+    const myLayer = new CSV({ geoviewLayerId, geoviewLayerName, metadataAccessPath, isTimeAware } as TypeCSVLayerConfig);
+    return myLayer.initGeoViewLayerEntries();
+  }
+
+  /**
+   * Processes a CSV GeoviewLayerConfig and returns a promise
+   * that resolves to an array of `ConfigBaseClass` layer entry configurations.
+   *
+   * This method:
+   * 1. Creates a Geoview layer configuration using the provided parameters.
+   * 2. Instantiates a layer with that configuration.
+   * 3. Processes the layer configuration and returns the result.
+   *
+   * @param geoviewLayerId - The unique identifier for the GeoView layer
+   * @param geoviewLayerName - The display name for the GeoView layer
+   * @param url - The URL of the service endpoint
+   * @param layerEntries - An array of layer entry shells to include in the configuration
+   * @param isTimeAware - Indicates if the layer is time aware
+   * @returns A promise that resolves to an array of layer configurations
+   */
+  static processGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string,
+    url: string,
+    layerEntries: TypeLayerEntryShell[],
+    isTimeAware: boolean
+  ): Promise<ConfigBaseClass[]> {
+    // Create the Layer config
+    const layerConfig = CSV.createGeoviewLayerConfig(geoviewLayerId, geoviewLayerName, url, isTimeAware, layerEntries);
+
+    // Create the class from geoview-layers package
+    const myLayer = new CSV(layerConfig);
+
+    // Process it
+    return AbstractGeoViewLayer.processConfig(myLayer);
+  }
+
+  /**
+   * Converts CSV text into an array of OpenLayers point features.
+   *
+   * Parses the CSV rows, identifies latitude/longitude columns by header name,
+   * reprojects coordinates if necessary, and builds a Feature with Point geometry
+   * for each valid row.
+   *
+   * @param csvData - The raw CSV text content
+   * @param layerConfig - The CSV layer entry configuration containing source settings (separator, etc.)
+   * @param inProjection - The projection of the coordinates in the CSV data
+   * @param outProjection - The target projection for the output features
+   * @returns The array of OpenLayers features created from the CSV rows
+   * @throws {LayerNoGeographicDataInCSVError} When latitude or longitude columns cannot be identified
+   */
+  static convertCsv(
+    csvData: string,
+    layerConfig: CsvLayerEntryConfig,
+    inProjection: ProjectionLike,
+    outProjection: ProjectionLike
+  ): Feature[] {
+    const inProjectionConv: OLProjection = Projection.getProjectionFromStringOrNumber(inProjection);
+    const outProjectionConv: OLProjection = Projection.getProjectionFromStringOrNumber(outProjection);
+
+    const features: Feature[] = [];
+    let latIndex: number | undefined;
+    let lonIndex: number | undefined;
+    const csvRows = this.#csvStringToArray(csvData, layerConfig.getSource().separator || ',');
+    const headers: string[] = csvRows[0];
+    for (let i = 0; i < headers.length; i++) {
+      if (this.EXCLUDED_HEADERS_LAT.includes(headers[i].toLowerCase())) latIndex = i;
+      if (this.EXCLUDED_HEADERS_LNG.includes(headers[i].toLowerCase())) lonIndex = i;
+    }
+
+    if (latIndex === undefined || lonIndex === undefined) {
+      // Failed
+      throw new LayerNoGeographicDataInCSVError(layerConfig.layerPath, layerConfig.getLayerNameCascade());
+    }
+
+    this.processFeatureInfoConfig(headers, csvRows[1], this.EXCLUDED_HEADERS, layerConfig);
+
+    for (let i = 1; i < csvRows.length; i++) {
+      const currentRow = csvRows[i];
+      const properties: { [key: string]: string | number } = {};
+      for (let j = 0; j < headers.length; j++) {
+        if (j !== latIndex && j !== lonIndex && currentRow[j]) {
+          properties[headers[j]] = currentRow[j] !== '' && Number(currentRow[j]) ? Number(currentRow[j]) : currentRow[j];
+        }
+      }
+
+      const lon = currentRow[lonIndex] ? Number(currentRow[lonIndex]) : Infinity;
+      const lat = currentRow[latIndex] ? Number(currentRow[latIndex]) : Infinity;
+      if (Number.isFinite(lon) && Number.isFinite(lat)) {
+        const coordinates =
+          inProjectionConv.getCode() !== outProjectionConv.getCode()
+            ? Projection.transform([lon, lat], inProjectionConv, outProjectionConv)
+            : [lon, lat];
+        const feature = new Feature({
+          geometry: new Point(coordinates),
+          ...properties,
+        });
+        features.push(feature);
+      }
+    }
+
+    return features;
+  }
+
+  // #endregion STATIC PUBLIC METHODS
+
+  // #region STATIC PRIVATE METHODS
+
+  /**
+   * Converts csv to array of rows of separated values.
+   *
+   * @param csvData - The raw csv text
+   * @param separator - The character used to separate the values
+   * @returns An array of the rows of the csv, split by separator
+   */
+  static #csvStringToArray(csvData: string, separator: string): string[][] {
+    const regex = new RegExp(`(\\${separator}|\\r?\\n|\\r|^)(?:"([^"]*(?:""[^"]*)*)"|([^\\${separator}\\r\\n]*))`, 'gi');
+    let matches;
+    const parsedData: string[][] = [[]];
+
+    // eslint-disable-next-line no-cond-assign
+    while ((matches = regex.exec(csvData))) {
+      if (matches[1].length && matches[1] !== separator) parsedData.push([]);
+      parsedData[parsedData.length - 1].push(matches[2] !== undefined ? matches[2].replace(/""/g, '"') : matches[3]);
+    }
+
+    // These characters are removed from the headers as they break the data table filtering (Issue #2693).
+    parsedData[0].forEach((header, i) => {
+      if (header.includes("'")) logger.logWarning("Header included illegal character (') replaced with (_)");
+      parsedData[0][i] = header.replaceAll("'", '_');
+      if (header.includes('/')) logger.logWarning('Header included illegal character (/) replaced with (|)');
+      parsedData[0][i] = parsedData[0][i].replaceAll('/', '|');
+      if (header.includes('+')) logger.logWarning('Header included illegal character (+) replaced with (plus)');
+      parsedData[0][i] = parsedData[0][i].replaceAll('+', 'plus');
+      if (header.includes('-')) logger.logWarning('Header included illegal character (-) replaced with (_)');
+      parsedData[0][i] = parsedData[0][i].replaceAll('-', '_');
+      if (header.includes('*')) logger.logWarning('Header included illegal character (*) replaced with (x)');
+      parsedData[0][i] = parsedData[0][i].replaceAll('*', 'x');
+      if (header.includes('(')) logger.logWarning('Header included illegal character (() replaced with ([)');
+      parsedData[0][i] = parsedData[0][i].replaceAll('(', '[');
+      if (header.includes(')')) logger.logWarning('Header included illegal character ()) replaced with (])');
+      parsedData[0][i] = parsedData[0][i].replaceAll(')', ']');
+    });
+
+    return parsedData;
+  }
+
+  // #endregion STATIC PRIVATE METHODS
+}

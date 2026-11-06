@@ -1,0 +1,2055 @@
+﻿import type { Feature, MapBrowserEvent } from 'ol';
+import { WKB, WKT, GeoJSON, EsriJSON, KML, WFS } from 'ol/format';
+import type { ReadOptions } from 'ol/format/Feature';
+import type Geometry from 'ol/geom/Geometry';
+import type { ProjectionLike } from 'ol/proj';
+import { Style, Stroke, Fill, Circle } from 'ol/style';
+import type { Color } from 'ol/color';
+import { getArea as getAreaOL, getLength as getLengthOL } from 'ol/sphere';
+import type { Extent } from 'ol/extent';
+import { containsCoordinate, buffer } from 'ol/extent';
+import type { OSM, VectorTile } from 'ol/source';
+import { XYZ } from 'ol/source';
+import TileLayer from 'ol/layer/Tile';
+import { LineString, Point, Polygon } from 'ol/geom';
+import type { Coordinate } from 'ol/coordinate';
+import GML3 from 'ol/format/GML3';
+
+import { CONST_LAYER_TYPES, MIME_TYPE_FORMAT_APP_XML, validVectorLayerLegendTypes } from '@/api/types/layer-schema-types';
+import {
+  CONFIG_PROXY_URL,
+  type TypeMapMouseInfo,
+  type TypeOutfields,
+  type TypeStyleGeometry,
+  type TypeValidMapProjectionCodes,
+} from '@/api/types/map-schema-types';
+import type {
+  TypeGeoviewLayerType,
+  TypeLegend,
+  TypeMetadataWFS,
+  TypeMetadataWFSCapabilities,
+  TypeMetadataWMS,
+  TypeMetadataWMSCapabilities,
+  TypeMetadataWMSCapabilityLayer,
+  TypeMetadataWMTS,
+  TypeMetadataWMTSCapabilities,
+  TypeOGCService,
+  TypeVectorLayerStyles,
+} from '@/api/types/layer-schema-types';
+import { NetworkError, NotSupportedError, ResponseEmptyError } from '@/core/exceptions/core-exceptions';
+import { findPropertyByRegexPath, parseXMLToJson } from '@/core/utils/utilities';
+import { encodeLayersParam, ensureServiceRequestUrl } from '@/core/utils/ogc-url-helper';
+import { Fetch } from '@/core/utils/fetch-helper';
+import type { TypeLegendItem, TypeLegendLayerItem } from '@/core/components/layers/types';
+import type { TypeBasemapLayer } from '@/geo/layer/basemap/basemap-types';
+import type { TypeFeatureStyle } from '@/geo/layer/geometry/geometry-types';
+import { Projection } from '@/geo/utils/projection';
+
+// available layer types
+export const layerTypes = CONST_LAYER_TYPES;
+
+interface EsriFeature {
+  attributes?: Record<string, unknown>;
+  geometry?: {
+    x?: number | string;
+    y?: number | string;
+    rings?: (number | string)[][][];
+    paths?: (number | string)[][][];
+    points?: (number | string)[][];
+  };
+}
+
+interface EsriFeatureCollection {
+  features?: EsriFeature[];
+}
+
+interface EsriJSONReadResult {
+  features: Feature<Geometry>[];
+  hadInvalidGeometries: boolean;
+  dataProjection?: ProjectionLike;
+}
+
+// #region FETCH METADATA
+
+export abstract class GeoUtilities {
+  /**
+   * Debug flag to force the use of a proxy for all requests.
+   */
+  static #DEBUG_FORCE_PROXY = false;
+
+  /** The base URL for EPSG.io, used for projection lookups. */
+  static readonly EPSG_URL = 'https://epsg.io';
+
+  /** The ISO reference url for the dimension interval tags */
+  static readonly ISO_8601_REF_DIMENSION_INTERVAL =
+    'https://docs.digi.com//resources/documentation/digidocs/90001488-13/default.htm#reference/r_iso_8601_duration_format.htm';
+
+  /**
+   * Checks if the provided proxy URL is an Esri proxy.
+   *
+   * @param proxyUrl - The proxy URL to check
+   * @returns `true` if the proxy URL includes "executeFromProxy", indicating an Esri proxy; otherwise, `false`.
+   */
+  static isEsriProxy(proxyUrl: string | undefined): boolean {
+    return proxyUrl?.includes('executeFromProxy') ?? false; // default: false
+  }
+
+  /**
+   * Extracts the base URL (origin + pathname) from a full URL string,
+   * removing any query parameters, hash fragments, or authentication data.
+   *
+   * @param url - The full URL string to process
+   * @returns The normalized base URL consisting of the origin and pathname
+   */
+  static getBaseUrl(url: string): string {
+    // Create the URL object
+    const urlValue = new URL(url);
+
+    // Rebuild final URL with normalized parameters
+    return `${urlValue.origin}${urlValue.pathname}`;
+  }
+
+  /**
+   * Ensures a service URL includes standardized OGC parameters (`SERVICE`, `REQUEST`, `VERSION`),
+   * overriding any existing ones with the correct casing and values.
+   *
+   * The function normalizes query parameter keys, removes lowercase variants (`service`, `request`),
+   * and ensures the final URL contains correctly capitalized parameters with the specified values.
+   * If the `VERSION` parameter is missing, a default value of 1.3.0 is added for WMS, 2.0.0 for WFS, and 1.0.0 for WMTS.
+   *
+   * @param url - The input service URL, which may be absolute or relative
+   * @param service - The OGC service type (e.g., `"WMS"`, `"WFS"`, `"WMTS"`)
+   * @param request - The OGC request type (e.g., `"GetMap"`, `"GetFeature"`, `"GetCapabilities"`)
+   * @param version - The default service version to enforce if not already present
+   * @returns The normalized and fully qualified service request URL
+   */
+  static ensureServiceRequestUrl(url: string, service: TypeOGCService, request: string, version?: string): string {
+    let serviceVersion = version;
+    if (!serviceVersion) {
+      if (service === 'WMS') {
+        serviceVersion = '1.3.0';
+      } else if (service === 'WFS') {
+        serviceVersion = '2.0.0';
+      } else if (service === 'WMTS') {
+        serviceVersion = '1.0.0';
+      }
+    }
+    return ensureServiceRequestUrl(url, service, request, serviceVersion);
+  }
+
+  /**
+   * Builds a complete GetCapabilities URL for a specific OGC service.
+   *
+   * @param url - The base service URL
+   * @param service - The service type (e.g., "WMS", "WFS")
+   * @param layers - Optional layer name(s) to include in the request
+   * @returns A fully qualified GetCapabilities request URL
+   */
+  static ensureServiceRequestUrlGetCapabilities(url: string, service: TypeOGCService, layers?: string): string {
+    // Redirect
+    const layersClause = layers ? `&Layers=${encodeURIComponent(layers)}` : '';
+    // Send version='' on purpose to let the server respond with its latest version
+    return `${this.ensureServiceRequestUrl(url, service, 'GetCapabilities')}${layersClause}`;
+  }
+
+  /**
+   * Builds a complete GetStyles URL for a WMS service.
+   *
+   * @param url - The base WMS service URL
+   * @param layers - Optional layer name(s) to include in the request
+   * @param version - Optional WMS version
+   * @returns A fully qualified GetStyles request URL
+   */
+  static ensureServiceRequestUrlGetStyles(url: string, layers?: string, version?: string): string {
+    // Redirect
+    const layersClause = layers ? `&Layers=${encodeURIComponent(layers)}` : '';
+    return `${this.ensureServiceRequestUrl(url, 'WMS', 'GetStyles', version)}${layersClause}`;
+  }
+
+  /**
+   * Builds a complete GetLegendGraphic URL for a WMS service.
+   *
+   * @param url - The base WMS service URL
+   * @param layerId - The layer name for which to retrieve the legend
+   * @param version - The WMS version
+   * @param format - Optional image format for the legend (e.g., "image/png")
+   * @returns A fully qualified GetLegendGraphic request URL
+   */
+  static ensureServiceRequestUrlGetLegendGraphic(url: string, layerId: string, version: string, format = 'image/png'): string {
+    // Redirect
+    return `${this.ensureServiceRequestUrl(url, 'WMS', 'GetLegendGraphic', version)}&LAYER=${encodeURIComponent(layerId)}&FORMAT=${encodeURIComponent(format)}`;
+  }
+
+  /**
+   * Builds a complete DescribeFeatureType URL for a WFS service.
+   *
+   * @param url - The base WFS service URL
+   * @param layerId - The layer or feature type name to describe
+   * @param version - The WFS version
+   * @param outputFormat - Optional output format (e.g., "application/json", "text/xml")
+   * @returns A fully qualified DescribeFeatureType request URL
+   */
+  static ensureServiceRequestUrlDescribeFeatureType(
+    url: string,
+    layerId: string,
+    version: string,
+    outputFormat: string | undefined
+  ): string {
+    // Redirect
+    const outputFormatClause = outputFormat ? `&outputFormat=${encodeURIComponent(outputFormat)}` : '';
+    return `${this.ensureServiceRequestUrl(url, 'WFS', 'DescribeFeatureType', version)}&typeName=${encodeURIComponent(layerId)}${outputFormatClause}`;
+  }
+
+  /**
+   * Builds a complete GetFeature URL for a WMS/WFS service.
+   *
+   * @param url - The base WFS service URL
+   * @param layerId - The layer or feature type name to request
+   * @param version - The WFS version
+   * @param outputFormat - Optional output format (e.g., "application/json")
+   * @returns A fully qualified GetFeature request URL
+   */
+  static ensureServiceRequestUrlGetFeature(
+    url: string,
+    layerId: string,
+    version: string,
+    outputFormat: string | undefined,
+    outfields: TypeOutfields[] | undefined,
+    xmlFilter: string | undefined,
+    outputProjectionCode: string | undefined
+  ): string {
+    // Redirect
+    const outputFormatClause = outputFormat ? `&outputFormat=${encodeURIComponent(outputFormat)}` : '';
+    const outfieldsClause = outfields ? `&propertyName=${encodeURIComponent(outfields.map((f) => f.name).join(','))}` : '';
+    const xmlFilterClause = xmlFilter ? `&filter=${encodeURIComponent(xmlFilter)}` : '';
+    const outputProjectionCodeClause = outputProjectionCode ? `&srsName=${encodeURIComponent(outputProjectionCode)}` : '';
+    return `${this.ensureServiceRequestUrl(url, 'WFS', 'GetFeature', version)}&typeName=${encodeURIComponent(layerId)}${outputFormatClause}${outfieldsClause}${xmlFilterClause}${outputProjectionCodeClause}`;
+  }
+
+  /**
+   * Removes specified query parameters from a URL, preserving all others.
+   *
+   * This method normalizes a URL by stripping out any query parameters whose
+   * keys match the ones provided in `removeParams`. It works even if the URL
+   * contains multiple `?` or `&` characters (e.g., proxy-wrapped URLs).
+   *
+   * @param url - The URL to normalize
+   * @param removeParams - Array of parameter names (case-insensitive)
+   *   to remove from the URL
+   * @returns The normalized URL with the specified parameters removed
+   */
+  static ensureURLForOpenLayersSource(url: string, removeParams: string[]): string {
+    const lowerRemove = removeParams.map((p) => p.toLowerCase());
+    const [base, ...queryParts] = url.split('?');
+    const cleanedParams: string[] = [];
+
+    // Flatten all &-separated query parts
+    const allParams: string[] = [];
+    queryParts.forEach((q) => {
+      allParams.push(...q.split('&'));
+    });
+
+    // Keep only params not in removeParams
+    allParams.forEach((param) => {
+      if (param) {
+        const key = param.split('=')[0].toLowerCase();
+        if (!lowerRemove.includes(key)) {
+          cleanedParams.push(param);
+        }
+      }
+    });
+
+    // Rebuild URL
+    return cleanedParams.length > 0 ? base + '?' + cleanedParams.join('&') : base;
+  }
+
+  /**
+   * Fetch the json response from the ESRI map server to get REST endpoint metadata.
+   *
+   * @param url - The url of the ESRI map server
+   * @returns A promise that resolves with the JSON metadata from the server
+   * @deprecated - Unused in our framework and templates, is it used by external devs? If not, remove it
+   */
+  static getESRIServiceMetadata(url: string): Promise<unknown> {
+    // fetch the map server returning a json object
+    return Fetch.fetchJson(`${url}?f=json`);
+  }
+
+  /**
+   * Fetch the json response from the XML response of a WMS getCapabilities request.
+   *
+   * @param url - The url of the WMS server
+   * @param configProxyUrl - Proxy URL to use when necessary (defaults to CONFIG_PROXY_URL)
+   * @param layers - Optional layers to query, separated by comma
+   * @param abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process
+   * @returns A promise that resolves with the parsed WMS metadata and proxy information
+   * @throws {RequestTimeoutError} When the request exceeds the timeout duration
+   * @throws {RequestAbortedError} When the request was aborted by the caller's signal
+   * @throws {ResponseError} When the response is not OK (non-2xx)
+   * @throws {ResponseEmptyError} When the JSON response is empty
+   * @throws {NetworkError} When a network issue happened
+   */
+  static async getWMSServiceMetadata(
+    url: string,
+    configProxyUrl: string = CONFIG_PROXY_URL,
+    layers?: string,
+    abortSignal?: AbortSignal
+  ): Promise<FetchWithProxyResult<TypeMetadataWMSCapabilities>> {
+    // Make sure the URL has necessary information
+    const capUrl = this.ensureServiceRequestUrlGetCapabilities(url, 'WMS', layers);
+
+    // Redirect
+    const { data, proxyUsed } = await this.fetchTextWithProxyFallback(capUrl, configProxyUrl, abortSignal);
+
+    // Parse it and return
+    const metadataParsed = parseXMLToJson<TypeMetadataWMS>(data);
+
+    // Because of the Esri proxy returning an embedded error on a ok response instead of failing, we have to check it here
+    this.validateEsriProxyError(metadataParsed);
+
+    // Result to be returned
+    let metadataResult = findPropertyByRegexPath<TypeMetadataWMSCapabilities>(metadataParsed, /WMS_Capabilities/);
+
+    // If nothing found, try with a less common WMT_MS_Capabilities response
+    // GV e.g. for service https://maps.geogratis.gc.ca/wms/elevation_en?VERSION=1.1.0
+    if (!metadataResult) {
+      metadataResult = findPropertyByRegexPath<TypeMetadataWMSCapabilities>(metadataParsed, /WMT_MS_Capabilities/);
+    }
+
+    // If it's an array, find the best object in the array
+    if (Array.isArray(metadataResult)) {
+      metadataResult = metadataResult.find((obj) => obj.Capability);
+    }
+
+    // Validate and extend metadata result
+    metadataResult = this.#validateExtendWMSWMTSWFSParsedResult(data, metadataResult);
+
+    // Normalize the Json to make it more uniform, simulating what ol/Format/WMSCapabilities was doing before being replaced
+    this.#helperParseCapabilityNormalizeArray(metadataResult.Capability.Request.GetMap, 'DCPType');
+    this.#helperParseCapabilityNormalizeArray(metadataResult.Capability.Request.GetFeatureInfo, 'Format');
+    this.#helperParseCapabilityLayer(metadataResult.Capability.Layer);
+
+    // Return it
+    return { data: metadataResult, proxyUsed };
+  }
+
+  /**
+   * Fetch the json response from the XML response of a WFS getCapabilities request.
+   *
+   * @param url - The url of the WFS server
+   * @param configProxyUrl - Proxy URL to use when necessary (defaults to CONFIG_PROXY_URL)
+   * @param abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process
+   * @returns A promise that resolves with the parsed WFS metadata and proxy information
+   * @throws {RequestTimeoutError} When the request exceeds the timeout duration
+   * @throws {RequestAbortedError} When the request was aborted by the caller's signal
+   * @throws {ResponseError} When the response is not OK (non-2xx)
+   * @throws {ResponseEmptyError} When the JSON response is empty
+   * @throws {NetworkError} When a network issue happened
+   */
+  static async getWFSServiceMetadata(
+    url: string,
+    configProxyUrl: string = CONFIG_PROXY_URL,
+    abortSignal?: AbortSignal
+  ): Promise<FetchWithProxyResult<TypeMetadataWFSCapabilities>> {
+    // Make sure the URL has necessary information
+    const capUrl = this.ensureServiceRequestUrlGetCapabilities(url, 'WFS');
+
+    // Redirect
+    const { data, proxyUsed } = await this.fetchTextWithProxyFallback(capUrl, configProxyUrl, abortSignal);
+
+    // Parse it and return
+    const metadataParsed = parseXMLToJson<TypeMetadataWFS>(data);
+
+    // Because of the Esri proxy returning an embedded error on a ok response instead of failing, we have to check it here
+    this.validateEsriProxyError(metadataParsed);
+
+    // Result to be returned
+    let metadataResult = findPropertyByRegexPath<TypeMetadataWFSCapabilities>(metadataParsed, /WFS_Capabilities/);
+
+    // If it's an array, find the best object in the array
+    if (Array.isArray(metadataResult)) {
+      metadataResult = metadataResult.find((obj) => obj.FeatureTypeList);
+    }
+
+    // Validate and extend metadata result
+    metadataResult = this.#validateExtendWMSWMTSWFSParsedResult(data, metadataResult);
+
+    // Return it
+    return { data: metadataResult, proxyUsed };
+  }
+
+  /**
+   * Fetch the json response from the XML response of a WMTS getCapabilities request.
+   *
+   * @param url - The url of the WMTS server
+   * @param configProxyUrl - Proxy URL to use when necessary (defaults to CONFIG_PROXY_URL)
+   * @param layers - Optional layers to query, separated by comma
+   * @param abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process
+   * @returns A promise that resolves with the parsed WMTS metadata and proxy information
+   * @throws {RequestTimeoutError} When the request exceeds the timeout duration
+   * @throws {RequestAbortedError} When the request was aborted by the caller's signal
+   * @throws {ResponseError} When the response is not OK (non-2xx)
+   * @throws {ResponseEmptyError} When the JSON response is empty
+   * @throws {NetworkError} When a network issue happened
+   */
+  static async getWMTSServiceMetadata(
+    url: string,
+    configProxyUrl: string = CONFIG_PROXY_URL,
+    layers?: string,
+    abortSignal?: AbortSignal
+  ): Promise<FetchWithProxyResult<TypeMetadataWMTSCapabilities>> {
+    // Make sure the URL has necessary information
+    const capUrl = this.ensureServiceRequestUrlGetCapabilities(url, 'WMTS', layers);
+
+    // Redirect
+    const { data, proxyUsed } = await this.fetchTextWithProxyFallback(capUrl, configProxyUrl, abortSignal);
+
+    // Parse it and return
+    const metadataParsed = parseXMLToJson<TypeMetadataWMTS>(data);
+
+    // Because of the Esri proxy returning an embedded error on a ok response instead of failing, we have to check it here
+    this.validateEsriProxyError(metadataParsed);
+
+    // Result to be returned
+    let metadataResult = findPropertyByRegexPath<TypeMetadataWMTSCapabilities>(metadataParsed, /Capabilities/);
+
+    // If it's an array, find the best object in the array
+    if (Array.isArray(metadataResult)) {
+      metadataResult = metadataResult.find((obj) => obj.Contents);
+    }
+
+    // Validate and extend metadata result
+    metadataResult = this.#validateExtendWMSWMTSWFSParsedResult(data, metadataResult);
+
+    // Return it
+    return { data: metadataResult, proxyUsed };
+  }
+
+  /**
+   * Fetches JSON metadata, retrying through a proxy on network errors.
+   *
+   * @param url - The base URL to fetch the metadata from (e.g., ArcGIS REST endpoint)
+   * @param configProxyUrl - Proxy URL to use when necessary (defaults to CONFIG_PROXY_URL)
+   * @param abortSignal - Optional {@link AbortSignal} used to cancel the request
+   * @returns A promise resolving to the fetched data and proxy information
+   * @throws {RequestTimeoutError} When the request exceeds the timeout duration
+   * @throws {RequestAbortedError} When the request was aborted by the caller's signal
+   * @throws {ResponseError} When the response is not OK (non-2xx)
+   * @throws {ResponseEmptyError} When the JSON response is empty
+   * @throws {NetworkError} When a network issue happened and no proxy is available
+   */
+  static async fetchJsonWithProxyFallback<T>(
+    url: string,
+    configProxyUrl: string = CONFIG_PROXY_URL,
+    abortSignal?: AbortSignal
+  ): Promise<FetchWithProxyResult<T>> {
+    try {
+      // Fetch the metadata
+      const responseData = await Fetch.fetchJson<T>(url, { signal: abortSignal });
+
+      // If pretending, after calling the service, that the request failed to force a proxy in debug
+      if (GeoUtilities.#DEBUG_FORCE_PROXY) throw new NetworkError('DEBUG_FORCE_PROXY is enabled, forcing a proxy request.', '500');
+
+      // Return the response data
+      return { data: responseData };
+    } catch (error: unknown) {
+      // If a network error such as CORS and we have a proxy to try
+      if (error instanceof NetworkError) {
+        // If the proxy to use is the Esri proxy
+        if (GeoUtilities.isEsriProxy(configProxyUrl)) {
+          // Encode the layers parameter if present
+          // eslint-disable-next-line no-param-reassign
+          url = encodeLayersParam(url);
+        }
+
+        // We're going to change the metadata url to use a proxy
+        const newProxiedMetadataUrl = `${configProxyUrl}?${url}`;
+
+        // Try again with the proxy this time
+        const responseJson = await Fetch.fetchJson<T>(newProxiedMetadataUrl);
+
+        // Return it with proxy info
+        return { data: responseJson, proxyUsed: configProxyUrl };
+      }
+
+      // Unknown error, throw it higher
+      throw error;
+    }
+  }
+
+  /**
+   * Fetches the raw text response from a service URL, retrying through a proxy on network errors.
+   *
+   * @param url - The service URL to fetch
+   * @param configProxyUrl - Proxy URL to use when necessary (defaults to CONFIG_PROXY_URL)
+   * @param abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process
+   * @returns A promise that resolves with the response text and proxy information
+   * @throws {RequestTimeoutError} When the request exceeds the timeout duration
+   * @throws {RequestAbortedError} When the request was aborted by the caller's signal
+   * @throws {ResponseError} When the response is not OK (non-2xx)
+   * @throws {ResponseEmptyError} When the JSON response is empty
+   * @throws {NetworkError} When a network issue happened
+   */
+  static async fetchTextWithProxyFallback(
+    url: string,
+    configProxyUrl: string = CONFIG_PROXY_URL,
+    abortSignal?: AbortSignal
+  ): Promise<FetchWithProxyResult<string>> {
+    try {
+      // Fetch the metadata
+      const responseData = await Fetch.fetchText(url, { signal: abortSignal });
+
+      // If pretending, after calling the service, that the request failed to force a proxy in debug
+      if (GeoUtilities.#DEBUG_FORCE_PROXY) throw new NetworkError('DEBUG_FORCE_PROXY is enabled, forcing a proxy request.', '500');
+
+      // Return the response data
+      return { data: responseData };
+    } catch (error: unknown) {
+      // If a network error such as CORS
+      if (error instanceof NetworkError) {
+        // If the proxy to use is the Esri proxy
+        if (GeoUtilities.isEsriProxy(configProxyUrl)) {
+          // Encode the layers parameter if present
+          // eslint-disable-next-line no-param-reassign
+          url = encodeLayersParam(url);
+        }
+
+        // We're going to change the metadata url to use a proxy
+        const newProxiedMetadataUrl = `${configProxyUrl}?${url}`;
+
+        // Try again with the proxy this time
+        const responseString = await Fetch.fetchText(newProxiedMetadataUrl);
+
+        // Return it with proxy info
+        return { data: responseString, proxyUsed: configProxyUrl };
+      }
+
+      // Unknown error, throw it higher
+      throw error;
+    }
+  }
+
+  /**
+   * Return the map server url from a layer service.
+   *
+   * @param url - The service url for a wms / dynamic or feature layers
+   * @param rest - Boolean value to add rest services if not present (default false)
+   * @returns The map server url
+   * @deprecated As it's not being used anymore (or only used by external developers?)
+   */
+  static getMapServerUrl(url: string, rest = false): string {
+    let mapServerUrl = url;
+    if (mapServerUrl.includes('MapServer')) {
+      mapServerUrl = mapServerUrl.slice(0, mapServerUrl.indexOf('MapServer') + 'MapServer'.length);
+    }
+    if (mapServerUrl.includes('FeatureServer')) {
+      mapServerUrl = mapServerUrl.slice(0, mapServerUrl.indexOf('FeatureServer') + 'FeatureServer'.length);
+    }
+
+    if (rest) {
+      const urlRightSide = mapServerUrl.slice(mapServerUrl.indexOf('/services/'));
+      mapServerUrl = `${mapServerUrl.slice(0, url.indexOf('services/'))}rest${urlRightSide}`;
+    }
+
+    return mapServerUrl;
+  }
+
+  /**
+   * Return the root server url from a OGC layer service.
+   *
+   * @param url - The service url for an ogc layer
+   * @returns The root ogc server url
+   * @deprecated As it's not being used anymore (or only used by external developers?)
+   */
+  static getOGCServerUrl(url: string): string {
+    let ogcServerUrl = url;
+    if (ogcServerUrl.includes('collections')) {
+      ogcServerUrl = ogcServerUrl.slice(0, ogcServerUrl.indexOf('collections'));
+    }
+    return ogcServerUrl;
+  }
+
+  /**
+   * Replaces or adds the BBOX parameter in a WMS GetMap URL.
+   *
+   * @param url - The original WMS GetMap URL
+   * @param newCRS - The new CRS
+   * @param newBBOX - The new BBOX to set, as an array of 4 numbers: [minX, minY, maxX, maxY]
+   * @returns A new URL string with the updated BBOX parameter
+   */
+  static replaceCRSandBBOXParam(url: string, newCRS: string, newBBOX: number[]): string {
+    // Format the new BBOX as a comma-separated string
+    const bboxString = newBBOX.join(',');
+
+    // Replace params using regex to avoid re-encoding proxy-wrapped URLs (new URL() encodes the proxied portion)
+    let result = url.replace(/([?&])BBOX=[^&]*/i, `$1BBOX=${bboxString}`);
+    result = result.replace(/([?&])CRS=[^&]*/i, `$1CRS=${newCRS}`);
+
+    return result;
+  }
+
+  // #endregion FETCH METADATA
+
+  // #region FETCH METADATA - PRIVATE METHODS
+
+  /**
+   * Validates the Esri proxy error in the parsed metadata.
+   *
+   * @param metadataParsed - The parsed metadata object
+   * @throws {NetworkError} When the Esri proxy returned an error
+   * @deprecated The Esri proxy should be eventually completely replaced via the default configuration. Once it's gone, this can be removed for cleanup.
+   */
+  static validateEsriProxyError<T extends TypeMetadataWMS | TypeMetadataWMTS | TypeMetadataWFS>(metadataParsed: T | undefined): void {
+    // TODO: CHECK - The serviceexceptionreport stuff here is related to the Esri proxy which respond with such a payload
+    // TO.DOCONT: Could probably be removed once we've completely migrated to the new proxy
+    if (metadataParsed?.ServiceExceptionReport) throw new NetworkError('The Esri proxy returned an error with the underlying url.', '500');
+  }
+
+  /**
+   * Validates the Esri proxy error in the parsed metadata.
+   *
+   * @param metadataParsed - The parsed metadata object
+   * @throws {NetworkError} When the Esri proxy returned an error
+   * @deprecated The Esri proxy should be eventually completely replaced via the default configuration. Once it's gone, this can be removed for cleanup.
+   */
+  static validateEsriProxyErrorXML(metadataXML: string): void {
+    // TODO: CHECK - The serviceexceptionreport stuff here is related to the Esri proxy which respond with such a payload
+    // TO.DOCONT: Could probably be removed once we've completely migrated to the new proxy
+    // Check if the response is a WMS ServiceException XML
+    const parser = new DOMParser();
+    const xmlTestDoc = parser.parseFromString(metadataXML, MIME_TYPE_FORMAT_APP_XML);
+    if (
+      xmlTestDoc.documentElement?.localName?.toLowerCase() === 'serviceexceptionreport' ||
+      xmlTestDoc.documentElement?.localName?.toLowerCase() === 'serviceexception'
+    ) {
+      throw new NetworkError('The Esri proxy returned an error with the underlying url.', '500');
+    }
+  }
+
+  /**
+   * Validates and interprets parsed OGC capabilities metadata, detecting the server type.
+   *
+   * Reads the version from `@attributes` and detects whether the server is QGIS, GeoServer, or MapServer.
+   *
+   * @param metadataRaw - The raw XML string of the capabilities response (used for server type detection)
+   * @param metadataResult - The extracted capabilities object (may be undefined if parsing found nothing)
+   * @returns The validated and enriched capabilities object with version and server type populated
+   * @throws {ResponseEmptyError} When the extracted result is empty
+   */
+  static #validateExtendWMSWMTSWFSParsedResult<
+    U extends TypeMetadataWMSCapabilities | TypeMetadataWFSCapabilities | TypeMetadataWMTSCapabilities,
+  >(metadataRaw: string, metadataResult: U | undefined): U {
+    // If nothing
+    if (!metadataResult) throw new ResponseEmptyError();
+
+    // Read the version
+    // eslint-disable-next-line no-param-reassign
+    metadataResult.version = metadataResult['@attributes']?.version;
+
+    // Try to guess the server type
+    // eslint-disable-next-line no-param-reassign
+    metadataResult.serverType = this.#isQgisServer(metadataRaw) ? 'qgis' : undefined;
+
+    // If server type not determined, check geoserver
+    if (!metadataResult.serverType) {
+      // eslint-disable-next-line no-param-reassign
+      metadataResult.serverType = this.#isGeoServer(metadataRaw) ? 'geoserver' : undefined;
+    }
+
+    // If server type not determined, check mapserver
+    if (!metadataResult.serverType) {
+      // eslint-disable-next-line no-param-reassign
+      metadataResult.serverType = this.#isMapServer(metadataRaw) ? 'mapserver' : undefined;
+    }
+
+    // Return it
+    return metadataResult;
+  }
+
+  /**
+   * Detects whether a WMS GetCapabilities document was produced by QGIS Server.
+   *
+   * QGIS Server responses can be identified by:
+   * - The presence of the QGIS-specific namespace (`xmlns:qgs="http://www.qgis.org/wms"`)
+   * - Or schema references to `qgis.org/wms` in the `xsi:schemaLocation`
+   *
+   * @param xml - The GetCapabilities XML string or parsed XML Document
+   * @returns True if the capabilities document appears to be from QGIS Server
+   */
+  static #isQgisServer(xml: string | Document): boolean {
+    let xmlDoc: Document;
+
+    if (typeof xml === 'string') {
+      const parser = new DOMParser();
+      xmlDoc = parser.parseFromString(xml, 'application/xml');
+    } else {
+      xmlDoc = xml;
+    }
+
+    // Check for QGIS namespace
+    const root = xmlDoc.documentElement;
+    const xmlnsQgs = root.getAttribute('xmlns:qgs');
+    if (xmlnsQgs?.includes('qgis.org/wms')) return true;
+
+    // Check for QGIS schema location
+    const schemaLocation = root.getAttribute('xsi:schemaLocation');
+    if (schemaLocation?.includes('qgis.org/wms')) return true;
+
+    // Check for any qgs-prefixed elements just in case
+    if (xmlDoc.getElementsByTagNameNS('http://www.qgis.org/wms', '*').length > 0) return true;
+
+    return false;
+  }
+
+  /**
+   * Detects whether a WMS GetCapabilities XML response was generated by GeoServer.
+   *
+   * Detection logic looks for:
+   * - GeoServer namespaces (e.g., "http://geoserver.org")
+   * - Schema locations referencing GeoServer (e.g., "/geoserver/")
+   * - GeoServer-specific Service metadata (keywords, OnlineResource, etc.)
+   *
+   * @param xml - The raw WMS GetCapabilities XML string
+   * @returns True if the response appears to be from GeoServer, false otherwise
+   */
+  static #isGeoServer(xml: string): boolean {
+    // Quick check for obvious GeoServer signatures
+    const lowerXml = xml.toLowerCase();
+
+    // 1. Check for GeoServer namespace or schema location
+    if (lowerXml.includes('http://geoserver.org') || lowerXml.includes('/geoserver/')) {
+      return true;
+    }
+
+    // 2. GeoServer sometimes adds its own xmlns:gs or xmlns:gml in a GeoServer-specific context
+    if (lowerXml.includes('xmlns:gs=') || lowerXml.includes('xmlns:geoserver=')) {
+      return true;
+    }
+
+    // 3. Check for a Service > Keyword referencing GeoServer
+    if (lowerXml.includes('<keyword>geoserver</keyword>')) {
+      return true;
+    }
+
+    // 4. Check for GeoServer-specific schema extensions
+    if (lowerXml.includes('geoserver/wms')) {
+      return true;
+    }
+
+    // 5. Sometimes the OnlineResource or metadata link includes "geoserver"
+    if (lowerXml.includes('<onlineresource xlink:href="') && lowerXml.includes('geoserver')) {
+      return true;
+    }
+
+    // No clear indicators of GeoServer found
+    return false;
+  }
+
+  /**
+   * Detects whether a WMS GetCapabilities XML response was generated by MapServer.
+   *
+   * Detection logic looks for:
+   * - MapServer-specific namespaces or schema URLs
+   * - Service metadata fields referencing MapServer
+   * - MapServer URLs in OnlineResource or schemaLocation
+   *
+   * @param xml - The raw WMS GetCapabilities XML string
+   * @returns True if the response appears to be from MapServer, false otherwise
+   */
+  static #isMapServer(xml: string): boolean {
+    const lowerXml = xml.toLowerCase();
+
+    // 1. Check for the MapServer namespace (common indicator)
+    if (lowerXml.includes('http://mapserver.gis.umn.edu/mapserver')) {
+      return true;
+    }
+
+    // 2. Check for URLs that include "mapserv" (typical CGI endpoint)
+    if (lowerXml.includes('mapserv?') || lowerXml.includes('/mapserver')) {
+      return true;
+    }
+
+    // 3. Check for schema locations referencing mapserver
+    if (lowerXml.includes('schemas.mapserver') || lowerXml.includes('mapserver.xsd')) {
+      return true;
+    }
+
+    // 4. Check for a service title or abstract mentioning MapServer
+    if (lowerXml.includes('<title>mapserver') || lowerXml.includes('<abstract>mapserver')) {
+      return true;
+    }
+
+    // 5. Check for contact organization mentioning MapServer
+    if (lowerXml.includes('<contactorganization>mapserver')) {
+      return true;
+    }
+
+    // 6. Sometimes appears as a generator keyword in comments or metadata
+    if (lowerXml.includes('<!-- mapserver') || lowerXml.includes('generated by mapserver')) {
+      return true;
+    }
+
+    // No clear indicators of MapServer found
+    return false;
+  }
+
+  /**
+   * Normalizes a property of an object so that its value is always an array.
+   *
+   * This helper is used when parsing WMS Capabilities documents, where
+   * some fields may be expressed as a single object or as an array of objects.
+   * Ensuring array form simplifies processing logic elsewhere.
+   *
+   * @param object - The object containing the property to normalize
+   * @param property - The property name whose value should be normalized
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  static #helperParseCapabilityNormalizeArray(object: any, property: string): void {
+    // Check BoundingBox property
+    if (object[property]) {
+      // If not an array, make it so
+      if (!Array.isArray(object[property])) {
+        // eslint-disable-next-line no-param-reassign
+        object[property] = [object[property]];
+      }
+    }
+  }
+
+  /**
+   * Recursively normalizes a WMS Capability Layer object so its structure is
+   * consistent and easier to work with.
+   *
+   * This function was created to **simulate
+   * the normalizations previously performed by OpenLayers' `WMSCapabilities`
+   * parser (`ol/format/WMSCapabilities`) before that logic was replaced**.
+   * The function:
+   * - Recursively normalizes nested `Layer` elements.
+   * - Ensures certain properties are always arrays (`Layer`, `BoundingBox`, `Style`, `CRS`, `Dimension`).
+   * - Normalizes `SRS` to `CRS` when only `SRS` is provided (as OpenLayers used to do).
+   * - Generates convenience `extent` arrays for `BoundingBox` and `EX_GeographicBoundingBox`,
+   *   again mimicking old OpenLayers parsing behavior.
+   *
+   * @param layer - A WMS capability layer object
+   */
+  static #helperParseCapabilityLayer(layer: TypeMetadataWMSCapabilityLayer): void {
+    // Check for recursion
+    if (layer.Layer) {
+      // Normalize the 'Layer' to be always be an array
+      this.#helperParseCapabilityNormalizeArray(layer, 'Layer');
+
+      // Loop
+      layer.Layer.forEach((lyr) => {
+        // Recursion
+        this.#helperParseCapabilityLayer(lyr);
+      });
+    }
+
+    // If the service uses SRS instead of CRS, normalize to CRS for practicality (simulating what ol/Format/WMSCapabilities was doing before)
+    if (!layer.CRS) {
+      // eslint-disable-next-line no-param-reassign, @typescript-eslint/no-explicit-any
+      layer.CRS = (layer as any).SRS;
+    }
+
+    // Normalize a couple properties to always be arrays (simulating what ol/Format/WMSCapabilities was doing before)
+    this.#helperParseCapabilityNormalizeArray(layer, 'BoundingBox');
+    this.#helperParseCapabilityNormalizeArray(layer, 'Style');
+    // For each style
+    layer.Style?.forEach((style) => {
+      this.#helperParseCapabilityNormalizeArray(style, 'LegendURL');
+    });
+    this.#helperParseCapabilityNormalizeArray(layer, 'CRS');
+    this.#helperParseCapabilityNormalizeArray(layer, 'Dimension');
+
+    // Write the extents for the bboxes for practicality (simulating what ol/Format/WMSCapabilities was doing before)
+    layer.BoundingBox?.forEach((bbox) => {
+      if (bbox['@attributes'].minx || bbox['@attributes'].maxx) {
+        // eslint-disable-next-line no-param-reassign
+        bbox['@attributes'].extent = [
+          Number(bbox['@attributes'].minx),
+          Number(bbox['@attributes'].miny),
+          Number(bbox['@attributes'].maxx),
+          Number(bbox['@attributes'].maxy),
+        ];
+      }
+    });
+
+    // Write the extents for the bboxes for practicality (simulating what ol/Format/WMSCapabilities was doing before)
+    if (layer.EX_GeographicBoundingBox) {
+      if (layer.EX_GeographicBoundingBox.eastBoundLongitude || layer.EX_GeographicBoundingBox.northBoundLatitude) {
+        // eslint-disable-next-line no-param-reassign
+        layer.EX_GeographicBoundingBox.extent = [
+          Number(layer.EX_GeographicBoundingBox.westBoundLongitude),
+          Number(layer.EX_GeographicBoundingBox.southBoundLatitude),
+          Number(layer.EX_GeographicBoundingBox.eastBoundLongitude),
+          Number(layer.EX_GeographicBoundingBox.northBoundLatitude),
+        ];
+      }
+    }
+
+    // Write the Dimension for practicality (simulating what ol/Format/WMSCapabilities was doing before)
+    layer.Dimension?.forEach((dimension) => {
+      // eslint-disable-next-line no-param-reassign
+      dimension.name ??= dimension['@attributes'].name;
+      // eslint-disable-next-line no-param-reassign
+      dimension.default ??= dimension['@attributes'].default;
+      // eslint-disable-next-line no-param-reassign
+      dimension.units ??= dimension['@attributes'].units;
+      // Only set multipleValues when the attribute is explicitly present in the XML (absent means unknown, not false)
+      if (dimension.multipleValues === undefined && dimension['@attributes'].multipleValues !== undefined) {
+        // eslint-disable-next-line no-param-reassign
+        dimension.multipleValues = dimension['@attributes'].multipleValues === '1';
+      }
+      // eslint-disable-next-line no-param-reassign
+      dimension.values ??= dimension['#text'];
+    });
+  }
+
+  // #endregion FETCH METADATA - PRIVATE METHODS
+
+  // #region LEGEND
+
+  /**
+   * Generates legend layer icon metadata from a layer legend definition.
+   *
+   * This method extracts icon imagery and legend item details from the provided
+   * `layerLegend`, handling both vector and non-vector legends.
+   * Behavior:
+   * - **Vector legends**:
+   *   - Iterates through each geometry type in the legend definition.
+   *   - Generates icon images from HTML canvas elements using `toDataURL()`.
+   *   - Supports both `simple` and categorized style configurations.
+   *   - Builds an `iconList` of {@link TypeLegendItem} entries per geometry type.
+   *   - Assigns:
+   *     - `iconImage` as the primary icon (first legend item)
+   *     - `iconImageStacked` as the secondary icon when multiple entries exist
+   * - **Non-vector legends**:
+   *   - Attempts to extract a canvas image directly from `layerLegend.legend`.
+   *   - Falls back to `'no data'` if no canvas is available.
+   * Notes:
+   * - Duplicate legend labels within categorized styles are filtered out.
+   * - Visibility defaults to `true` unless explicitly set to `false`.
+   * - Returns `undefined` if `layerLegend` is `null` or `undefined`.
+   *
+   * @param schemaTag - The layer schema type used to determine whether the legend should be interpreted as vector-based
+   * @param layerLegend - The legend configuration object associated with the layer
+   * @returns An array of legend layer item metadata containing icon images and legend entries,
+   * or `undefined` if no legend is provided.
+   */
+  static getLayerIconImage(schemaTag: TypeGeoviewLayerType, layerLegend: TypeLegend | undefined): TypeLegendLayerItem[] | undefined {
+    const iconDetails: TypeLegendLayerItem[] = [];
+
+    if (layerLegend) {
+      if (this.isVectorLegend(layerLegend, schemaTag)) {
+        Object.entries(layerLegend.legend).forEach(([key, styleRepresentation]) => {
+          const geometryType = key as TypeStyleGeometry;
+          const styleSettings = layerLegend.styleConfig![geometryType]!;
+          const iconDetailsEntry: TypeLegendLayerItem = {};
+          iconDetailsEntry.geometryType = geometryType;
+
+          if (styleSettings.type === 'simple') {
+            iconDetailsEntry.iconImage = (styleRepresentation.defaultCanvas as HTMLCanvasElement).toDataURL();
+            iconDetailsEntry.name = styleSettings.info[0].label;
+
+            const legendLayerListItem: TypeLegendItem = {
+              geometryType,
+              icon: iconDetailsEntry.iconImage,
+              name: iconDetailsEntry.name ?? '',
+              isVisible: true,
+            };
+            iconDetailsEntry.iconList = [legendLayerListItem];
+            iconDetails.push(iconDetailsEntry);
+          } else {
+            iconDetailsEntry.iconList = [];
+            styleRepresentation.arrayOfCanvas!.forEach((canvas, i) => {
+              // Check if there is already an entry for this label before adding it.
+              if (!iconDetailsEntry.iconList?.find((listItem) => listItem.name === styleSettings.info[i].label)) {
+                const legendLayerListItem: TypeLegendItem = {
+                  geometryType,
+                  icon: canvas ? canvas.toDataURL() : null,
+                  name: styleSettings.info[i].label ?? '',
+                  isVisible: styleSettings.info[i].visible !== false,
+                };
+                iconDetailsEntry.iconList?.push(legendLayerListItem);
+              }
+            });
+            if (styleRepresentation.defaultCanvas) {
+              const legendLayerListItem: TypeLegendItem = {
+                geometryType,
+                icon: styleRepresentation.defaultCanvas.toDataURL(),
+                name: styleSettings.info[styleSettings.info.length - 1].label ?? '',
+                isVisible: styleSettings.info[styleSettings.info.length - 1].visible !== false,
+              };
+              iconDetailsEntry.iconList.push(legendLayerListItem);
+            }
+            if (iconDetailsEntry.iconList?.length) iconDetailsEntry.iconImage = iconDetailsEntry.iconList[0].icon;
+            if (iconDetailsEntry.iconList && iconDetailsEntry.iconList.length > 1)
+              iconDetailsEntry.iconImageStacked = iconDetailsEntry.iconList[1].icon;
+            iconDetails.push(iconDetailsEntry);
+          }
+        });
+      } else {
+        const iconDetailsEntry: TypeLegendLayerItem = {};
+        // Use html canvas if available
+        const htmlElement = layerLegend.legend as HTMLCanvasElement | undefined;
+        if (htmlElement?.toDataURL) {
+          iconDetailsEntry.iconImage = htmlElement.toDataURL();
+        } else {
+          if (layerLegend.legend === 'AnnotationLayer') {
+            iconDetailsEntry.iconImage = 'annotation';
+          } else {
+            // No styles or image, no icon
+            iconDetailsEntry.iconImage = 'no data';
+          }
+        }
+        iconDetails.push(iconDetailsEntry);
+      }
+
+      return iconDetails;
+    }
+    return undefined;
+  }
+
+  /**
+   * Extracts and normalizes legend items from a collection of legend layer icons.
+   *
+   * This method:
+   * - Flattens all `iconList` entries from the provided legend layer items.
+   * - Handles special layer types (`imageStatic` and `GeoTIFF`) by dynamically
+   *   creating a legend item using the `iconImage` property.
+   * For `imageStatic` and `GeoTIFF` schema tags, if at least one icon is present,
+   * an additional legend item is created with:
+   * - `geometryType` set to `'Point'`
+   * - `name` set to `'image'`
+   * - `icon` set from `icons[0].iconImage`
+   * - `isVisible` set to `true`
+   *
+   * @param schemaTag - The layer schema type used to determine
+   * special handling logic (e.g., `'imageStatic'`, `'GeoTIFF'`).
+   * @param icons - The list of legend layer items containing
+   * optional `iconList` collections and optional `iconImage` values.
+   * @returns A flattened array of legend items derived from the
+   * provided icons, including any dynamically generated items for special layer types.
+   */
+  static getLayerItemsFromIcons(schemaTag: TypeGeoviewLayerType, icons: TypeLegendLayerItem[] | undefined): TypeLegendItem[] {
+    // The items to be returned
+    const items: TypeLegendItem[] = [];
+
+    // If no icons
+    if (!icons) return items;
+
+    // Add the icons as items on the layer entry
+    icons.forEach((legendLayerItem) => {
+      if (legendLayerItem.iconList)
+        legendLayerItem.iconList.forEach((legendLayerListItem) => {
+          items.push(legendLayerListItem);
+        });
+    });
+
+    // Also take care of image static by storing the iconImage into the icon property on-the-fly
+    if (schemaTag === 'imageStatic' && icons.length > 0) {
+      items.push({
+        geometryType: 'Point',
+        name: 'image',
+        icon: icons[0].iconImage || null,
+        isVisible: true,
+      });
+    }
+
+    // Also take care of GeoTIFF by storing the iconImage into the icon property on-the-fly
+    if (schemaTag === 'GeoTIFF' && icons.length > 0) {
+      items.push({
+        geometryType: 'Point',
+        name: 'image',
+        icon: icons[0].iconImage || null,
+        isVisible: true,
+      });
+    }
+
+    // If it's an annotation, we want it as items for now
+    if (icons[0].iconImage === 'annotation') {
+      items.push({
+        geometryType: 'Point',
+        name: 'layer',
+        icon: icons[0].iconImage || null,
+        isVisible: true,
+      });
+    }
+
+    // Return
+    return items;
+  }
+
+  /**
+   * Type guard function that redefines a TypeLegend as a TypeVectorLegend
+   * if the type attribute of the verifyIfLegend parameter is valid.
+   *
+   * The type ascention applies only to the true block of the if clause.
+   *
+   * @param verifyIfLegend - Object to test in order to determine if the type ascention is valid
+   * @returns True if the payload is valid
+   */
+  static isVectorLegend(verifyIfLegend: TypeLegend, schemaTag: TypeGeoviewLayerType): verifyIfLegend is TypeVectorLegend {
+    return validVectorLayerLegendTypes.includes(schemaTag) && verifyIfLegend.styleConfig !== undefined;
+  }
+
+  // #endregion LEGEND
+
+  // #region GEOMETRY PUBLIC
+
+  /**
+   * Returns the WKT representation of a given geometry.
+   *
+   * @param geometry - The geometry
+   * @returns The WKT representation of the geometry, or undefined if no geometry is provided
+   */
+  static geometryToWKT(geometry: Geometry): string | undefined {
+    if (geometry) {
+      // Get the wkt for the geometry
+      const format = new WKT();
+      return format.writeGeometry(geometry);
+    }
+    return undefined;
+  }
+
+  /**
+   * Returns the Geometry representation of a given wkt.
+   *
+   * @param wkt - The well known text
+   * @param readOptions - Read options to convert the wkt to a geometry
+   * @returns The Geometry representation of the wkt, or undefined if no wkt is provided
+   */
+  static wktToGeometry(wkt: string, readOptions: ReadOptions): Geometry | undefined {
+    if (wkt) {
+      // Get the feature for the wkt
+      const format = new WKT();
+      return format.readGeometry(wkt, readOptions);
+    }
+    return undefined;
+  }
+
+  /**
+   * Returns the Geometry representation of a given geojson.
+   *
+   * @param geojson - The geojson
+   * @param readOptions - Read options to convert the geojson to a geometry
+   * @returns The Geometry representation of the geojson, or undefined if no geojson is provided
+   */
+  static geojsonToGeometry(geojson: string, readOptions: ReadOptions): Geometry | undefined {
+    if (geojson) {
+      // Get the feature for the geojson
+      const format = new GeoJSON();
+      return format.readGeometry(geojson, readOptions);
+    }
+    return undefined;
+  }
+
+  /**
+   * Checks whether a given value is a valid GeoJSON FeatureCollection object.
+   *
+   * @param value - The value to test (can be any type)
+   * @returns True if the value appears to be a GeoJSON FeatureCollection, otherwise false
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  static isGeoJSONObject(value: any): boolean {
+    return typeof value === 'object' && value !== null && value['type'] === 'FeatureCollection' && Array.isArray(value['features']);
+  }
+
+  /**
+   * Extracts the EPSG code from a GeoJSON object's CRS definition.
+   *
+   * Accepts either a GeoJSON object or a JSON string. If the GeoJSON contains
+   * a `crs` entry with a `properties.name` field in the form
+   * `"urn:ogc:def:crs:EPSG::<code>"`, it is normalized to `"EPSG:<code>"`.
+   *
+   * @param geojson - A GeoJSON object or a JSON string representing one
+   * @returns The normalized EPSG code (e.g., `"EPSG:3005"`), or undefined if the CRS is not defined
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  static readEPSGOfGeoJSON(geojson: any): string | undefined {
+    // Convert string to geoJSON if necessary
+    const geojsonObject = typeof geojson === 'string' ? JSON.parse(geojson) : geojson;
+
+    // Create features from geoJSON
+    const name = geojsonObject.crs?.properties?.name;
+
+    // If found a name
+    if (name) {
+      return this.#parseEPSGFromName(name);
+    }
+
+    // Return the EPSG
+    return name;
+  }
+
+  /**
+   * Extracts the EPSG code from a GML object's CRS definition.
+   *
+   * Accepts either a GML object or an XML string. If the GML contains
+   * an element with a `srsName` attribute in the form
+   * `"urn:ogc:def:crs:EPSG::<code>"`, it is normalized to `"EPSG:<code>"`.
+   *
+   * @param gml - A GML object or an XML string representing one
+   * @returns The normalized EPSG code (e.g., `"EPSG:3005"`), or undefined if the CRS is not defined
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  static readEPSGOfGML(gml: any): string | undefined {
+    const xml = typeof gml === 'string' ? new DOMParser().parseFromString(gml, 'text/xml') : gml;
+
+    // Search for any element with srsName
+    const nodes = xml.querySelectorAll?.('[srsName]') ?? [];
+    for (const node of nodes) {
+      const srsName = node.getAttribute('srsName');
+
+      // If found a name
+      if (srsName) {
+        return this.#parseEPSGFromName(srsName);
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Reads OpenLayers features from an Esri features object.
+   *
+   * If `inProjection` is provided, it is registered via `addProjectionIfMissing` and used as the data projection.
+   * Otherwise, the projection is detected from the `spatialReference` embedded in the Esri JSON response.
+   * When parsing fails due to invalid geometries, the method attempts to clean them and retries.
+   *
+   * @param features - The Esri JSON features data to read
+   * @param inProjection - Optional input data projection (falls back to spatialReference embedded in the Esri JSON)
+   * @param outProjection - Optional output feature projection
+   * @returns A promise that resolves with the parsed features, the interpreted source data projection, and whether there were any invalid geometries
+   * @throws {Error} When the EsriJSON data is invalid and cannot be parsed, even after attempting to clean invalid geometries
+   */
+  static async readFeaturesFromEsriJSON(
+    features: unknown,
+    inProjection?: ProjectionLike,
+    outProjection?: ProjectionLike
+  ): Promise<EsriJSONReadResult> {
+    const format = new EsriJSON();
+
+    // Resolve the data projection: register inProjection first so getProjectionFromString can find it,
+    // or fall back to format-detected projection when no inProjection is available
+    let dataProjection: ProjectionLike;
+    if (inProjection) {
+      dataProjection = await Projection.addProjectionIfMissing(inProjection);
+    } else {
+      // Format can only resolve projections OL already knows about (e.g., EPSG:4326)
+      dataProjection = format.readProjection(features);
+    }
+
+    // GV Anything other than numbers in the geometry will throw errors in EsriJSON().readFeatures()
+    try {
+      // First try to process features right away and only clean the geometries if it fails.
+      // If the data was cleaned, a flag is raised so that a message can be emitted to the user.
+      return {
+        features: format.readFeatures(features, { dataProjection, featureProjection: outProjection }),
+        dataProjection,
+        hadInvalidGeometries: false,
+      };
+    } catch (error: unknown) {
+      if (features && typeof features === 'object' && 'features' in features) {
+        try {
+          const cleanedFeatures = this.#cleanEsriGeometries(features);
+
+          return {
+            features: format.readFeatures(cleanedFeatures, { dataProjection, featureProjection: outProjection }),
+            dataProjection,
+            hadInvalidGeometries: true,
+          };
+        } catch (secondError) {
+          throw new Error(`Invalid geometries found in EsriJSON data that could not be cleaned: ${secondError}`);
+        }
+      }
+
+      throw new Error(`Failed to parse EsriJSON data: ${error}`);
+    }
+  }
+
+  /**
+   * Reads OpenLayers features from a GeoJSON object.
+   *
+   * The projection is resolved in priority order: CRS embedded in the GeoJSON > `inProjection` > format default.
+   * When resolved, the projection is registered via `addProjectionIfMissing` before reading features.
+   *
+   * @param geojson - The GeoJSON data to read
+   * @param inProjection - Optional input data projection (overridden by CRS embedded in the GeoJSON)
+   * @param outProjection - Optional output feature projection
+   * @returns A promise that resolves with the parsed features and the interpreted source data projection
+   */
+  static async readFeaturesFromGeoJSON(
+    geojson: unknown,
+    inProjection?: ProjectionLike,
+    outProjection?: ProjectionLike
+  ): Promise<SourceFeaturesInfo> {
+    const format = new GeoJSON();
+
+    // Read the EPSG from the GeoJson content — overrides caller-provided projection if present
+    const interpretedProjection = GeoUtilities.readEPSGOfGeoJSON(geojson);
+
+    // If the projection was interpreted from the data, use that
+    // eslint-disable-next-line no-param-reassign
+    if (interpretedProjection) inProjection = interpretedProjection;
+
+    // Resolve the data projection: register inProjection first so getProjectionFromString can find it,
+    // or fall back to format-detected projection when no inProjection is available
+    let dataProjection: ProjectionLike;
+    if (inProjection) {
+      dataProjection = await Projection.addProjectionIfMissing(inProjection);
+    } else {
+      // Format can only resolve projections OL already knows about (e.g., EPSG:4326)
+      dataProjection = format.readProjection(geojson);
+    }
+
+    // Read the features
+    const features = format.readFeatures(geojson, { dataProjection, featureProjection: outProjection });
+
+    // Return the features and the interpreted source projection
+    return { features, dataProjection };
+  }
+
+  /**
+   * Reads OpenLayers features from a WFS features object.
+   *
+   * The projection is resolved in priority order: srsName embedded in the GML > `inProjection` > format default.
+   * When resolved, the projection is registered via `addProjectionIfMissing` before reading features.
+   *
+   * @param wfs - The WFS data to read (XML string or document)
+   * @param version - The WFS version
+   * @param inProjection - Optional input data projection (overridden by srsName embedded in the GML)
+   * @param outProjection - Optional output feature projection
+   * @returns A promise that resolves with the parsed features and the interpreted source data projection
+   */
+  static async readFeaturesFromWFS(
+    wfs: unknown,
+    version: string,
+    inProjection?: ProjectionLike,
+    outProjection?: ProjectionLike
+  ): Promise<SourceFeaturesInfo> {
+    const format = new WFS({ version });
+
+    // Read the EPSG from the GML content
+    const interpretedProjection = GeoUtilities.readEPSGOfGML(wfs);
+
+    // If the projection was interpreted from the data, use that
+    // eslint-disable-next-line no-param-reassign
+    if (interpretedProjection) inProjection = interpretedProjection;
+
+    // Resolve the data projection: register inProjection first so getProjectionFromString can find it,
+    // or fall back to format-detected projection when no inProjection is available
+    let dataProjection: ProjectionLike;
+    if (inProjection) {
+      dataProjection = await Projection.addProjectionIfMissing(inProjection);
+    } else {
+      // Format can only resolve projections OL already knows about (e.g., EPSG:4326)
+      dataProjection = format.readProjection(wfs);
+    }
+
+    // Read the features
+    const features = format.readFeatures(wfs, { dataProjection, featureProjection: outProjection });
+
+    // Return the features and the interpreted source projection
+    return { features, dataProjection };
+  }
+
+  /**
+   * Reads OpenLayers features from a WKB object.
+   *
+   * WKB does not embed projection metadata, so `inProjection` defaults to EPSG:4326 when not provided.
+   * The resolved projection is registered via `addProjectionIfMissing` before reading features.
+   *
+   * @param wkbObject - The WKB data to read (string, ArrayBuffer, or ArrayBufferView)
+   * @param inProjection - Optional input data projection (defaults to EPSG:4326 if not provided)
+   * @param outProjection - Optional output feature projection
+   * @returns A promise that resolves with the parsed features and the interpreted source data projection
+   */
+  static async readFeaturesFromWKB(
+    wkbObject: string | ArrayBuffer | ArrayBufferView<ArrayBufferLike>,
+    inProjection?: ProjectionLike,
+    outProjection?: ProjectionLike
+  ): Promise<SourceFeaturesInfo> {
+    const format = new WKB();
+
+    // If no projection was found, default to EPSG:4326 (lon/lat) to help OpenLayers read the features, it struggles for WKB here otherwise
+    // eslint-disable-next-line no-param-reassign
+    inProjection ??= Projection.PROJECTION_NAMES.LONLAT;
+
+    // Resolve the data projection: register inProjection first so getProjectionFromString can find it
+    // WKB always has inProjection set (defaulted above), so the else branch is effectively unreachable
+    let dataProjection: ProjectionLike;
+    if (inProjection) {
+      dataProjection = await Projection.addProjectionIfMissing(inProjection);
+    } else {
+      dataProjection = format.readProjection(wkbObject);
+    }
+
+    // Read the features
+    const features = format.readFeatures(wkbObject, { dataProjection, featureProjection: outProjection });
+
+    // Return the features and the interpreted source projection
+    return { features, dataProjection };
+  }
+
+  /**
+   * Reads OpenLayers features from a KML object.
+   *
+   * The projection is resolved in priority order: srsName embedded in the KML > `inProjection` > format default.
+   * When resolved, the projection is registered via `addProjectionIfMissing` before reading features.
+   *
+   * @param kmlObject - The KML data to read
+   * @param inProjection - Optional input data projection (overridden by srsName embedded in the KML)
+   * @param outProjection - Optional output feature projection
+   * @returns A promise that resolves with the parsed features and the interpreted source data projection
+   */
+  static async readFeaturesFromKML(
+    kmlObject: unknown,
+    inProjection?: ProjectionLike,
+    outProjection?: ProjectionLike
+  ): Promise<SourceFeaturesInfo> {
+    const format = new KML();
+
+    // Read the EPSG from the GML content
+    const interpretedProjection = GeoUtilities.readEPSGOfGML(kmlObject);
+
+    // If the projection was interpreted from the data, use that
+    // eslint-disable-next-line no-param-reassign
+    if (interpretedProjection) inProjection = interpretedProjection;
+
+    // Resolve the data projection: register inProjection first so getProjectionFromString can find it,
+    // or fall back to format-detected projection when no inProjection is available
+    let dataProjection: ProjectionLike;
+    if (inProjection) {
+      dataProjection = await Projection.addProjectionIfMissing(inProjection);
+    } else {
+      // Format can only resolve projections OL already knows about (e.g., EPSG:4326)
+      dataProjection = format.readProjection(kmlObject);
+    }
+
+    // Read the features
+    const features = format.readFeatures(kmlObject, { dataProjection, featureProjection: outProjection });
+
+    // Return the features and the interpreted source projection
+    return { features, dataProjection };
+  }
+
+  /**
+   * Default drawing style for GeoView.
+   *
+   * @param strokeColor - Optional stroke color
+   * @param strokeWidth - Optional stroke width
+   * @param fillColor - Optional fill color
+   * @returns An Open Layers styling for drawing on a map
+   */
+  static getDefaultDrawingStyle(strokeColor?: Color | string, strokeWidth?: number, fillColor?: Color | string): Style {
+    return new Style({
+      stroke: new Stroke({
+        color: strokeColor || 'orange',
+        width: strokeWidth || 2,
+      }),
+      fill: new Fill({
+        color: fillColor || 'transparent',
+      }),
+      image: new Circle({
+        radius: 4,
+        fill: new Fill({
+          color: fillColor || 'orange',
+        }),
+        stroke: new Stroke({
+          color: strokeColor || 'orange',
+          width: strokeWidth || 2,
+        }),
+      }),
+    });
+  }
+
+  // #endregion GEOMETRY PUBLIC
+
+  // #region GEOMETRY PRIVATE
+
+  /**
+   * Extracts an EPSG code from a SRS/CRS standard string.
+   *
+   * Supports common formats used in GeoJSON/WFS/GML.
+   */
+  static #parseEPSGFromName(name: string): string | undefined {
+    // Standard forms
+    // "EPSG:4326" -> EPSG:4326
+    // "urn:ogc:def:crs:EPSG::4326" -> EPSG:4326
+    // "http://www.opengis.net/gml/srs/epsg.xml#4326" -> EPSG:4326
+    // "urn:x-ogc:def:crs:EPSG:6.6:4326" -> EPSG:4326
+
+    // Direct "EPSG:xxxx"
+    if (name.startsWith('EPSG:')) return name;
+
+    // URN formats
+    const match = name.match(/EPSG[:/]+(\d+)/i);
+    if (match) return `EPSG:${match[1]}`;
+
+    return undefined;
+  }
+
+  /**
+   * Cleans invalid geometries in Esri feature collection by setting invalid coordinates to NaN or empty arrays.
+   *
+   * @param features - The Features data to clean
+   * @returns A cleaned copy of the features collection
+   */
+  static #cleanEsriGeometries(features: unknown): EsriFeatureCollection {
+    const cleanedFeatures = JSON.parse(JSON.stringify(features)) as EsriFeatureCollection;
+
+    cleanedFeatures.features?.forEach((feature) => {
+      if (!feature.geometry) return;
+
+      // Handle point geometries - set to NaN if not a number
+      if ('x' in feature.geometry || 'y' in feature.geometry) {
+        if (typeof feature.geometry.x !== 'number') {
+          // eslint-disable-next-line no-param-reassign
+          feature.geometry.x = Number.NaN;
+        }
+        if (typeof feature.geometry.y !== 'number') {
+          // eslint-disable-next-line no-param-reassign
+          feature.geometry.y = Number.NaN;
+        }
+      }
+
+      // Handle rings (polygons) - set to empty array if first coordinate is not a number
+      if (
+        feature.geometry.rings &&
+        feature.geometry.rings.length > 0 &&
+        feature.geometry.rings[0].length > 0 &&
+        typeof feature.geometry.rings[0][0][0] !== 'number'
+      ) {
+        // eslint-disable-next-line no-param-reassign
+        feature.geometry.rings = [];
+      }
+
+      // Handle paths (polylines) - set to empty array if first coordinate is not a number
+      if (
+        feature.geometry.paths &&
+        feature.geometry.paths.length > 0 &&
+        feature.geometry.paths[0].length > 0 &&
+        typeof feature.geometry.paths[0][0][0] !== 'number'
+      ) {
+        // eslint-disable-next-line no-param-reassign
+        feature.geometry.paths = [];
+      }
+
+      // Handle points (multipoint) - set to empty array if first coordinate is not a number
+      if (feature.geometry.points && feature.geometry.points.length > 0 && typeof feature.geometry.points[0][0] !== 'number') {
+        // eslint-disable-next-line no-param-reassign
+        feature.geometry.points = [];
+      }
+    });
+
+    return cleanedFeatures;
+  }
+
+  // #endregion GEOMETRY PRIVATE
+
+  // #region VARIA
+
+  /**
+   * Create empty basemap tilelayer to use as initial basemap while we load basemap
+   * so the viewer will not fails if basemap is not avialable.
+   *
+   * @returns The created empty basemap
+   */
+  static createEmptyBasemap(): TileLayer<XYZ | OSM | VectorTile> {
+    // create empty tilelayer to use as initial basemap while we load basemap
+    const emptyBasemap: TypeBasemapLayer = {
+      basemapId: 'empty',
+      source: new XYZ(),
+      type: 'empty',
+      opacity: 0,
+      resolutions: [],
+      origin: [],
+      minScale: 0,
+      maxScale: 17,
+      extent: [0, 0, 0, 0],
+    };
+    const emptyLayer = new TileLayer(emptyBasemap);
+    emptyLayer.set('mapId', 'basemap');
+
+    return emptyLayer;
+  }
+
+  /**
+   * Format the coordinates for degrees - minutes - seconds (lat, long).
+   *
+   * @param value - The value to format
+   * @returns The formatted value
+   */
+  static coordFormatDMS(value: number): string {
+    // degree char
+    const deg = String.fromCharCode(176);
+
+    const d = Math.floor(Math.abs(value)) * (value < 0 ? -1 : 1);
+    const m = Math.floor(Math.abs((value - d) * 60));
+    const s = Math.round((Math.abs(value) - Math.abs(d) - m / 60) * 3600);
+    return `${Math.abs(d)}${deg} ${m >= 10 ? `${m}` : `0${m}`}' ${s >= 10 ? `${s}` : `0${s}`}"`;
+  }
+
+  /**
+   * Converts a TypeFeatureStyle to an Open Layers Style object.
+   *
+   * @param style - Optional feature style to convert
+   * @returns An Open Layers styling for drawing on a map
+   */
+  static convertTypeFeatureStyleToOpenLayersStyle(style?: TypeFeatureStyle): Style {
+    // Redirect
+    return this.getDefaultDrawingStyle(style?.strokeColor, style?.strokeWidth, style?.fillColor);
+  }
+
+  // #endregion VARIA
+
+  // #region EXTENT
+
+  /**
+   * Check if a point is contained in an extent.
+   *
+   * @param point - The point
+   * @param extent - The extent
+   * @returns True if point is within the extent, false otherwise
+   */
+  static isPointInExtent(point: Coordinate, extent: Extent): boolean {
+    return containsCoordinate(extent, point);
+  }
+
+  /**
+   * Returns the union of 2 extents.
+   *
+   * @param extentA - First extent
+   * @param extentB - Optional second extent
+   * @returns The union of the extents, or the valid extent when the other one is undefined or contains NaN values
+   */
+  static getExtentUnion(extentA: Extent | undefined, extentB?: Extent | undefined): Extent | undefined {
+    // Treat extents containing NaN as invalid and ignore them for union purposes.
+    const validExtentA = extentA && !extentA.some((coord) => Number.isNaN(coord)) ? extentA : undefined;
+    const validExtentB = extentB && !extentB.some((coord) => Number.isNaN(coord)) ? extentB : undefined;
+
+    // If no valid A, return valid B which may be undefined too.
+    if (!validExtentA) return validExtentB;
+
+    // If no valid B, return valid A.
+    if (!validExtentB) return validExtentA;
+
+    // Return the union of A and B
+    return [
+      Math.min(validExtentA[0], validExtentB[0]),
+      Math.min(validExtentA[1], validExtentB[1]),
+      Math.max(validExtentA[2], validExtentB[2]),
+      Math.max(validExtentA[3], validExtentB[3]),
+    ];
+  }
+
+  /**
+   * Returns the intersection of 2 extents.
+   *
+   * @param extentA - First extent
+   * @param extentB - Optional second extent
+   * @returns The intersection of the extents, or the valid extent when the other one is undefined or contains NaN values
+   */
+  static getExtentIntersection(extentA: Extent | undefined, extentB?: Extent | undefined): Extent | undefined {
+    // Treat extents containing NaN as invalid and ignore them for intersection purposes.
+    const validExtentA = extentA && !extentA.some((coord) => Number.isNaN(coord)) ? extentA : undefined;
+    const validExtentB = extentB && !extentB.some((coord) => Number.isNaN(coord)) ? extentB : undefined;
+
+    // If no valid B, return valid A.
+    if (!validExtentB) return validExtentA;
+
+    // If no valid A, return valid B.
+    if (!validExtentA) return validExtentB;
+
+    // Return the intersection of A and B
+    return [
+      Math.max(validExtentA[0], validExtentB[0]),
+      Math.max(validExtentA[1], validExtentB[1]),
+      Math.min(validExtentA[2], validExtentB[2]),
+      Math.min(validExtentA[3], validExtentB[3]),
+    ];
+  }
+
+  /**
+   * Converts an extent to a polygon.
+   *
+   * @param extent - The extent to convert
+   * @returns The created polygon
+   */
+  static extentToPolygon(extent: Extent): Polygon {
+    const polygon = new Polygon([
+      [
+        [extent[0], extent[1]],
+        [extent[0], extent[3]],
+        [extent[2], extent[3]],
+        [extent[2], extent[1]],
+      ],
+    ]);
+    return polygon;
+  }
+
+  /**
+   * Converts a polygon to an extent.
+   *
+   * @param polygon - The polygon to convert
+   * @returns The created extent
+   */
+  static polygonToExtent(polygon: Polygon): Extent {
+    const outerRing = polygon.getCoordinates()[0];
+    let minx = outerRing[0][0];
+    let miny = outerRing[0][1];
+    let maxx = outerRing[0][0];
+    let maxy = outerRing[0][1];
+    for (let i = 1; i < outerRing.length; i++) {
+      minx = Math.min(outerRing[i][0], minx);
+      miny = Math.min(outerRing[i][1], miny);
+      maxx = Math.max(outerRing[i][0], maxx);
+      maxy = Math.max(outerRing[i][1], maxy);
+    }
+    const extent: Extent = [minx, miny, maxx, maxy];
+    return extent;
+  }
+
+  /**
+   * Checks whether an extent is defined and contains exactly four finite numeric coordinates.
+   *
+   * An extent is invalid when it is undefined, has a length other than four, or contains `NaN` or infinite coordinates.
+   *
+   * @param extent - The extent to validate
+   * @returns `true` when the extent is valid; otherwise, `false`
+   */
+  static isValidExtent(extent: Extent | undefined): boolean {
+    return (extent && extent.length === 4 && extent.every((coordinate) => Number.isFinite(coordinate))) ?? false;
+  }
+
+  /**
+   * Checks validity of lat long, LCC, or Web Mercator extent and updates values if invalid.
+   *
+   * @param extent - The extent to validate
+   * @param code - The projection code of the extent. Default EPSG:4326
+   * @returns The validated extent
+   */
+  static validateExtent(extent: Extent, code = 'EPSG:4326'): Extent {
+    // Max extents for projections
+    const maxExtents: Record<string, number[]> = {
+      'EPSG:4326': [-180, -90, 180, 90],
+      'EPSG:3857': [-20037508.3427892, -20037508.3427892, 20037508.3427892, 20037508.3427892],
+      'EPSG:3978': [-7192737.96, -3004297.73, 5183275.29, 4484204.83],
+      'EPSG:3573': [-9000000, -9000000, 9000000, 9000000],
+    };
+
+    let validatedExtent: Extent;
+    // In rare cases, services return 'NaN' as extents, not picked up by Number.isNan
+    if (typeof extent[0] !== 'number') validatedExtent = maxExtents[code];
+    else {
+      // Replace any invalid entries with maximum value
+      const minX = extent[0] < maxExtents[code][0] || extent[0] === -Infinity || Number.isNaN(extent[0]) ? maxExtents[code][0] : extent[0];
+      const minY = extent[1] < maxExtents[code][1] || extent[1] === -Infinity || Number.isNaN(extent[1]) ? maxExtents[code][1] : extent[1];
+      const maxX = extent[2] > maxExtents[code][2] || extent[2] === Infinity || Number.isNaN(extent[2]) ? maxExtents[code][2] : extent[2];
+      const maxY = extent[3] > maxExtents[code][3] || extent[3] === Infinity || Number.isNaN(extent[3]) ? maxExtents[code][3] : extent[3];
+
+      // Check the order
+      validatedExtent = [minX < maxX ? minX : maxX, minY < maxY ? minY : maxY, maxX > minX ? maxX : minX, maxY > minY ? maxY : minY];
+    }
+
+    return validatedExtent;
+  }
+
+  /**
+   * Validates lat long, LCC, or Web Mercator extent if it is defined.
+   *
+   * @param extent - The extent to validate
+   * @param code - The projection code of the extent. Default EPSG:4326
+   * @returns The validated extent if it was defined, or undefined
+   */
+  static validateExtentWhenDefined(extent: Extent | undefined, code = 'EPSG:4326'): Extent | undefined {
+    // Validate extent if it is defined
+    if (extent) return this.validateExtent(extent, code);
+    return undefined;
+  }
+
+  /**
+   * Checks if a given extent is long/lat.
+   *
+   * @param extent - The extent to check
+   * @returns Whether or not the extent is long/lat
+   */
+  static isExtentLonLat(extent: Extent): boolean {
+    if (
+      extent.length === 4 &&
+      extent[0] >= -180 &&
+      extent[0] <= 180 &&
+      extent[1] >= -90 &&
+      extent[1] <= 90 &&
+      extent[2] >= -180 &&
+      extent[2] <= 180 &&
+      extent[3] >= -90 &&
+      extent[3] <= 90
+    )
+      return true;
+    return false;
+  }
+
+  // #endregion EXTENT
+
+  /**
+   * Gets the area of a given geometry.
+   *
+   * @param geometry - The geometry to calculate the area
+   * @returns The area of the given geometry
+   */
+  static getArea(geometry: Geometry): number {
+    // Note that the geometry.getLength() and geometry.getArea() methods return measures of projected (planar) geometries.
+    // These can be very different than on-the-ground measures in certain situations - in northern and southern latitudes
+    // using Web Mercator for example. For better results, use the functions in the ol/sphere module.
+    return getAreaOL(geometry);
+  }
+
+  /**
+   * Gets the length of a given geometry.
+   *
+   * @param geometry - The geometry to calculate the length
+   * @returns The length of the given geometry
+   */
+  static getLength(geometry: Geometry): number {
+    // Note that the geometry.getLength() and geometry.getArea() methods return measures of projected (planar) geometries.
+    // These can be very different than on-the-ground measures in certain situations - in northern and southern latitudes
+    // using Web Mercator for example. For better results, use the functions in the ol/sphere module.
+    return getLengthOL(geometry);
+  }
+
+  /**
+   * Calculates distance along a path define by array of Coordinates.
+   *
+   * @param coordinates - Array of coordinates
+   * @param inProj - Input projection (EPSG:4326, EPSG:3978, ESPG:3857)
+   * @param outProj - Output projection (EPSG:3978, ESPG:3857)
+   * @returns The total distance in kilometers and distance for each section
+   */
+  static calculateDistance(coordinates: Coordinate[], inProj: string, outProj: string): { total: number; sections: number[] } {
+    const arr = Projection.transformPoints(coordinates, inProj, outProj);
+
+    const geom = new LineString(arr);
+    const sections: number[] = [];
+    geom.forEachSegment((start, end) => {
+      sections.push(Math.round((this.getLength(new LineString([start, end])) / 1000) * 100) / 100);
+    });
+
+    return { total: Math.round((this.getLength(geom) / 1000) * 100) / 100, sections };
+  }
+
+  /**
+   * Gets meters per pixel for different projections.
+   *
+   * @param projection - The projection of the map
+   * @param resolution - The resolution of the map
+   * @param lat - Optional latitude, only needed for Web Mercator
+   * @returns Number representing meters per pixel
+   */
+  static getMetersPerPixel(projection: TypeValidMapProjectionCodes, resolution: number, lat?: number): number {
+    if (!resolution) return 0;
+
+    // Web Mercator needs latitude correction because of severe distortion at high latitudes
+    // At latitude 60°N, the scale distortion factor is about 2:1
+    if (projection === 3857 && lat !== undefined) {
+      const latitudeCorrection = Math.cos((lat * Math.PI) / 180);
+      return resolution * latitudeCorrection;
+    }
+
+    // LCC (and other meter-based projections) can use resolution directly
+    return resolution;
+  }
+
+  /**
+   * Gets the pointer position information from a Map Event and a specified projection.
+   *
+   * @param mapEvent - The map event
+   * @param projCode - The map projection code
+   * @returns An object representing pointer position information in EPSG:4326
+   */
+  static getPointerPositionFromMapEvent(mapEvent: MapBrowserEvent, projCode: string): TypeMapMouseInfo {
+    // Return an object representing pointer position information
+    return {
+      projected: mapEvent.coordinate,
+      pixel: mapEvent.pixel,
+      lonlat: Projection.transformPoints([mapEvent.coordinate], projCode, Projection.PROJECTION_NAMES.LONLAT)[0],
+      dragging: mapEvent.dragging,
+    };
+  }
+
+  /**
+   * Function for checking if two geometries have the same coordinates.
+   *
+   * Note: will return false for geometry collections.
+   *
+   * @param geom1 - The first geometry
+   * @param geom2 - The second geometry
+   * @returns Whether the two geometries are equal or not
+   */
+  static geometriesAreEqual(geom1: Geometry | undefined, geom2: Geometry | undefined): boolean {
+    if (!geom1 || !geom2) return false;
+    if (geom1.getType() !== geom2.getType()) return false;
+
+    // TODO: Implement check for Geometry Collections
+    if (geom1.getType() === 'GeometryCollection') return false;
+
+    // For points
+    if (geom1 instanceof Point && geom2 instanceof Point) {
+      const origCoords = geom1.getCoordinates();
+      const currCoords = geom2.getCoordinates();
+      return origCoords[0] === currCoords[0] && origCoords[1] === currCoords[1];
+    }
+
+    if (geom1 instanceof LineString || geom1 instanceof Polygon) {
+      const coords1 = geom1.getCoordinates();
+      const coords2 = (geom2 as LineString | Polygon).getCoordinates();
+      return JSON.stringify(coords1) === JSON.stringify(coords2);
+    }
+
+    return false;
+  }
+
+  /**
+   * Apply buffer to extent.
+   *
+   * @param extent - The extent to check and buffer
+   * @param bufferSize - Buffer size in map units (default: 5000)
+   * @returns Buffered extent
+   */
+  static bufferExtent(extent: Extent, bufferSize = 5000): Extent {
+    return buffer(extent, bufferSize);
+  }
+
+  /**
+   * Serializes an OpenLayers geometry into a GML3 string.
+   *
+   * This method uses the OpenLayers `GML3` format to convert the provided
+   * `Geometry` object into a GML XML string, using the specified spatial
+   * reference system (`srsName`). The GML3 writer hardcodes the default
+   * `http://www.opengis.net/gml` namespace on the root element, so the
+   * serialized output is post-processed to rewrite both the default and `gml:`
+   * namespace declarations to the supplied `gmlNamespace` (e.g.
+   * `http://www.opengis.net/gml/3.2` for GML 3.2 / WFS 2.0).
+   *
+   * @param geometry - The OpenLayers geometry to serialize
+   * @param srsName - The spatial reference system (e.g., 'EPSG:3857') to assign to the GML geometry
+   * @param gmlNamespace - The GML namespace URI to apply on the serialized root element (e.g. `http://www.opengis.net/gml/3.2` for GML 3.2)
+   * @returns The serialized GML geometry as a string
+   */
+  static writeGeometryToGML(geometry: Geometry, srsName: string, gmlNamespace: string): string {
+    // GV I've tried a simplified approach for this function, even some suggested by AI, and they all failed to some degree.
+    // GV Sometimes doubling nodes like <Polygon> or sometimes adding extra node level like <geom> or sometimes forgetting the srsName attribute at the root.
+    // GV This iteration seems the most stable.
+
+    // Serialize to GML
+    const gmlFormat = new GML3({ srsName });
+
+    // Create a dummy parent node
+    const doc = document.implementation.createDocument(gmlNamespace, 'dummy', null);
+
+    // Write geometry inside the dummy node
+    gmlFormat.writeGeometryElement(doc.documentElement, geometry, []);
+
+    // Grab the actual geometry node (first child of dummy)
+    const geomNode = doc.documentElement.firstChild as Element;
+
+    // If failed to create a geometry node
+    if (!geomNode) {
+      throw new Error('Failed to generate GML geometry');
+    }
+
+    // Explicitly set the srsName on the geometry element
+    geomNode.setAttribute('srsName', srsName);
+
+    // Serialize and return
+    let serialized = new XMLSerializer().serializeToString(geomNode);
+
+    // The GML3 format unfortunately hardcodes the gml namespace in the root node, so we need to replace it with the provided gmlNamespace
+    serialized = serialized.replace('xmlns="http://www.opengis.net/gml"', `xmlns="${gmlNamespace}"`);
+    serialized = serialized.replace('xmlns:gml="http://www.opengis.net/gml"', `xmlns:gml="${gmlNamespace}"`);
+
+    // Return the serialized XML content
+    return serialized;
+  }
+
+  /**
+   * Converts a WFS geometry type string to a TypeStyleGeometry.
+   *
+   * @param wfsGeometryType - The wfs geometry type to convert
+   * @returns The corresponding TypeStyleGeometry
+   * @throws {NotSupportedError} When the geometry type is not supported
+   */
+  static wfsConvertGeometryTypeToOLGeometryType(wfsGeometryType: string): TypeStyleGeometry {
+    switch (wfsGeometryType) {
+      case 'gml:PointPropertyType':
+        return 'Point';
+      case 'gml:MultiPointPropertyType':
+        return 'MultiPoint';
+      case 'gml:LineStringPropertyType':
+      case 'gml:CurvePropertyType':
+        return 'LineString';
+      case 'gml:MultiLineStringPropertyType':
+      case 'gml:MultiCurvePropertyType':
+        return 'MultiLineString';
+      case 'gml:PolygonPropertyType':
+      case 'gml:SurfacePropertyType':
+        return 'Polygon';
+      case 'gml:MultiPolygonPropertyType':
+      case 'gml:MultiSurfacePropertyType':
+        return 'MultiPolygon';
+      default:
+        // Unsupported geometry type
+        throw new NotSupportedError(`Unsupported geometry type: ${wfsGeometryType}`);
+    }
+  }
+
+  /**
+   * Converts an esri geometry type string to a TypeStyleGeometry.
+   *
+   * @param esriGeometryType - The esri geometry type to convert
+   * @returns The corresponding TypeStyleGeometry
+   * @throws {NotSupportedError} When the geometry type is not supported
+   */
+  static esriConvertEsriGeometryTypeToOLGeometryType(esriGeometryType: string): TypeStyleGeometry {
+    switch (esriGeometryType) {
+      case 'esriGeometryPoint':
+        return 'Point';
+      case 'esriGeometryMultipoint':
+        return 'MultiPoint';
+      case 'esriGeometryPolyline':
+        return 'LineString';
+      case 'esriGeometryMultiPolyline':
+        return 'MultiLineString';
+      case 'esriGeometryPolygon':
+        return 'Polygon';
+      case 'esriGeometryMultiPolygon':
+        return 'MultiPolygon';
+      default:
+        // Unsupported geometry type
+        throw new NotSupportedError(`Unsupported geometry type: ${esriGeometryType}`);
+    }
+  }
+}
+
+/** Result from a fetch operation that may have required a proxy fallback. */
+export type FetchWithProxyResult<T> = {
+  /** The fetched data. */
+  data: T;
+  /** The proxy URL that was used, or undefined if no proxy was needed. */
+  proxyUsed?: string;
+};
+
+/** Empty result for layers that have no metadata to fetch. */
+export const EMPTY_FETCH_RESULT: FetchWithProxyResult<undefined> = { data: undefined };
+
+export interface TypeVectorLegend extends TypeLegend {
+  legend: TypeVectorLayerStyles;
+}
+
+/** Represents the result of reading features from a source, including the parsed features and their original projection. */
+export type SourceFeaturesInfo = {
+  /** The array of parsed OpenLayers features. */
+  features: Feature<Geometry>[];
+  /** The projection the source data was in, or undefined if it could not be determined. */
+  dataProjection: ProjectionLike;
+};

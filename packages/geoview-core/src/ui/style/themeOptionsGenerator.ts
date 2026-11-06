@@ -1,0 +1,596 @@
+import type { ThemeOptions } from '@mui/material';
+import type { CSSObject } from '@mui/system';
+import type { IGeoViewColors } from '@/ui/style/types';
+import { font, headingStyles, opacity, geoViewColors as defaultGeoViewColors, geoViewFontSizes } from '@/ui/style/default';
+import { logger } from '@/core/utils/logger';
+
+/**
+ * Returns the fullscreen element container for tooltip popper placement.
+ *
+ * Fixes tooltips not appearing in fullscreen mode.
+ *
+ * @returns The fullscreen element if active, otherwise document body
+ * @see https://github.com/mui/material-ui/issues/15618#issuecomment-1893503162
+ */
+function tooltipsPopperContainer(): Element | null {
+  // Use the fullscreen element if in fullscreen mode, otherwise just the document's body
+  return document.fullscreenElement ?? document.body;
+}
+
+/** WCAG 2.1 SC 2.4.7 compliant focus indicator outline width. */
+export const FOCUS_OUTLINE_WIDTH = '3px';
+
+/** Focus indicator outline offset distance from element boundary. */
+export const FOCUS_OUTLINE_OFFSET = '2px';
+
+/** Focus indicator halo (box-shadow) size for enhanced visibility. */
+export const FOCUS_HALO_SIZE = '6px';
+
+/**
+ * WCAG-compliant focus indicator styles for keyboard navigation.
+ *
+ * Returns a CSSObject for use in MUI component styleOverrides.
+ * Component-level application is required because MUI's ButtonBase sets outline: 0
+ * with higher CSS specificity than CssBaseline global styles.
+ *
+ * @param geoViewColors - GeoView color palette for focus indicator colors
+ * @returns Focus indicator style object for .Mui-focusVisible selector
+ */
+export const getFocusIndicatorStyles = (geoViewColors: IGeoViewColors): CSSObject => ({
+  outline: `${FOCUS_OUTLINE_WIDTH} solid ${geoViewColors.focusIndicator.outline}`,
+  outlineOffset: FOCUS_OUTLINE_OFFSET,
+  boxShadow: `0 0 0 ${FOCUS_HALO_SIZE} ${geoViewColors.focusIndicator.halo}`,
+});
+
+/**
+ * WCAG-compliant focus indicator styles for InputBase-derived form controls.
+ *
+ * Reuses getFocusIndicatorStyles' outline but drops the box-shadow halo, since form controls
+ * render their own border/underline and the halo was visually redundant.
+ *
+ * @param geoViewColors - GeoView color palette for focus indicator colors
+ * @returns Focus indicator style object (no halo) for use with :has(:focus-visible) on the input root
+ */
+export const getFormControlFocusIndicatorStyles = (geoViewColors: IGeoViewColors): CSSObject => ({
+  ...getFocusIndicatorStyles(geoViewColors),
+  boxShadow: 'none',
+});
+
+/**
+ * Generates button style overrides for all button variants.
+ *
+ * Note: Focus indicators are applied via MuiButtonBase (parent component) to avoid duplication.
+ *
+ * @param geoViewColors - GeoView color palette to derive button styles from
+ * @returns Style override object for MUI Button component
+ */
+const getButtonStyleOverrides = (geoViewColors: IGeoViewColors): CSSObject => ({
+  '&.highlighted': {
+    '&:hover, &:active, &.active': {
+      backgroundColor: `${geoViewColors.primary.main}`,
+      color: `${geoViewColors.white}`,
+    },
+  },
+  '&.buttonOutline': {
+    backgroundColor: 'transparent',
+    border: `3px solid transparent`,
+    color: `${geoViewColors.primary.main}`,
+    '&:hover, &:active, &.active': {
+      backgroundColor: `${geoViewColors.bgColor.dark[100]}`,
+      border: `3px solid ${geoViewColors.primary.light[500]}`,
+      color: `${geoViewColors.primary.dark[100]}`,
+      boxShadow: 1,
+    },
+    '&:disabled': {
+      color: `${geoViewColors.bgColor.dark[450]}`,
+      backgroundColor: 'transparent',
+    },
+    '&[aria-disabled="true"]': {
+      color: `${geoViewColors.bgColor.dark[450]}`,
+      backgroundColor: 'transparent',
+      cursor: 'not-allowed',
+    },
+  },
+  '&.buttonPopperClose': {
+    // used for Popper/dialog close buttons
+    backgroundColor: 'transparent',
+    border: `1px solid ${geoViewColors.primary.main}`,
+    color: `${geoViewColors.primary.main}`,
+    height: 36,
+    width: 36,
+    transition: 'background-color 0.3s ease-in-out',
+    '&:hover': {
+      backgroundColor: `${geoViewColors.bgColor.dark[100]}`,
+    },
+    '&:disabled': {
+      color: `${geoViewColors.bgColor.dark[450]}`,
+      borderColor: `${geoViewColors.bgColor.dark[450]}`,
+      backgroundColor: 'transparent',
+    },
+  },
+  '&.buttonFilledOutline:not(:disabled)': {
+    backgroundColor: `${geoViewColors.primary.main}`,
+    border: `3px solid transparent`,
+    color: `${geoViewColors.white}`,
+    '&:hover, &:active, &.active': {
+      backgroundColor: `${geoViewColors.primary.light[800]}`,
+      border: `3px solid ${geoViewColors.primary.light[500]}`,
+      color: `${geoViewColors.primary.dark[100]}`,
+      boxShadow: 1,
+    },
+  },
+  '&.buttonFilledOutline:disabled': {
+    backgroundColor: `${geoViewColors.bgColor.dark[150]}`,
+  },
+  '&.buttonFilled': {
+    // used for app-bar buttons
+    backgroundColor: `transparent`,
+    border: `2px solid transparent`,
+    color: `${geoViewColors.primary.main}`,
+    '&:hover, &:focus': {
+      backgroundColor: geoViewColors.primary.light[200],
+      color: geoViewColors.white,
+      boxShadow: 1,
+    },
+    '&:active, &.active': {
+      backgroundColor: `${geoViewColors.primary.main}`,
+      color: `${geoViewColors.white}`,
+      boxShadow: 1,
+    },
+    '&:disabled': {
+      color: `${geoViewColors.bgColor.dark[450]}`,
+    },
+  },
+  '&.style4': {
+    // used for app-bar buttons
+    boxShadow: 1,
+    borderRadius: 25,
+    height: 40,
+    width: 40,
+    '&:hover, &:active, &.active': {
+      backgroundColor: `${geoViewColors.primary.main}`,
+      border: `2px solid ${geoViewColors.primary.light[500]}`,
+      color: `${geoViewColors.white}`,
+      boxShadow: 1,
+    },
+    '&:disabled': {
+      color: `${geoViewColors.bgColor.dark[450]}`,
+    },
+  },
+});
+
+/**
+ * Generates complete MUI ThemeOptions from a GeoView color palette.
+ *
+ * Configures all MUI component overrides, typography, palette, and spacing
+ * to match GeoView's design system.
+ *
+ * @param geoViewColors - Optional color palette to generate theme from
+ * @param themeFont - Optional font family stack to apply to the generated theme
+ * @returns Complete MUI ThemeOptions configuration
+ */
+export const generateThemeOptions = (geoViewColors: IGeoViewColors = defaultGeoViewColors, themeFont = font): ThemeOptions => {
+  logger.logTraceCore('ui/style/themeOptionsGenerator - generateThemeOptions', geoViewColors);
+
+  const themeHeadingStyles = {
+    ...headingStyles,
+    fontFamily: themeFont,
+  };
+
+  const themeOptions: ThemeOptions = {
+    palette: {
+      geoViewColor: geoViewColors,
+      geoViewFontSize: geoViewFontSizes,
+      geoViewSpacingAndSizing: {},
+      backdrop: '#3F3F3F50',
+      common: {
+        black: '#000',
+        white: '#fff',
+      },
+      primary: {
+        main: geoViewColors.primary.main,
+        light: geoViewColors.primary.light[600],
+        dark: geoViewColors.primary.dark[200],
+        contrastText: geoViewColors.primary.contrastText(),
+      },
+      secondary: {
+        main: geoViewColors.primary.main,
+        light: geoViewColors.primary.light[600],
+        dark: geoViewColors.primary.dark[300],
+        contrastText: geoViewColors.primary.contrastText(),
+      },
+      error: {
+        main: geoViewColors.error.main,
+        light: geoViewColors.error.light[600],
+        dark: geoViewColors.error.dark[300],
+        contrastText: geoViewColors.error.contrastText(),
+      },
+      warning: {
+        main: geoViewColors.warning.main,
+        light: geoViewColors.warning.light[600],
+        dark: geoViewColors.warning.dark[300],
+        contrastText: geoViewColors.warning.contrastText(),
+      },
+      info: {
+        main: geoViewColors.info.main,
+        light: geoViewColors.info.light[600],
+        dark: geoViewColors.info.dark[300],
+        contrastText: geoViewColors.info.contrastText(),
+      },
+      success: {
+        main: geoViewColors.success.main,
+        light: geoViewColors.success.light[600],
+        dark: geoViewColors.success.dark[300],
+        contrastText: geoViewColors.success.contrastText(),
+      },
+      contrastThreshold: 3,
+      tonalOffset: 0.2,
+      text: {
+        primary: geoViewColors.textColor.light[50],
+        secondary: geoViewColors.textColor.light[500],
+        disabled: 'rgba(0, 0, 0, 0.38)',
+      },
+      divider: 'rgba(0, 0, 0, 0.12)',
+      background: {
+        paper: geoViewColors.bgColor.light[600],
+        default: geoViewColors.bgColor.light[500],
+      },
+      action: {
+        active: geoViewColors.primary.main,
+        hover: geoViewColors.primary.opacity(opacity.hoverOpacity),
+        hoverOpacity: opacity.hoverOpacity,
+        selected: geoViewColors.primary.opacity(opacity.selectedOpacity),
+        selectedOpacity: opacity.selectedOpacity,
+        // hoverRow: `rgba(0, 255, 255, ${opacity.hoverOpacity})`,
+        // selectedRow: `rgba(0, 255, 255, ${opacity.selectedOpacity})`,
+        disabled: 'rgba(0, 0, 0, 0.26)',
+        disabledBackground: `rgba(0, 0, 0, ${opacity.focusOpacity})`,
+        disabledOpacity: opacity.disabledOpacity,
+        focus: geoViewColors.primary.opacity(opacity.focusOpacity),
+        focusOpacity: opacity.focusOpacity,
+        activatedOpacity: opacity.activatedOpacity,
+      },
+    },
+
+    // start of other options
+    typography: {
+      // fontSize: `${defaultFontSize}rem`,
+      htmlFontSize: 16,
+      fontFamily: themeFont,
+      h1: themeHeadingStyles,
+      h2: themeHeadingStyles,
+      h3: themeHeadingStyles,
+      h4: themeHeadingStyles,
+      h5: themeHeadingStyles,
+      h6: {
+        fontWeight: 400,
+      },
+      subtitle1: {
+        fontSize: geoViewFontSizes.default,
+        lineHeight: 1.25,
+      },
+      subtitle2: {
+        fontSize: geoViewFontSizes.xs,
+        lineHeight: 1.25,
+      },
+      body1: {},
+      body2: {},
+      caption: {},
+      overline: {
+        fontSize: geoViewFontSizes.sm,
+        fontWeight: 500,
+        letterSpacing: 2,
+      },
+      button: {
+        fontSize: geoViewFontSizes.default,
+        fontWeight: 500,
+      },
+      control: {
+        fontSize: 11,
+        fontWeight: 500,
+      },
+    },
+    breakpoints: {
+      values: {
+        xs: 0,
+        sm: 640,
+        md: 960,
+        lg: 1200,
+        xl: 1536,
+      },
+    },
+    zIndex: {
+      mobileStepper: 1000,
+      speedDial: 1050,
+      appBar: 1100,
+      drawer: 1200,
+      modal: 1300,
+      snackbar: 1400,
+      tooltip: 15000,
+      olControl: 500,
+      focusDialog: 1300,
+    },
+    transitions: {
+      duration: {
+        shortest: 150,
+        shorter: 200,
+        short: 250,
+        // most basic recommended timing
+        standard: 300,
+        // this is to be used in complex animations
+        complex: 375,
+        // recommended when something is entering screen
+        enteringScreen: 225,
+        // recommended when something is leaving screen
+        leavingScreen: 195,
+        tooltipDelay: 1000,
+        splash: 1500,
+      },
+      easing: {
+        // This is the most common easing curve.
+        easeInOut: 'cubic-bezier(0.4, 0, 0.2, 1)',
+        // Objects enter the screen at full velocity from off-screen and
+        // slowly decelerate to a resting point.
+        easeOut: 'cubic-bezier(0.0, 0, 0.2, 1)',
+        // Objects leave the screen at full velocity. They do not decelerate when off-screen.
+        easeIn: 'cubic-bezier(0.4, 0, 1, 1)',
+        // The sharp curve is used by objects that may return to the screen at any time.
+        sharp: 'cubic-bezier(0.4, 0, 0.6, 1)',
+      },
+    },
+    shape: {
+      borderRadius: 6,
+      center: '50%',
+      right: '100%',
+      left: '0%',
+    },
+    components: {
+      MuiTooltip: {
+        defaultProps: {
+          slotProps: {
+            popper: {
+              container: tooltipsPopperContainer,
+            },
+          },
+        },
+        styleOverrides: {
+          tooltip: {
+            backgroundColor: geoViewColors.bgColor.dark[800],
+            color: geoViewColors.bgColor.light[800],
+          },
+        },
+      },
+      MuiPopper: {
+        defaultProps: {
+          container: tooltipsPopperContainer,
+        },
+      },
+      MuiMenu: {
+        defaultProps: {
+          container: tooltipsPopperContainer,
+        },
+      },
+      MuiPaper: {
+        styleOverrides: {
+          root: {
+            borderRadius: 5,
+            borderWidth: '1px',
+            borderColor: geoViewColors.bgColor.darken(0.5, 0.5),
+            borderStyle: 'solid',
+            boxShadow: `0px 12px 9px -13px ${geoViewColors.bgColor.darken(0.2, 0.5)}`,
+
+            '&.unbordered': {
+              borderStyle: 'none',
+            },
+          },
+        },
+      },
+      MuiButtonBase: {
+        styleOverrides: {
+          root: {
+            // WCAG-compliant focus indicator for all ButtonBase descendants
+            // (Button, IconButton, Tab, MenuItem, Checkbox, Radio, Switch, Chip, ListItemButton, etc.)
+            '&.Mui-focusVisible': getFocusIndicatorStyles(geoViewColors),
+            // Custom focus indicator for MenuItem within ButtonBase
+            '&.MuiMenuItem-root.Mui-focusVisible': {
+              ...getFocusIndicatorStyles(geoViewColors),
+              outlineOffset: '-3px', // sit inside the item
+              boxShadow: 'none', // drop the halo for dense menu rows
+            },
+            // Checkbox root is small — tighten the outline instead of the default offset
+            '&.MuiCheckbox-root.Mui-focusVisible': {
+              ...getFocusIndicatorStyles(geoViewColors),
+              outlineOffset: '-6px', // sit inside the item
+              boxShadow: 'none', // drop the halo for dense menu rows
+            },
+          },
+        },
+      },
+      MuiListItem: {
+        styleOverrides: {
+          root: {
+            '&.layer-panel': {
+              boxShadow: 'none',
+              '&[data-layer-depth="0"], &:not([data-layer-depth])': {
+                background: `${geoViewColors.bgColor.light[600]} 0% 0% no-repeat padding-box`,
+                borderRadius: '5px',
+                marginBottom: '10px',
+              },
+
+              '&[data-layer-depth] &:not([data-layer-depth="0"])': {
+                borderRadius: '0px',
+                border: 'unset',
+                backgroundColor: 'unset',
+              },
+
+              '& .MuiListItemButton-root:not(.Mui-focusVisible)': {
+                backgroundColor: 'transparent !important',
+              },
+
+              // for selected layer
+              '&.selectedLayer, &.selected': {
+                borderColor: `${geoViewColors.primary.main} !important`,
+                borderWidth: '2px !important',
+                borderStyle: 'solid !important',
+              },
+              // when layer is dragging
+              '&.dragging': {
+                backgroundcolor: geoViewColors.primary.dark[600],
+                cursor: 'grab',
+                userSelect: 'none',
+              },
+              // for handling layer status
+              '&.error, &.query-error': {
+                background: geoViewColors.error.lighten(0.7, 0.6),
+                '& .MuiListItemText-secondary': {
+                  fontWeight: 'bold',
+                  color: geoViewColors.error.main,
+                },
+              },
+              // for handling loading layer status
+              '&.loading, &.processing, &.query-processing': {
+                background: geoViewColors.info.lighten(0.7, 0.6),
+                '& .MuiListItemText-secondary': {
+                  fontWeight: 'bold',
+                  color: geoViewColors.info.main,
+                },
+              },
+              // for handling registered layer status - means we are unable to query metadata, server is slow
+              '&.registered': {
+                background: geoViewColors.grey.lighten(0.7, 0.6),
+                '& .MuiListItemText-secondary': {
+                  fontWeight: 'bold',
+                  color: geoViewColors.info.main,
+                },
+              },
+            },
+          },
+        },
+      },
+      MuiButton: {
+        styleOverrides: {
+          root: {
+            ...getButtonStyleOverrides(geoViewColors),
+          },
+        },
+      },
+      MuiIconButton: {
+        styleOverrides: {
+          root: {
+            ...getButtonStyleOverrides(geoViewColors),
+          },
+        },
+      },
+      MuiFab: {
+        styleOverrides: {
+          root: { padding: '0 24px' },
+        },
+      },
+      MuiDrawer: {
+        styleOverrides: {
+          paper: { position: 'relative' },
+        },
+      },
+      MuiButtonGroup: {
+        styleOverrides: {
+          grouped: {
+            minWidth: 'auto',
+          },
+        },
+      },
+      MuiListItemButton: {
+        defaultProps: {
+          disableTouchRipple: true,
+        },
+      },
+      MuiTabs: {
+        styleOverrides: {
+          root: {
+            backgroundColor: geoViewColors.bgColor.dark[100], // Background color for the Tabs component
+          },
+          indicator: {
+            backgroundColor: '#FF4081', // Background color for the selected tab indicator
+          },
+        },
+      },
+      MuiTab: {
+        styleOverrides: {
+          root: {
+            color: geoViewColors.textColor.light[100], // Text color for the tabs
+            '&.Mui-selected': {
+              color: `${geoViewColors.primary.light[200]}`, // Text color for the selected tab
+            },
+          },
+        },
+      },
+      MuiTypography: {
+        styleOverrides: {
+          root: {
+            color: geoViewColors.textColor.main,
+            overflowWrap: 'anywhere',
+            wordBreak: 'normal',
+            hyphens: 'auto',
+          },
+        },
+      },
+      MuiInputBase: {
+        styleOverrides: {
+          root: {
+            '& .MuiInputBase-input::placeholder': {
+              color: geoViewColors.textColor.light[200], // Placeholder text color that meets WCAG contrast (min 4.5:1) requirements against a white background
+              opacity: 1,
+            },
+            // Hide browser's native search input controls globally: It's confusing to keyboard users as it isn't focusable
+            '& input[type="search"]::-webkit-search-cancel-button': {
+              WebkitAppearance: 'none',
+              appearance: 'none',
+            },
+            '& input[type="search"]::-webkit-search-decoration': {
+              WebkitAppearance: 'none',
+              appearance: 'none',
+            },
+            // Keyboard-only focus indicator for InputBase-derived controls (TextField, Select, Autocomplete, date-pickers).
+            // Scoped to .geoview-keyboard-active (GeoView keyboard-navigation mode) because :focus-visible alone still
+            // matches text inputs on mouse click; .geoview-keyboard-active ensures mouse users never see the outline.
+            '.geoview-keyboard-active &:has(:focus-visible)': {
+              ...getFormControlFocusIndicatorStyles(geoViewColors),
+              outlineOffset: '0',
+            },
+            // Standard-variant focus underline is the root's own ::after, not the input's — suppress it on keyboard focus
+            '.geoview-keyboard-active &:has(:focus-visible)::after': {
+              border: 'none',
+            },
+            '.geoview-keyboard-active &:has(:focus-visible)::before': {
+              border: 'none',
+            },
+          },
+        },
+      },
+      MuiFormLabel: {
+        styleOverrides: {
+          root: {
+            color: geoViewColors.textColor.light[200], // Placeholder text color that meets WCAG contrast (min 4.5:1) requirements against a white background
+            opacity: 1,
+            // Keep the focused label the same as the root color instead of MUI's default primary.main, but preserve MUI's error color
+            '&.Mui-focused:not(.Mui-error)': {
+              color: geoViewColors.textColor.light[200],
+            },
+          },
+        },
+      },
+    },
+    overrides: {
+      button: {
+        size: { width: '32px', height: '32px' },
+      },
+      northArrow: {
+        size: { width: 42, height: 42 },
+      },
+      crosshairIcon: {
+        size: { width: 275, height: 275 },
+      },
+    },
+  } as ThemeOptions;
+
+  return themeOptions;
+};

@@ -1,0 +1,60 @@
+import { useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useTheme } from '@mui/material/styles';
+
+import { getSxClasses } from './data-table-style';
+import { Switch } from '@/ui';
+import { useStoreDataTableLayerSettings } from '@/core/stores/states/data-table-state';
+import { logger } from '@/core/utils/logger';
+import { useDataTableController } from '@/core/controllers/use-controllers';
+
+/** Properties for the FilterMap component. */
+interface FilterMapProps {
+  layerPath: string;
+  isGlobalFilterOn: boolean;
+}
+
+/**
+ * Renders a toggle switch to filter the map based on data table filters.
+ *
+ * @param props - Properties defined in FilterMapProps interface
+ * @returns The filter map toggle switch element
+ */
+function FilterMap({ layerPath, isGlobalFilterOn }: FilterMapProps): JSX.Element {
+  // Log
+  logger.logTraceRender('components/data-table/filter-map');
+
+  // Hook
+  const { t } = useTranslation();
+  const theme = useTheme();
+  const sxClasses = getSxClasses(theme);
+
+  const datatableSettings = useStoreDataTableLayerSettings();
+  const dataTableController = useDataTableController();
+
+  // #region Handlers
+
+  /**
+   * Handles the change event for the filter map toggle switch.
+   *
+   * This function toggles the filtered entry state for the specified layer in the data table.
+   */
+  const handleFilteredEntryChanged = useCallback((): void => {
+    dataTableController.setMapFilteredRecord(layerPath, !datatableSettings[layerPath].mapFilteredRecord);
+  }, [dataTableController, datatableSettings, layerPath]);
+
+  // #endregion
+
+  return (
+    <Switch
+      size="small"
+      onChange={handleFilteredEntryChanged}
+      checked={!!datatableSettings[layerPath]?.mapFilteredRecord}
+      sx={sxClasses.filterMap}
+      disabled={isGlobalFilterOn}
+      label={t('dataTable.filterMap')}
+    />
+  );
+}
+
+export default FilterMap;

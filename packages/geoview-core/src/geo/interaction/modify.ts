@@ -1,0 +1,222 @@
+import { Modify as olModify } from 'ol/interaction';
+import type { ModifyEvent as olModifyEvent, Options as olModifyOptions } from 'ol/interaction/Modify';
+import Collection from 'ol/Collection';
+import type Feature from 'ol/Feature';
+import type { Condition } from 'ol/events/condition';
+
+import type { EventDelegateBase } from '@/api/events/event-helper';
+import EventHelper from '@/api/events/event-helper';
+import type { TypeFeatureStyle } from '@/geo/layer/geometry/geometry-types';
+import { GeoUtilities } from '@/geo/utils/utilities';
+
+import type { InteractionOptions } from './interaction';
+import { Interaction } from './interaction';
+import type { GeometryApi } from '@/geo/layer/geometry/geometry';
+
+/**
+ * Supported options for modify interactions
+ */
+export type ModifyOptions = InteractionOptions & {
+  geometryGroupKey?: string;
+  features?: Collection<Feature>;
+  style?: TypeFeatureStyle;
+  insertVertexCondition?: Condition;
+  pixelTolerance?: number;
+};
+
+/**
+ * Class used for modifying features on a map.
+ */
+export class Modify extends Interaction {
+  /** The embedded OpenLayers Modify component. */
+  #olModify: olModify;
+
+  /** Callback handlers for the modifystart event. */
+  #onModifyStartedHandlers: ModifyDelegate[] = [];
+
+  /** Callback handlers for the modifyend event. */
+  #onModifyEndedHandlers: ModifyDelegate[] = [];
+
+  /** Callback handlers for the custom modifydrag event. */
+  #onModifyDraggedHandlers: ModifyDelegate[] = [];
+
+  /** Active feature being modified */
+  #activeFeature: Feature | null = null;
+
+  /**
+   * Initializes a Modify component.
+   *
+   * @param options - Object to configure the initialization of the Modify interaction
+   * @param geometryApi - The geometry API used to retrieve geometry groups if a geometry group key is provided in the options
+   */
+  constructor(options: ModifyOptions, geometryApi: GeometryApi) {
+    super(options);
+
+    // The OpenLayers Modify options
+    // TODO: Enhancements - Add support for more modifying options
+    const olOptions: olModifyOptions = {
+      style: GeoUtilities.convertTypeFeatureStyleToOpenLayersStyle(options.style),
+    };
+
+    // If a list of features is specified
+    if (options.features) {
+      // Set the features to snap to
+      olOptions.features = options.features;
+    } else if (options.geometryGroupKey) {
+      // If a geometry group key is set
+      // Get the vector source for the geometry group or create one when not existing
+      const geomGroup = geometryApi.createGeometryGroup(options.geometryGroupKey);
+      olOptions.source = geomGroup.vectorSource;
+    }
+
+    // The insertVertexCondition condition takes a function that allows for customizing
+    // a set of rules that determines where new vertices can be added to a feature.
+    // For example, if you don't want to allow for new vertices at all, you can pass the following:
+    // () => false. The condition must always return a boolean.
+    if (options.insertVertexCondition) {
+      olOptions.insertVertexCondition = options.insertVertexCondition;
+    }
+
+    // Pixel Tolerance must be a positive number, so we can revert to the default otherwise
+    if (options.pixelTolerance && options.pixelTolerance > 0) {
+      olOptions.pixelTolerance = options.pixelTolerance;
+    }
+
+    // Instantiate the OpenLayers Modify interaction
+    this.#olModify = new olModify(olOptions);
+
+    // Register handlers for modify events
+    this.#olModify.on('modifystart', this.#emitModifyStarted.bind(this));
+    this.#olModify.on('modifyend', this.#emitModifyEnded.bind(this));
+
+    // Since the openlayers modify interaction doesn't fire any events while
+    // the active feature is being modified, we can register handlers for the
+    // custom modifyDrag event by tracking changes to the active feature instead.
+    // We can wrap this inside modifystart and modifyend event handlers
+    // to ensure we only track the changes during the modify interaction
+    this.#olModify.on('modifystart', (event: olModifyEvent) => {
+      this.#activeFeature = event.features.item(0); // Track active feature
+
+      if (this.#activeFeature) {
+        this.#activeFeature.on('change', this.#emitModifyDragged.bind(this));
+      }
+    });
+
+    // Unregister the modifyDrag event when the modify interaction ends
+    this.#olModify.on('modifyend', () => {
+      if (this.#activeFeature) {
+        this.#activeFeature.un('change', this.#emitModifyDragged.bind(this));
+        this.#activeFeature = null; // Reset active feature
+      }
+    });
+  }
+
+  /**
+   * Starts the interaction on the map.
+   */
+  override startInteraction(): void {
+    // Redirect to super method to start interaction
+    super.startInteraction(this.#olModify);
+  }
+
+  /**
+   * Stops the interaction on the map.
+   */
+  override stopInteraction(): void {
+    // Redirect to super method to stop interaction
+    super.stopInteraction(this.#olModify);
+  }
+
+  /**
+   * Emits the modifystart event to all registered handlers.
+   *
+   * @param event - The event to emit
+   */
+  #emitModifyStarted(event: olModifyEvent): void {
+    // Emit the modifystarted event
+    EventHelper.emitEvent(this, this.#onModifyStartedHandlers, event);
+  }
+
+  /**
+   * Registers a callback handler for the modifystart event.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   */
+  onModifyStarted(callback: ModifyDelegate): void {
+    // Register the modifystarted event callback
+    EventHelper.onEvent(this.#onModifyStartedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a callback handler for the modifystart event.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offModifyStarted(callback: ModifyDelegate): void {
+    // Unregister the modifystarted event callback
+    EventHelper.offEvent(this.#onModifyStartedHandlers, callback);
+  }
+
+  /**
+   * Emits the modifyend event to all registered handlers.
+   *
+   * @param event - The event to emit
+   */
+  #emitModifyEnded(event: olModifyEvent): void {
+    // Emit the modifyended event
+    EventHelper.emitEvent(this, this.#onModifyEndedHandlers, event);
+  }
+
+  /**
+   * Registers a callback handler for the modifyend event.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   */
+  onModifyEnded(callback: ModifyDelegate): void {
+    // Register the modifyended event callback
+    EventHelper.onEvent(this.#onModifyEndedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a callback handler for the modifyend event.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offModifyEnded(callback: ModifyDelegate): void {
+    // Unregister the modifyended event callback
+    EventHelper.offEvent(this.#onModifyEndedHandlers, callback);
+  }
+
+  /**
+   * Emits the modifydrag event for all registered handlers.
+   */
+  #emitModifyDragged(): void {
+    if (this.#activeFeature) {
+      const event = { features: new Collection([this.#activeFeature]) } as olModifyEvent;
+      EventHelper.emitEvent(this, this.#onModifyDraggedHandlers, event);
+    }
+  }
+
+  /**
+   * Registers a callback handler for the modifydrag event.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   */
+  onModifyDragged(callback: ModifyDelegate): void {
+    EventHelper.onEvent(this.#onModifyDraggedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a callback handler for the modifydrag event.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offModifyDragged(callback: ModifyDelegate): void {
+    EventHelper.offEvent(this.#onModifyDraggedHandlers, callback);
+  }
+}
+
+/**
+ * Delegate for the modify event handler function signature.
+ */
+type ModifyDelegate = EventDelegateBase<Modify, olModifyEvent, void>;

@@ -1,0 +1,120 @@
+import type { ComponentsVariants, ComponentsOverrides, ComponentsProps } from '@mui/material';
+import type { IGeoViewColors, IGeoViewFontSizes, IGeoViewSpacingAndSizing } from '@/ui/style/types';
+
+/** MUI theme augmentation. See https://material-ui.com/guides/typescript/ */
+
+/**
+ * Custom shape overrides for the MUI theme.
+ *
+ * This type MUST be exported so that TypeScript emits this file to the
+ * declaration output (`lib/`). Without at least one export, `.d.ts` files
+ * containing only ambient `declare module` blocks are silently excluded
+ * from the build output, which prevents plugin packages from seeing the
+ * MUI augmentations (e.g. `geoViewColor` on `Palette`) during `rush build`.
+ *
+ * The re-export in `external-types.ts` (`export * from './material-ui.d'`)
+ * then pulls this file into the module graph for all consumers.
+ */
+export type Shape = {
+  borderRadius: number | string;
+  left: string;
+  center: string;
+  right: string;
+};
+
+// #region MUI
+declare module '@mui/material/styles' {
+  // allow configuration using `createTheme`
+  interface ThemeOptions {
+    // GV No theme when this UI component is used by external component (e.g. GeoChart). All geoViewColor and geoViewFontSize properties need to have the "?" to support when no theme are set (no map).
+    geoViewColor?: IGeoViewColors;
+    shape?: Shape;
+    overrides?: {
+      button: {
+        size: { width: string | number; height: string | number };
+      };
+      northArrow: {
+        size: { width: string | number; height: string | number };
+      };
+      crosshairIcon: {
+        size: { width: string | number; height: string | number };
+      };
+    };
+  }
+  interface Theme {
+    overrides: {
+      button: {
+        size: { width: string; height: string };
+      };
+      northArrow: {
+        size: { width: number; height: number };
+      };
+      crosshairIcon: {
+        size: { width: number; height: number };
+      };
+    };
+  }
+}
+
+declare module '@mui/material/styles/createPalette' {
+  interface Palette {
+    backdrop: string;
+    // GV No theme when this UI component is used by external component (e.g. GeoChart). All geoViewColor and geoViewFontSize properties need to have the "?" to support when no theme are set (no map).
+    geoViewColor?: IGeoViewColors;
+    geoViewFontSize?: IGeoViewFontSizes;
+    geoViewSpacingAndSizing?: IGeoViewSpacingAndSizing;
+  }
+
+  interface PaletteOptions {
+    backdrop?: string;
+    // GV No theme when this UI component is used by external component (e.g. GeoChart). All geoViewColor and geoViewFontSize properties need to have the "?" to support when no theme are set (no map).
+    geoViewColor?: IGeoViewColors;
+    geoViewFontSize?: IGeoViewFontSizes;
+    geoViewSpacingAndSizing?: IGeoViewSpacingAndSizing;
+  }
+}
+
+declare module '@mui/material/styles/createTransitions' {
+  interface Duration {
+    tooltipDelay?: number;
+    splash: number;
+  }
+}
+
+declare module '@mui/material/styles/components' {
+  interface Components<Theme = unknown> {
+    button?: {
+      defaultProps?: ComponentsProps['MuiButton'];
+      styleOverrides?: ComponentsOverrides<Theme>['MuiButton'];
+      /**
+       * @deprecated pass a callback to the slot in `styleOverrides` instead. [See example](https://mui.com/customization/theme-components/#overrides-based-on-props)
+       */
+      variants?: ComponentsVariants['MuiButton'];
+    };
+  }
+}
+
+declare module '@mui/material/styles/zIndex' {
+  interface ZIndex {
+    olControl: number;
+    focusDialog: number;
+  }
+}
+
+declare module '@mui/material/styles/createTypography' {
+  interface Typography {
+    control: {
+      fontSize: number;
+      fontWeight: number;
+    };
+  }
+
+  interface TypographyOptions {
+    control?: {
+      fontSize?: number;
+      fontWeight?: number;
+    };
+  }
+}
+
+// #endregion MUI

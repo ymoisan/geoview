@@ -1,0 +1,8 @@
+{
+  "id": "filter-panel",
+  "enabled": true,
+  "isOpen": false,
+  "title": "Filter Layers",
+  "version": "1.0",
+  "layers": []
+}

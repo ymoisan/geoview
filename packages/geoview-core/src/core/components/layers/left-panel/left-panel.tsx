@@ -1,0 +1,34 @@
+import { useStoreLayerDisplayState, useStoreLayerTopLevelLayerPaths } from '@/core/stores/states/layer-state';
+import { LayersList } from './layers-list';
+import { AddNewLayer } from './add-new-layer/add-new-layer';
+import { logger } from '@/core/utils/logger';
+import type { TypeContainerBox } from '@/core/types/global-types';
+
+interface LeftPanelProps {
+  showLayerDetailsPanel: (layerId: string) => void;
+  isLayoutEnlarged: boolean;
+  containerType: TypeContainerBox;
+}
+
+export function LeftPanel({ showLayerDetailsPanel, isLayoutEnlarged, containerType }: LeftPanelProps): JSX.Element {
+  // Log
+  logger.logTraceRender('components/layers/left-panel/left-panel');
+
+  // get from the store
+  const layerPaths = useStoreLayerTopLevelLayerPaths();
+  const displayState = useStoreLayerDisplayState();
+
+  if (displayState === 'add') {
+    return <AddNewLayer />;
+  }
+
+  return (
+    <LayersList
+      layerPaths={layerPaths}
+      depth={0}
+      showLayerDetailsPanel={showLayerDetailsPanel}
+      isLayoutEnlarged={isLayoutEnlarged}
+      containerType={containerType}
+    />
+  );
+}

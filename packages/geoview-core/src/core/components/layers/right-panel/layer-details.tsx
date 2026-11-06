@@ -1,0 +1,853 @@
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
+import { useTranslation } from 'react-i18next';
+
+import { useTheme } from '@mui/material/styles';
+import type { SxProps } from '@mui/material';
+
+import { delay } from '@/core/utils/utilities';
+import {
+  Box,
+  BrowserNotSupportedIcon,
+  Checkbox,
+  Divider,
+  Fade,
+  FormControlLabel,
+  Grid,
+  HighlightIcon,
+  HighlightOutlinedIcon,
+  IconButton,
+  InfoOutlinedIcon,
+  List,
+  ListItem,
+  Paper,
+  RestartAltIcon,
+  TableViewIcon,
+  TimeSliderIcon,
+  Typography,
+  SettingsIcon,
+  ZoomInSearchIcon,
+} from '@/ui';
+import { ArrowBackIcon } from '@/ui/icons';
+import { useTimeSliderControllerIfExists, useUIController, useDataTableController } from '@/core/controllers/use-controllers';
+import { layerHasClassItems, layerHasLegendImage, type TypeLegendItem } from '@/core/components/layers/types';
+import { getSxClasses } from './layer-details-style';
+import {
+  getStoreLayerLegendLayerByPath,
+  useStoreLayerHighlightedLayer,
+  useStoreLayerBounds,
+  useStoreLayerHasText,
+  useStoreLayerStyleSettings,
+  useStoreLayerAllChildrenVisible,
+  useStoreLayerChildPaths,
+  useStoreLayerControls,
+  useStoreLayerStatus,
+  useStoreLayerItems,
+  useStoreLayerStyleConfig,
+  useStoreLayerCanToggle,
+  useStoreLayerName,
+  useStoreLayerSchemaTag,
+  useStoreLayerIcons,
+  useStoreLayerAttribution,
+  useStoreLayerVisible,
+  useStoreLayerIsParentHiddenOnMap,
+  useStoreLayerIsHiddenOnMap,
+  useStoreLayerVisibleLayers,
+} from '@/core/stores/states/layer-state';
+import { useStoreUIActiveTrapGeoView, useStoreUIFooterBarComponents, useStoreUIAppbarComponents } from '@/core/stores/states/ui-state';
+import { useStoreDataTableAllFeaturesDataArray, useStoreDataTableLayerSettings } from '@/core/stores/states/data-table-state';
+import { useStoreSwiperInteractive } from '@/core/stores/states/swiper-state';
+import { LayerIcon } from '@/core/components/common/layer-icon';
+import { LayerOpacityControl } from './layer-opacity-control/layer-opacity-control';
+import { LayerSettingsPanel } from './layer-settings/layer-settings';
+import { LayerInfoPanel } from './layer-info/layer-info';
+import { logger } from '@/core/utils/logger';
+import { LAYER_STATUS, TABS, TIMEOUT } from '@/core/utils/constant';
+import { CONST_LAYER_TYPES } from '@/api/types/layer-schema-types';
+import { useStoreTimeSliderLayer } from '@/core/stores/states/time-slider-state';
+import { useNavigateToTab } from '@/core/components/common/hooks/use-navigate-to-tab';
+import { useStoreGeoViewMapId } from '@/core/stores/geoview-store';
+import { DeleteUndoButton } from '@/core/components/layers/delete-undo-button';
+import type { TypeContainerBox } from '@/core/types/global-types';
+import { useLayerController, useLayerSetController } from '@/core/controllers/use-controllers';
+import type { TypeLayerStyleSettings } from '@/api/types/map-schema-types';
+
+interface LayerDetailsProps {
+  /** The layer path for the layer to display. */
+  layerPath: string;
+  /** The type of container for the layer details panel. */
+  containerType: TypeContainerBox;
+}
+
+interface SubLayerProps {
+  /** The layer path for the sublayer to render. */
+  layerPath: string;
+}
+
+/**
+ * Renders a single sublayer item with visibility toggle.
+ *
+ * Memoized to avoid re-rendering all sublayer items when only one changes.
+ * Self-recursive: renders its own children if present.
+ */
+const Sublayer = memo(({ layerPath }: SubLayerProps): JSX.Element => {
+  // Log
+  logger.logTraceRender('components/layers/right-panel/Sublayer');
+
+  const theme = useTheme();
+  const sxClasses = getSxClasses(theme);
+
+  // Hooks
+  const layerName = useStoreLayerName(layerPath);
+  const childPaths = useStoreLayerChildPaths(layerPath);
+  const layerHidden = useStoreLayerIsHiddenOnMap(layerPath);
+  const parentHidden = useStoreLayerIsParentHiddenOnMap(layerPath);
+  const layerVisible = useStoreLayerVisible(layerPath);
+  const layerStatus = useStoreLayerStatus(layerPath);
+  const layerController = useLayerController();
+
+  // A layer in error has no valid GV layer on the map — disable and uncheck its visibility control
+  const isError = layerStatus === LAYER_STATUS.ERROR;
+
+  // Return the ui
+  return (
+    <ListItem sx={sxClasses.sublayerListItem}>
+      <FormControlLabel
+        sx={sxClasses.formControlLabelFull}
+        control={
+          <Checkbox
+            color="primary"
+            checked={!isError && layerVisible === true}
+            onChange={() => layerController.setOrToggleLayerVisibility(layerPath)}
+            disabled={isError || parentHidden}
+          />
+        }
+        label={
+          <Box sx={sxClasses.checkboxLabelContent}>
+            <LayerIcon layerPath={layerPath} />
+            <Box component="span" sx={[sxClasses.tableIconLabel, (isError || layerHidden) && sxClasses.hiddenText] as SxProps}>
+              {layerName}
+            </Box>
+          </Box>
+        }
+      />
+      {childPaths && (
+        <Box sx={sxClasses.sublayerChildrenContainer}>
+          <List>
+            {childPaths.map((childPath) => (
+              <Sublayer key={childPath} layerPath={childPath} />
+            ))}
+          </List>
+        </Box>
+      )}
+    </ListItem>
+  );
+});
+Sublayer.displayName = 'Sublayer';
+
+/**
+ * Creates the layer details panel with settings, info, and visibility controls.
+ *
+ * @param props - Properties defined in LayerDetailsProps interface
+ * @returns The layer details panel element, or null if layer not found
+ */
+
+export function LayerDetails(props: LayerDetailsProps): JSX.Element | null {
+  // Log
+  logger.logTraceRender('components/layers/right-panel/layer-details');
+
+  const { layerPath, containerType } = props;
+
+  const { t } = useTranslation<string>();
+
+  const theme = useTheme();
+  const sxClasses = getSxClasses(theme);
+  const hiddenStyle = sxClasses.hiddenText;
+
+  const [contentVisible, setContentVisible] = useState<boolean>(true);
+  const [activeView, setActiveView] = useState<'details' | 'settings' | 'info'>('details');
+
+  // Ref for settings button focus restoration
+  const settingsButtonRef = useRef<HTMLButtonElement>(null);
+  const infoButtonRef = useRef<HTMLButtonElement>(null);
+
+  // get store state — individual hooks for precise reactivity
+  const mapId = useStoreGeoViewMapId();
+  const layerName = useStoreLayerName(layerPath);
+  const layerControls = useStoreLayerControls(layerPath);
+  const layerStatus = useStoreLayerStatus(layerPath);
+  const layerIcons = useStoreLayerIcons(layerPath);
+  const layerItems = useStoreLayerItems(layerPath);
+  const layerStyleConfig = useStoreLayerStyleConfig(layerPath);
+  const layerCanToggle = useStoreLayerCanToggle(layerPath);
+  const layerSchemaTag = useStoreLayerSchemaTag(layerPath);
+  const layerAttribution = useStoreLayerAttribution(layerPath);
+  const layerChildPaths = useStoreLayerChildPaths(layerPath);
+  const allSublayersVisible = useStoreLayerAllChildrenVisible(layerPath);
+  const highlightedLayer = useStoreLayerHighlightedLayer();
+  const hasText = useStoreLayerHasText(layerPath);
+  const visibleLayers = useStoreLayerVisibleLayers();
+  const datatableSettings = useStoreDataTableLayerSettings();
+  const layersData = useStoreDataTableAllFeaturesDataArray();
+  const bounds = useStoreLayerBounds(layerPath);
+  const layerVisible = useStoreLayerVisible(layerPath);
+  const parentHidden = useStoreLayerIsParentHiddenOnMap(layerPath);
+  const layerHidden = useStoreLayerIsHiddenOnMap(layerPath);
+  const availableSettings = useStoreLayerStyleSettings(layerPath);
+  const swiperInteractive = useStoreSwiperInteractive();
+  const timeSliderLayer = useStoreTimeSliderLayer(layerPath);
+  const isFocusTrap = useStoreUIActiveTrapGeoView();
+  const footerBarComponents = useStoreUIFooterBarComponents();
+  const appBarComponents = useStoreUIAppbarComponents();
+  const uiController = useUIController();
+  const layerController = useLayerController();
+  const layerSetController = useLayerSetController();
+  const timeSliderController = useTimeSliderControllerIfExists();
+  const dataTableController = useDataTableController();
+
+  // Check if data-table tab exists in footer or appBar
+  const hasDataTableTab = footerBarComponents.includes('data-table') || appBarComponents.includes('data-table');
+
+  // Use navigate hook for time slider (only if time slider state exists)
+  const navigateToTimeSlider = useNavigateToTab('time-slider', (lyrPath) => {
+    timeSliderController?.setSelectedLayerPathTimeSlider(lyrPath);
+  });
+
+  // Use navigate hook for data table
+  const navigateToDataTable = useNavigateToTab('data-table', (lyrPath) => {
+    dataTableController.setSelectedLayerPath(lyrPath);
+  });
+
+  // Is highlight button disabled?
+  const isLayerHighlightCapable = layerControls?.highlight;
+
+  // Is zoom to extent button capable?
+  const isLayerZoomToExtentCapable = layerControls?.zoom;
+  // Is zoom button disabled?
+  const isZoomDisabled = layerHidden || !bounds || Number.isNaN(bounds[0]);
+
+  // Is table button disabled?
+  const isTableButtonDisabled = layerControls?.table === false || layerHidden || parentHidden;
+
+  // Generate unique table details button ID
+  const tableDetailsButtonId = `${mapId}-${containerType}-table-details`;
+
+  // Layer is ESRI Dynamic
+  const isEsriDynamic = layerSchemaTag === CONST_LAYER_TYPES.ESRI_DYNAMIC;
+
+  // Layer is WMTS
+  const isWMTS = layerSchemaTag === CONST_LAYER_TYPES.WMTS;
+
+  // Has at least 1 layer items and style config
+  const hasLayerItemsAndStyle = layerHasClassItems(layerItems, layerStyleConfig, 1);
+
+  // Has layer legend image
+  const hasLayerLegendImage = layerHasLegendImage(layerSchemaTag, layerItems, layerIcons, layerStyleConfig);
+
+  // Layer has a value expression in its style config
+  const hasValueExpression = useMemo((): boolean => {
+    // Log
+    logger.logTraceUseMemo('LAYER DETAILS - hasValueExpression', layerStyleConfig);
+
+    return layerStyleConfig
+      ? Object.values(layerStyleConfig).some(
+          (styleConfig) => styleConfig && 'valueExpression' in styleConfig && styleConfig.valueExpression
+        )
+      : false;
+  }, [layerStyleConfig]);
+
+  /**
+   * Determines if a style configuration allows item visibility toggling.
+   *
+   * Simple styles can be toggled when the layer has multiple geometry types.
+   * UniqueValue/classBreaks styles require multiple non-default classes to enable toggling.
+   */
+  const canToggleStyleItems = (styleConfig: TypeLayerStyleSettings | undefined): boolean => {
+    if (!styleConfig) return false;
+
+    if (styleConfig.type === 'simple') {
+      // Simple styles can be toggled when there are multiple geometry types in the layer
+      return layerStyleConfig ? Object.keys(layerStyleConfig).length > 1 : false;
+    }
+
+    if (styleConfig.type === 'uniqueValue' || styleConfig.type === 'classBreaks') {
+      const nonDefaultCount = styleConfig.hasDefault ? styleConfig.info.length - 1 : styleConfig.info.length;
+      return nonDefaultCount > 1;
+    }
+
+    return true;
+  };
+
+  /**
+   * Resets active view to details when layer changes.
+   */
+  useEffect(() => {
+    // Log
+    logger.logTraceUseEffect('LAYER DETAILS - reset activeView on layer change', layerPath);
+    setActiveView('details');
+  }, [layerPath]);
+
+  // #region Handlers
+
+  /**
+   * Handles resetting the layer to its initial state.
+   */
+  const handleResetLayer = useCallback((): void => {
+    layerController.resetLayer(layerPath).catch((error: unknown) => {
+      // Log
+      logger.logPromiseFailed('in layerController.resetLayer in layer-details.handleResetLayer', error);
+    });
+  }, [layerController, layerPath]);
+
+  /**
+   * Handles zooming to the layer's extent.
+   */
+  const handleZoomTo = useCallback((): void => {
+    // Early return if zoom button is disabled
+    if (isZoomDisabled) {
+      return;
+    }
+    layerController.zoomToLayerExtent(layerPath).catch((error: unknown) => {
+      // Log
+      logger.logPromiseFailed('in zoomToLayerExtent in layer-details.handleZoomTo', error);
+    });
+  }, [isZoomDisabled, layerController, layerPath]);
+
+  /**
+   * Handles opening the data table for the layer.
+   */
+  const handleOpenTable = useCallback((): void => {
+    // Early return if table button is disabled
+    if (isTableButtonDisabled) {
+      return;
+    }
+    // trigger the fetching of the features when not available OR when layer status is in error
+    if (
+      !layersData.filter((layers) => layers.layerPath === layerPath && !!layers?.features?.length).length ||
+      layerStatus === LAYER_STATUS.ERROR
+    ) {
+      layerSetController.triggerGetAllFeatureInfo(layerPath).catch((error: unknown) => {
+        // Log
+        logger.logPromiseFailed('Failed to triggerGetAllFeatureInfo in layer-details.handleOpenTable', error);
+      });
+    }
+
+    // If data-table tab exists in viewer, navigate to it directly
+    if (hasDataTableTab) {
+      navigateToDataTable({ layerPath });
+    } else {
+      // Otherwise, open the data table modal
+      uiController.enableFocusTrap({ activeElementId: 'layerDataTable', callbackElementId: tableDetailsButtonId });
+    }
+  }, [
+    isTableButtonDisabled,
+    hasDataTableTab,
+    navigateToDataTable,
+    layerPath,
+    layerSetController,
+    layerStatus,
+    layersData,
+    tableDetailsButtonId,
+    uiController,
+  ]);
+
+  /**
+   * Handles highlighting the layer on the map.
+   */
+  const handleHighlightLayer = useCallback((): void => {
+    // Early return if highlight button is disabled
+    if (layerHidden) {
+      return;
+    }
+    layerController.setHighlightLayer(layerPath);
+  }, [layerController, layerHidden, layerPath]);
+
+  /**
+   * Handles navigation to the Time Slider panel when the button is clicked.
+   */
+  const handleTimeSliderNavigate = useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>): void => {
+      const isDisabled = layerHidden || parentHidden;
+      if (isDisabled) {
+        return;
+      }
+      event.stopPropagation();
+      navigateToTimeSlider({ layerPath });
+    },
+    [layerHidden, parentHidden, navigateToTimeSlider, layerPath]
+  );
+
+  /**
+   * Crossfades from settings view back to details view, restoring focus to the settings button.
+   */
+  const handleSettingsBackToDetails = useCallback((): void => {
+    setContentVisible(false);
+    delay(TIMEOUT.fadingPanelDuration)
+      .then(() => {
+        setActiveView('details');
+        setContentVisible(true);
+        requestAnimationFrame(() => settingsButtonRef.current?.focus());
+      })
+      .catch((error) => logger.logPromiseFailed('in delay in handleSettingsBackToDetails', error));
+  }, []);
+
+  /**
+   * Crossfades from details view to settings view.
+   */
+  const handleOpenSettings = useCallback((): void => {
+    setContentVisible(false);
+    delay(TIMEOUT.fadingPanelDuration)
+      .then(() => {
+        setActiveView('settings');
+        setContentVisible(true);
+      })
+      .catch((error) => logger.logPromiseFailed('in delay in handleOpenSettings', error));
+  }, []);
+
+  /**
+   * Crossfades from info view back to details view, restoring focus to the info button.
+   */
+  const handleInfoBackToDetails = useCallback((): void => {
+    setContentVisible(false);
+    delay(TIMEOUT.fadingPanelDuration)
+      .then(() => {
+        setActiveView('details');
+        setContentVisible(true);
+        requestAnimationFrame(() => infoButtonRef.current?.focus());
+      })
+      .catch((error) => logger.logPromiseFailed('in delay in handleInfoBackToDetails', error));
+  }, []);
+
+  /**
+   * Crossfades from details view to info view.
+   */
+  const handleOpenInfo = useCallback((): void => {
+    setContentVisible(false);
+    delay(TIMEOUT.fadingPanelDuration)
+      .then(() => {
+        setActiveView('info');
+        setContentVisible(true);
+      })
+      .catch((error) => logger.logPromiseFailed('in delay in handleOpenInfo', error));
+  }, []);
+
+  /**
+   * Sets visibility for all children of the layer, skipping children in error state.
+   */
+  const handleToggleAllVisibility = useCallback((): void => {
+    // Use the non-reactive getter to walk the tree — only needed at click time
+    const layer = getStoreLayerLegendLayerByPath(mapId, layerPath);
+    if (!layer) return;
+
+    const setRecursive = (legendLayer: typeof layer, newVisibility: boolean): void => {
+      legendLayer.children.forEach((child) => {
+        // Skip children in error state — they have no valid GV layer on the map
+        if (child.layerStatus === LAYER_STATUS.ERROR) return;
+        if (newVisibility) {
+          if (!visibleLayers.includes(child.layerPath)) layerController.setOrToggleLayerVisibility(child.layerPath, true);
+        } else if (visibleLayers.includes(child.layerPath)) layerController.setOrToggleLayerVisibility(child.layerPath, false);
+        if (child.children.length) setRecursive(child, newVisibility);
+      });
+    };
+    setRecursive(layer, !allSublayersVisible);
+  }, [allSublayersVisible, mapId, layerPath, layerController, visibleLayers]);
+
+  // #endregion Handlers
+
+  const allItemsChecked = !!(layerItems && layerItems.every((i) => i.isVisible !== false));
+
+  /**
+   * Renders the checkbox (or static label) for a single legend item.
+   */
+  const renderItemCheckbox = (item: TypeLegendItem): JSX.Element | null => {
+    if (!layerStyleConfig) return null;
+
+    // Determine if style type allows toggling this item on/off
+    const styleConfig = layerStyleConfig[item.geometryType];
+    const canToggle = canToggleStyleItems(styleConfig);
+
+    const isDisabled = layerHidden || !layerCanToggle || (isEsriDynamic && !!hasValueExpression) || isWMTS;
+
+    // Build the label content with icon and text
+    const labelContent = (
+      <Box sx={sxClasses.checkboxLabelContent}>
+        {item.icon ? <Box component="img" alt="" src={item.icon} /> : <BrowserNotSupportedIcon sx={sxClasses.itemImage} />}
+        <Box component="span" sx={[sxClasses.tableIconLabel, (layerHidden || !item.isVisible) && hiddenStyle] as SxProps}>
+          {item.name}
+        </Box>
+      </Box>
+    );
+
+    // If not checkbox needed, just return the label content
+    if (!canToggle) {
+      return <Box sx={[sxClasses.formControlLabelFull, sxClasses.itemLabelIndented] as SxProps}>{labelContent}</Box>;
+    }
+
+    return (
+      <FormControlLabel
+        control={
+          <Checkbox
+            color="primary"
+            checked={item.isVisible === true}
+            onChange={() => layerController.toggleItemVisibilityAndForget(layerPath, item)}
+            disabled={isDisabled}
+          />
+        }
+        label={labelContent}
+        sx={sxClasses.formControlLabelFull}
+      />
+    );
+  };
+
+  /**
+   * Renders the header checkbox that toggles visibility of all legend items at once.
+   */
+  const renderHeaderCheckbox = (): JSX.Element => {
+    const isDisabled = layerHidden || !layerCanToggle || (isEsriDynamic && hasValueExpression) || isWMTS;
+
+    const labelContent = (
+      <Box component="span" sx={[sxClasses.boldLabel, layerHidden && hiddenStyle] as SxProps}>
+        {t('layers.toggleItemsVisibility')}
+      </Box>
+    );
+
+    return (
+      <FormControlLabel
+        control={
+          <Checkbox
+            color="primary"
+            checked={allItemsChecked}
+            onChange={() => layerController.setAllItemsVisibilityAndForget(layerPath, !allItemsChecked)}
+            disabled={isDisabled}
+          />
+        }
+        label={labelContent}
+        sx={sxClasses.formControlLabel}
+      />
+    );
+  };
+
+  /**
+   * Renders the WMS legend graphic image when the layer is a WMS with an icon but no individual items.
+   */
+  const renderWMSImage = (): JSX.Element | null => {
+    // If will render items, don't render image
+    if (hasLayerItemsAndStyle) return;
+
+    // If it's a WMS and we have any iconImage and no items
+    if (hasLayerLegendImage) {
+      return (
+        <Grid sx={sxClasses.itemsGrid}>
+          <Grid container sx={sxClasses.wmsImageContainer}>
+            <Box component="img" alt="" src={layerIcons![0].iconImage!} sx={sxClasses.wmsImage} />
+          </Grid>
+        </Grid>
+      );
+    }
+
+    return null;
+  };
+
+  /**
+   * Renders the grid of legend items for the current layer.
+   */
+  const renderItems = (): JSX.Element | null => {
+    // If we have any items
+    if (hasLayerItemsAndStyle) {
+      return (
+        <Grid className="layer-details-panel" container spacing={0} sx={[sxClasses.itemsGrid, sxClasses.itemsGridColumn] as SxProps}>
+          {layerItems?.map((item) => (
+            <Grid key={`${layerPath}/${item.geometryType}/${item.name}/${item.icon || 'no-icon'}`} sx={sxClasses.itemGridItem}>
+              {renderItemCheckbox(item)}
+            </Grid>
+          ))}
+        </Grid>
+      );
+    }
+
+    return null;
+  };
+
+  /**
+   * Renders the button that opens the data table for the current layer.
+   */
+  const renderDetailsButton = (): JSX.Element | null => {
+    // Hidden in WCAG mode - keyboard users can Tab to Data Table Panel instead
+    if (isFocusTrap) {
+      return null;
+    }
+
+    return (
+      <IconButton
+        id={tableDetailsButtonId}
+        className="buttonOutline"
+        onClick={handleOpenTable}
+        aria-label={hasDataTableTab ? t('dataTable.accessAdvancedFunctions') : t('legend.tableDetails')}
+        aria-disabled={isTableButtonDisabled} // WCAG - used instead of disabled to allow button to be discoverable by screen readers
+      >
+        <TableViewIcon color={isTableButtonDisabled ? 'disabled' : 'inherit'} />
+      </IconButton>
+    );
+  };
+
+  /**
+   * Renders the button that navigates to the time slider panel for the current layer, when applicable.
+   */
+  const renderTimeSliderButton = (): JSX.Element | null => {
+    // Check if layer is in time slider
+    const isLayerInTimeSlider = !!timeSliderLayer;
+    const isDisabled = layerHidden || parentHidden;
+
+    // Button to navigate to Time Slider panel and select this layer
+    // Hidden in WCAG mode - keyboard users can Tab to Time Slider Panel instead
+    // TODO: WCAG - Consider showing button in WCAG mode (requires re-working WCAG UX)
+    if (isLayerInTimeSlider && !isFocusTrap) {
+      return (
+        <IconButton
+          className="buttonOutline"
+          onClick={handleTimeSliderNavigate}
+          aria-label={t('layers.selectLayerAndScrollTimeSlider')}
+          aria-disabled={isDisabled} // WCAG - used instead of disabled to allow button to be discoverable by screen readers
+        >
+          <TimeSliderIcon color={isDisabled ? 'disabled' : 'inherit'} />
+        </IconButton>
+      );
+    }
+    return null;
+  };
+
+  /**
+   * Renders the highlight toggle button for layers that support highlighting.
+   */
+  const renderHighlightButton = (): JSX.Element | null => {
+    if (isLayerHighlightCapable)
+      return (
+        <IconButton
+          onClick={handleHighlightLayer}
+          className="buttonOutline"
+          aria-label={t('legend.highlightLayer')}
+          aria-disabled={layerHidden} // WCAG - used instead of disabled to allow button to be discoverable by screen readers
+          aria-pressed={highlightedLayer === layerPath}
+        >
+          {highlightedLayer === layerPath ? <HighlightIcon /> : <HighlightOutlinedIcon />}
+        </IconButton>
+      );
+    return null;
+  };
+
+  /**
+   * Renders the zoom-to-extent button for layers that support it.
+   */
+  const renderZoomButton = (): JSX.Element | null => {
+    if (isLayerZoomToExtentCapable)
+      return (
+        <IconButton
+          onClick={handleZoomTo}
+          className="buttonOutline"
+          aria-disabled={isZoomDisabled} // WCAG - used instead of disabled to allow button to be discoverable by screen readers
+          aria-label={t('legend.zoomTo')}
+        >
+          <ZoomInSearchIcon />
+        </IconButton>
+      );
+    return null;
+  };
+
+  /**
+   * Renders the delete/undo button when the layer is configured as removable.
+   */
+  const renderDeleteButton = (): JSX.Element | null => {
+    // Only render delete button if layer is removable (controls.remove must be explicitly true)
+    const isRemovable = layerControls?.remove ?? false;
+    if (!isRemovable) return null;
+
+    return (
+      <DeleteUndoButton
+        key={`delete-undo-${layerPath}`}
+        layerPath={layerPath}
+        layerRemovable={isRemovable}
+        focusTargetIdAfterDelete={`${mapId}-${containerType}-${TABS.LAYERS}-panel-close-btn`}
+      />
+    );
+  };
+
+  /**
+   * Renders the settings button, toggling between opening the settings view and returning to details.
+   */
+  const renderSettingsButton = (): JSX.Element | null => {
+    const hasInteraction = layerControls?.hover || layerControls?.query;
+    if (!availableSettings?.length && !hasInteraction && !hasText && !swiperInteractive) return null;
+
+    if (activeView === 'settings') {
+      return (
+        <IconButton
+          iconRef={settingsButtonRef}
+          className="buttonOutline"
+          onClick={handleSettingsBackToDetails}
+          tooltipPlacement="bottom"
+          aria-label={t('layers.settings.back')}
+        >
+          <ArrowBackIcon />
+        </IconButton>
+      );
+    }
+
+    return (
+      <IconButton
+        iconRef={settingsButtonRef}
+        className="buttonOutline"
+        onClick={handleOpenSettings}
+        tooltipPlacement="bottom"
+        aria-label={t('layers.settings.title')}
+      >
+        <SettingsIcon />
+      </IconButton>
+    );
+  };
+
+  /**
+   * Renders the info button, toggling between opening the info view and returning to details.
+   */
+  const renderInfoButton = (): JSX.Element => {
+    if (activeView === 'info') {
+      return (
+        <IconButton
+          iconRef={infoButtonRef}
+          className="buttonOutline"
+          onClick={handleInfoBackToDetails}
+          tooltipPlacement="bottom"
+          aria-label={t('layers.settings.back')}
+        >
+          <ArrowBackIcon />
+        </IconButton>
+      );
+    }
+
+    return (
+      <IconButton
+        iconRef={infoButtonRef}
+        className="buttonOutline"
+        onClick={handleOpenInfo}
+        tooltipPlacement="bottom"
+        aria-label={t('layers.moreInfo')}
+      >
+        <InfoOutlinedIcon />
+      </IconButton>
+    );
+  };
+
+  /**
+   * Renders the group of layer action buttons (details, time slider, highlight, zoom, delete, etc.).
+   */
+  const renderLayerButtons = (): JSX.Element => {
+    const hasDataTable = datatableSettings[layerPath];
+    const detailsButton = hasDataTable ? renderDetailsButton() : null;
+    const timeSliderButton = renderTimeSliderButton();
+    const deleteButton = renderDeleteButton();
+    const showDivider = detailsButton !== null || timeSliderButton !== null;
+
+    return (
+      <Box role="group" sx={sxClasses.layerButtonsGroup} aria-label={t('layers.layerControls')}>
+        {detailsButton}
+        {timeSliderButton}
+        {showDivider && <Box sx={sxClasses.verticalDivider} />}
+        <IconButton className="buttonOutline" onClick={handleResetLayer} aria-label={t('legend.resetLayer')}>
+          <RestartAltIcon />
+        </IconButton>
+        {renderHighlightButton()}
+        {renderZoomButton()}
+        {deleteButton && <Box sx={sxClasses.verticalDivider} />}
+        {deleteButton}
+      </Box>
+    );
+  };
+
+  /**
+   * Computes the subtitle shown under the layer name, reflecting hidden state, sublayer count, or visible item count.
+   */
+  const subTitle: string | null = ((): string | null => {
+    if (parentHidden) return t('layers.parentHidden');
+    if (!layerVisible) return t('layers.hidden');
+    if (layerChildPaths && layerChildPaths.length > 0) {
+      return t('legend.subLayersCount', { count: layerChildPaths.length });
+    }
+    const count = layerItems?.filter((d) => d.isVisible !== false).length ?? 0;
+    const totalCount = layerItems?.length ?? 0;
+
+    if (totalCount <= 1) {
+      return null;
+    }
+    return t('legend.itemsCount', { count, totalCount });
+  })();
+
+  // TODO: WCAG Issue #3116 - Consider using CSS rather than Divider for cleaner HTML structure
+  // Render
+  return (
+    <Paper sx={sxClasses.layerDetails}>
+      <Box sx={sxClasses.headerRow}>
+        <Box sx={sxClasses.headerTitleContainer}>
+          <Typography component="h2" sx={[sxClasses.categoryTitle, layerHidden && hiddenStyle] as SxProps} title={layerName}>
+            {layerName}
+          </Typography>
+          {subTitle && <Typography sx={[sxClasses.subTitle, layerHidden && hiddenStyle] as SxProps}>{subTitle}</Typography>}
+        </Box>
+        {renderSettingsButton()}
+        {renderInfoButton()}
+      </Box>
+
+      {/* Sequential crossfade: fade out → swap content → fade in */}
+      <Fade in={contentVisible} timeout={TIMEOUT.fadingPanelDuration}>
+        <Box>
+          {activeView === TABS.DETAILS && (
+            <>
+              {renderLayerButtons()}
+              <Box sx={sxClasses.toggleRow}>
+                {layerItems && layerItems.length > 1 && renderHeaderCheckbox()}
+                {layerChildPaths && layerChildPaths.length > 0 && (
+                  <FormControlLabel
+                    control={
+                      <Checkbox color="primary" checked={allSublayersVisible} onChange={handleToggleAllVisibility} disabled={layerHidden} />
+                    }
+                    label={
+                      <Box component="span" sx={[sxClasses.boldLabel, layerHidden && hiddenStyle] as SxProps}>
+                        {t('layers.toggleSublayersVisibility')}
+                      </Box>
+                    }
+                    sx={sxClasses.formControlLabel}
+                  />
+                )}
+                {layerControls?.opacity !== false && <LayerOpacityControl layerPath={layerPath} />}
+              </Box>
+              <Divider sx={sxClasses.sectionDivider} variant="middle" />
+              {renderWMSImage()}
+              <Box>
+                {renderItems()}
+                {layerChildPaths && layerChildPaths.length > 0 && (
+                  <List>
+                    {layerChildPaths.map((childPath) => (
+                      <Sublayer key={childPath} layerPath={childPath} />
+                    ))}
+                  </List>
+                )}
+              </Box>
+              <Divider sx={sxClasses.sectionDivider} variant="middle" />
+              {layerAttribution &&
+                layerAttribution.map((attribution) => {
+                  if (attribution) {
+                    return (
+                      <Typography sx={sxClasses.attributionText} key={attribution}>
+                        {attribution.indexOf('©') === -1 ? `© ${attribution}` : attribution}
+                      </Typography>
+                    );
+                  }
+                  return null;
+                })}
+            </>
+          )}
+          {activeView === 'settings' && <LayerSettingsPanel layerPath={layerPath} />}
+          {activeView === 'info' && <LayerInfoPanel layerPath={layerPath} />}
+        </Box>
+      </Fade>
+    </Paper>
+  );
+}

@@ -1,0 +1,503 @@
+import type { Extent } from 'ol/extent';
+
+import type {
+  ConfigClassOrType,
+  TypeGeoviewLayerConfig,
+  TypeMetadataWMSCapabilities,
+  TypeMetadataWMSCapabilityLayer,
+  TypeMetadataWMSCapabilityLayerStyle,
+  TypeOfServer,
+  TypeSourceImageWmsInitialConfig,
+} from '@/api/types/layer-schema-types';
+import type { DisplayDateMode } from '@/api/types/map-schema-types';
+import { CONST_LAYER_ENTRY_TYPES, CONST_LAYER_TYPES } from '@/api/types/layer-schema-types';
+import type { OgcWfsLayerEntryConfig } from '@/api/config/validation-classes/vector-validation-classes/wfs-layer-entry-config';
+import type { AbstractBaseLayerEntryConfigProps } from '@/api/config/validation-classes/abstract-base-layer-entry-config';
+import { AbstractBaseLayerEntryConfig } from '@/api/config/validation-classes/abstract-base-layer-entry-config';
+import { WMS, type TypeWMSLayerConfig } from '@/geo/layer/geoview-layers/raster/wms';
+import { normalizeDatacubeAccessPath, sortByNameDefaultFirst } from '@/core/utils/utilities';
+import { Projection } from '@/geo/utils/projection';
+import { WFS } from '@/geo/layer/geoview-layers/vector/wfs';
+import { ServicesManagement } from '@/geo/utils/services-management';
+
+export interface OgcWmsLayerEntryConfigProps extends AbstractBaseLayerEntryConfigProps {
+  /** Source settings to apply to the GeoView layer source at creation time. */
+  source?: TypeSourceImageWmsInitialConfig;
+}
+
+/** Type used to define a GeoView image layer to display on the map. */
+export class OgcWmsLayerEntryConfig extends AbstractBaseLayerEntryConfig {
+  /** The associated WFS layer config, if any */
+  #wfsLayerConfig?: OgcWfsLayerEntryConfig;
+
+  /** The supported styles */
+  #styles: string[] | undefined;
+
+  /** Indicates whether the WMS layer was added as part of a group initially in the config */
+  #addedViaGroup = false;
+
+  /**
+   * Creates an instance of OgcWmsLayerEntryConfig.
+   *
+   * @param layerConfig - The layer configuration we want to instantiate
+   */
+  constructor(layerConfig: OgcWmsLayerEntryConfigProps) {
+    super(layerConfig, CONST_LAYER_TYPES.WMS, CONST_LAYER_ENTRY_TYPES.RASTER_IMAGE);
+
+    // Normalize the access paths
+    this.#normalizeMetadataAndDataAccessPaths();
+
+    // Get the wms Style if any
+    const { wmsStyle } = this.getSource();
+
+    // If any wms styles in the config
+    if (wmsStyle) {
+      // If an array
+      if (Array.isArray(wmsStyle)) {
+        this.#styles = wmsStyle;
+      } else {
+        this.#styles = [wmsStyle];
+      }
+    }
+  }
+
+  // #region OVERRIDES
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer configuration specific to this layer
+   */
+  override getGeoviewLayerConfig(): TypeWMSLayerConfig {
+    return super.getGeoviewLayerConfig() as TypeWMSLayerConfig;
+  }
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed source configuration specific to this layer entry config
+   */
+  override getSource(): TypeSourceImageWmsInitialConfig {
+    return super.getSource();
+  }
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed service metadata specific to this layer entry config
+   */
+  override getServiceMetadata(): TypeMetadataWMSCapabilities | undefined {
+    return super.getServiceMetadata() as TypeMetadataWMSCapabilities | undefined;
+  }
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer metadata specific to this layer entry config
+   */
+  override getLayerMetadata(): TypeMetadataWMSCapabilityLayer | undefined {
+    return super.getLayerMetadata() as TypeMetadataWMSCapabilityLayer | undefined;
+  }
+
+  /**
+   * Retrieves the attributions associated with the layer.
+   *
+   * If attributions are not yet cached, this method attempts
+   * to read them from the layer's metadata (via the `Attribution.Title` property)
+   * and sets them accordingly. Once set, the attributions are cached in the layer.
+   *
+   * @returns The list of layer attributions, or `undefined` if none are available
+   */
+  override getAttributions(): string[] | undefined {
+    // If no attributions defined
+    if (!super.getAttributions()) {
+      // Read attributions in the metadata
+      const attribution = this.getLayerMetadata()?.Attribution?.Title;
+
+      // If any
+      if (attribution) {
+        // Set it
+        super.setAttributions([attribution]);
+      }
+    }
+
+    // Return it
+    return super.getAttributions();
+  }
+
+  /**
+   * Refreshes the layer metadata information by re-fetching the WMS GetCapabilities response and updating the layer configuration accordingly.
+   *
+   * This method is typically used when the display date mode changes, as the metadata may contain time-sensitive information that needs to be updated on-the-fly.
+   *
+   * @param displayDateMode - The display date mode that should be used
+   * @returns A promise that resolves when the metadata refresh operation has completed
+   * @throws {RequestTimeoutError} When the request exceeds the timeout duration
+   * @throws {ResponseEmptyError} When the capabilities response is empty
+   * @throws {NetworkError} When a network issue happened
+   */
+  override async onRefreshMetadata(displayDateMode: DisplayDateMode): Promise<void> {
+    // Refetch the metadata again with the new date mode and update the config
+    const fetchResult = await WMS.fetchMetadataWMSForLayer(this.getMetadataAccessPath()!, this.getProxyUrl(), this.layerId);
+
+    // Read the capabilities
+    const layerCapabilities = WMS.findLayerMetadataInCapability(this.layerId, fetchResult.data.Capability.Layer);
+
+    // Init the layer metadata
+    await WMS.initLayerMetadata(this, layerCapabilities, this.getAddedViaAGroup(), displayDateMode);
+  }
+
+  // #endregion OVERRIDES
+
+  // #region METHODS
+
+  /**
+   * Gets the version.
+   *
+   * @returns The service version as read from the metadata attribute
+   */
+  getVersion(): string | undefined {
+    // Read the version from the metadata information
+    return this.getServiceMetadata()?.version;
+  }
+
+  /**
+   * Gets the version and defaults to 1.1.0 when couldn't be determined as it's the most stable in testing.
+   *
+   * @returns The service version as read from the metadata attribute, or '1.1.0' if not available
+   */
+  getVersionOrDefault(): string {
+    // Redirect
+    return this.getVersion() ?? '1.1.0';
+  }
+
+  /**
+   * Gets the server type as read from the config or as read from the service GetCapabilities metadata response.
+   *
+   * @returns The type of server, or undefined if it could not be determined
+   */
+  getServerType(): TypeOfServer | undefined {
+    // Return the serverType as specified in the config if any or the serverType as read from the metadata (config > metadata)
+    return this.getSource().serverType || this.getServiceMetadata()?.serverType;
+  }
+
+  /**
+   * Returns a list of supported CRS (Coordinate Reference System) identifiers
+   * from the WMS service metadata.
+   *
+   * @returns An array of supported CRS identifiers (e.g., 'EPSG:3857')
+   */
+  getSupportedCRSs(): string[] {
+    return this.getServiceMetadata()?.Capability.Layer.CRS ?? [];
+  }
+
+  /**
+   * Gets if the config has specified that we should fetch the vectorial information from the WFS.
+   *
+   * @returns True when the vector information should be fetched from the WFS. True by default
+   */
+  getShouldFetchVectorInformationFromWFS(): boolean {
+    return this.getGeoviewLayerConfig().fetchVectorsOnWFS ?? true; // default: true
+  }
+
+  /**
+   * Gets if the service supports 'GetStyles' requests.
+   *
+   * @returns True when the service supports GetStyles requests
+   */
+  getSupportsGetStyles(): boolean {
+    return (
+      !!this.getServiceMetadata()?.Capability.Request['qgs:GetStyles'] || !!this.getServiceMetadata()?.Capability.Request['ms:GetStyles']
+    );
+  }
+
+  /**
+   * Retrieves the list of style names available for this layer.
+   *
+   * If styles are not yet cached, the method reads them from the layer metadata
+   * and initializes the internal style list. The styles correspond to named
+   * style definitions advertised by the WMS service (from the `Style` section of the metadata).
+   *
+   * @returns The list of available style names, or `undefined` if none are defined
+   */
+  getStyles(): string[] | undefined {
+    // If no styles defined
+    if (!this.#styles) {
+      // Read styles from the metadata
+      const styles = this.getStylesMetadata();
+
+      // Update internal styles list
+      if (styles?.length || 0 > 1) {
+        this.#styles = styles!.map((style) => style.Name);
+      }
+    }
+
+    // Return them
+    return this.#styles;
+  }
+
+  /**
+   * Retrieves the full style metadata objects available for this layer.
+   *
+   * Returns the complete `TypeMetadataWMSCapabilityLayerStyle` objects from the layer metadata,
+   * which include style names, legend URLs, and other style-related information.
+   *
+   * @returns The list of available style metadata objects, or `undefined` if none are defined
+   */
+  getStylesMetadata(): TypeMetadataWMSCapabilityLayerStyle[] | undefined {
+    const styles = this.getLayerMetadata()?.Style;
+    if (!styles) return undefined;
+
+    // Sort by the style names and return
+    return sortByNameDefaultFirst(styles, (style) => style.Name);
+  }
+
+  /**
+   * Determines the style to apply for this layer.
+   *
+   * Retrieves the list of available styles from the layer config/metadata and returns
+   * the first available one as the default style to use. If no styles are defined,
+   * the method returns `undefined`.
+   *
+   * @returns The name of the style to use, or `undefined` if no styles are available
+   */
+  getStyleToUse(): string | undefined {
+    // Redirect
+    const styles = this.getStyles();
+    if (styles && styles.length > 0) {
+      // Prioritize a layer style named default if any
+      const defaultStyleIndex = styles.findIndex((style) => style.toLowerCase() === 'default');
+      if (defaultStyleIndex !== -1) {
+        return styles[defaultStyleIndex];
+      }
+
+      // Return the first one
+      return styles[0];
+    }
+
+    // None
+    return undefined;
+  }
+
+  /**
+   * Retrieves the legend image URL associated with the current WMS layer style.
+   *
+   * Determines which style to use in the following order of priority:
+   * 1. The explicitly provided `chosenStyle` parameter.
+   * 2. The layer's configured `source.wmsStyle` value.
+   * 3. The style named `"default"`, if available.
+   * 4. The first available style in the metadata.
+   * Once the target style is identified, the method searches its `LegendURL` entries
+   * for one in `"image/png"` format and returns the corresponding `OnlineResource` URL.
+   *
+   * @param chosenStyle - Optional style name to prioritize
+   * @returns The legend image URL if found; otherwise `undefined`
+   */
+  getLegendUrl(chosenStyle?: string): string | undefined {
+    // Get the capabilities metadata from the layer config
+    const layerCapabilities = this.getLayerMetadata();
+    const styles = layerCapabilities?.Style;
+
+    // Return early if there are no styles defined
+    if (!Array.isArray(styles)) return undefined;
+
+    // Check whether a style named 'default' exists
+    const hasDefaultStyle = styles.some((style) => style.Name === 'default');
+
+    let selectedStyle: TypeMetadataWMSCapabilityLayerStyle | undefined;
+
+    if (chosenStyle) {
+      // Use explicitly chosen style if provided
+      selectedStyle = styles.find((style) => style.Name === chosenStyle);
+    } else if (typeof this.getSource()?.wmsStyle === 'string') {
+      // If source.wmsStyle is defined and not an array, use that
+      selectedStyle = styles.find((style) => style.Name === this.getSource().wmsStyle);
+    } else {
+      // No chosen style; prefer 'default' if available, else use the first style
+      selectedStyle = hasDefaultStyle ? styles.find((style) => style.Name === 'default') : styles[0];
+    }
+
+    // Look for a legend URL in the selected style, preferring PNG format
+    return selectedStyle?.LegendURL?.find((url) => url.Format === 'image/png')?.OnlineResource?.['@attributes']?.['xlink:href'];
+  }
+
+  /**
+   * Gets the bounds as defined in the metadata, favoring the ones in the given projection or returning the first one found.
+   *
+   * @param projection - The projection to favor when looking for the bounds inside the metadata
+   * @returns The projection and its extent as provided by the metadata, or undefined if not found
+   */
+  getBoundsExtent(projection: string): [string, Extent] | undefined {
+    // Get the bounding boxes in the metadata
+    const boundingBoxes = this.getServiceMetadata()?.Capability.Layer.BoundingBox;
+
+    // If found any
+    if (boundingBoxes) {
+      // Find the one with the right projection
+      for (let i = 0; i < boundingBoxes.length; i++) {
+        // Read the extent info from the GetCap
+        const { CRS, extent } = boundingBoxes[i]['@attributes'];
+
+        // If it's the crs we want
+        if (CRS === projection) {
+          const extentSafe: Extent = Projection.readExtentCarefully(CRS, extent!);
+          return [CRS, extentSafe];
+        }
+      }
+
+      // At this point, none could be found. If there's any to go with, we try our best...
+      if (boundingBoxes.length > 0) {
+        // Take the first one and return the bounds and projection
+        const { CRS, extent } = boundingBoxes[0]['@attributes'];
+        const extentSafe: Extent = Projection.readExtentCarefully(CRS, extent!);
+        return [CRS, extentSafe];
+      }
+    }
+
+    // Really not found
+    return undefined;
+  }
+
+  /**
+   * Gets the WFS styles layer id associated with this WMS layer entry config, defaults on the same layer id as the WMS.
+   *
+   * @returns The WFS styles layer id
+   */
+  getWfsLayerId(): string {
+    return this.layerEntryProps.wfsLayerId || this.layerId;
+  }
+
+  /**
+   * Sets the WFS layer ID associated with this WMS layer entry configuration.
+   *
+   * @param wfsLayerId - The WFS layer ID to set for this WMS layer entry configuration
+   */
+  setWfsLayerId(wfsLayerId: string): void {
+    this.layerEntryProps.wfsLayerId = wfsLayerId;
+  }
+
+  /**
+   * Gets the associated WFS layer configuration for this WMS layer.
+   *
+   * @returns The WFS layer configuration instance associated with this WMS layer, or `undefined` if no association exists
+   */
+  getWfsLayerConfig(): OgcWfsLayerEntryConfig | undefined {
+    return this.#wfsLayerConfig;
+  }
+
+  /**
+   * Associates a WFS layer configuration with this WMS layer.
+   *
+   * @param layerConfig - The WFS layer configuration to associate
+   */
+  setWfsLayerConfig(layerConfig: OgcWfsLayerEntryConfig): void {
+    this.#wfsLayerConfig = layerConfig;
+  }
+
+  /**
+   * Gets whether the WMS layer was added as part of a group in the config.
+   *
+   * @returns True when the layer was added as part of a group
+   */
+  getAddedViaAGroup(): boolean {
+    return this.#addedViaGroup;
+  }
+
+  /**
+   * Sets whether the WMS layer was added as part of a group in the config.
+   *
+   * @param addedViaGroup - True when the layer was added as part of a group
+   */
+  setAddedViaGroup(addedViaGroup: boolean): void {
+    this.#addedViaGroup = addedViaGroup;
+  }
+
+  /**
+   * Asynchronously creates and returns a GeoView WFS layer configuration based on the current WMS configuration.
+   *
+   * This method builds a WFS (Web Feature Service) layer configuration by:
+   * 1. Retrieving the metadata access path from the current layer configuration.
+   * 2. Using `WFS.processGeoviewLayerConfig` to generate WFS layer configurations.
+   * 3. Modifying each generated entry to include the current WMS layer ID.
+   * 4. Returning the first generated WFS layer configuration.
+   *
+   * @param configProxyUrl - Proxy URL to use when necessary
+   * @returns A promise that resolves with the first generated WFS layer entry configuration
+   */
+  async createGeoviewLayerConfigWfs(configProxyUrl: string | undefined): Promise<OgcWfsLayerEntryConfig> {
+    // The base url
+    let url = this.getMetadataAccessPath()!;
+
+    // Tweak url when switching from WMS to WFS
+    url = ServicesManagement.checkUrlSwitchWMSToWFS(url);
+
+    // Initializes a WFS layer config
+    const layerConfigs = await WFS.processGeoviewLayerConfig(
+      WMS.INTERNAL_WFS_FOR_WMS_GEOVIEW_LAYER_ID,
+      `Temporary WFS layer config for the WMS layer '${this.getLayerNameCascade()}'`,
+      url,
+      configProxyUrl,
+      [{ id: this.getWfsLayerId(), wmsLayerId: this.layerId }],
+      false,
+      'all',
+      false // Don't fetch styles from the WMS, we already are working with the WMS, we only want the vector information, prevents a "loop"
+    );
+
+    // Get the first layer config
+    return layerConfigs[0] as OgcWfsLayerEntryConfig;
+  }
+
+  /**
+   * Normalizes both the metadata and data access paths by replacing legacy wrapper segments in the URL.
+   *
+   * Specifically, this method replaces `wrapper/ramp/ogc` with `ows` in the metadata access path,
+   * then applies the normalized value to both the metadata and data access paths.
+   * This ensures consistency between the two paths and supports updated endpoint structures.
+   *
+   * @throws {LayerDataAccessPathMandatoryError} When the Data Access Path was undefined, likely because initDataAccessPath wasn't called
+   */
+  #normalizeMetadataAndDataAccessPaths(): void {
+    // Get the metadata access path
+    let metadataAccessPath = this.getMetadataAccessPath()!;
+
+    // Normalize it - datacube specific normalization
+    metadataAccessPath = normalizeDatacubeAccessPath(metadataAccessPath);
+
+    // Set the normalized url in the metadata access path
+    this.setMetadataAccessPath(metadataAccessPath);
+
+    // Get the data access path
+    let dataAccessPath = this.getDataAccessPath();
+
+    // If any, normalize it as well in case the provided one also needed to be normalized
+    if (dataAccessPath) {
+      // Normalize it - datacube specific normalization
+      dataAccessPath = normalizeDatacubeAccessPath(dataAccessPath);
+    } else {
+      // No data access path was provided, use the newly normalized metadata access path
+      dataAccessPath = metadataAccessPath;
+    }
+
+    // Save the normalized url in the data access path
+    this.setDataAccessPath(dataAccessPath);
+  }
+
+  // #endregion METHODS
+
+  // #region STATIC METHODS
+
+  /**
+   * Type guard that checks whether the given configuration (class instance or plain object) represents a WMS layer type.
+   *
+   * Supports `ConfigClassOrType` (class instance or plain object) and plain layer config objects (`TypeGeoviewLayerConfig`).
+   *
+   * @param layerConfig - The layer config to check. Can be an instance of a config class or a raw config object
+   * @returns `true` if the config is for a WMS layer; otherwise `false`
+   */
+  static isClassOrTypeWMS(layerConfig: ConfigClassOrType | TypeGeoviewLayerConfig): layerConfig is TypeWMSLayerConfig {
+    // Redirect
+    return this.isClassOrTypeSchemaTag(layerConfig, CONST_LAYER_TYPES.WMS);
+  }
+
+  // #endregion STATIC METHODS
+}

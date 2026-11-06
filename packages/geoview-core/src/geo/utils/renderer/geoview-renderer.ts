@@ -1,0 +1,3353 @@
+import { asArray, asString } from 'ol/color';
+import { Style, Stroke, Fill, RegularShape, Circle as StyleCircle, Icon as StyleIcon, Circle } from 'ol/style';
+import type { Geometry } from 'ol/geom';
+import { LineString, Point, Polygon, GeometryCollection } from 'ol/geom';
+import type { Options as IconOptions } from 'ol/style/Icon';
+import Icon from 'ol/style/Icon';
+import type { Options as CircleOptions } from 'ol/style/Circle';
+import type { Options as RegularShapeOptions } from 'ol/style/RegularShape';
+import type { Options as StrokeOptions } from 'ol/style/Stroke';
+import type { Options as FillOptions } from 'ol/style/Fill';
+import type { FeatureLike } from 'ol/Feature';
+import type Feature from 'ol/Feature';
+import { toContext } from 'ol/render';
+
+import { setAlphaColor } from '@/core/utils/utilities';
+import { NotSupportedError } from '@/core/exceptions/core-exceptions';
+import { DateMgt } from '@/core/utils/date-mgt';
+import type {
+  TypeLayerStyleConfigType,
+  TypeFillStyle,
+  TypePolygonVectorConfig,
+  TypeIconSymbolVectorConfig,
+  TypeLineStyle,
+  TypeLineStringVectorConfig,
+  TypeSimpleSymbolVectorConfig,
+  TypeSymbol,
+  TypeKindOfVectorSettings,
+  TypeStyleGeometry,
+  TypeLayerStyleSettings,
+  TypeLayerStyleConfig,
+  TypeLayerStyleConfigInfo,
+  TypeLayerStyleValueCondition,
+  TypeLayerStyleVisualVariable,
+  TypeAliasLookup,
+  codedValueType,
+  TypeOutfields,
+} from '@/api/types/map-schema-types';
+import {
+  isFilledPolygonVectorConfig,
+  isIconSymbolVectorConfig,
+  isLineStringVectorConfig,
+  isSimpleSymbolVectorConfig,
+} from '@/api/types/map-schema-types';
+import type { TypeLayerMetadataFields, TypeVectorLayerStyles } from '@/api/types/layer-schema-types';
+import type { FillPatternLine, FillPatternSettings, FilterNodeType } from './geoview-renderer-types';
+import { binaryKeywords, defaultColor, groupKeywords, NodeType, operatorPriority, unaryKeywords } from './geoview-renderer-types';
+import { logger } from '@/core/utils/logger';
+
+type TypeStyleProcessor = (
+  styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
+  feature?: Feature,
+  options?: TypeStyleProcessorOptions
+) => Style | undefined;
+
+type TypeEsriLegendItem = {
+  label: string;
+  contentType: string;
+  imageData: string;
+  width: number;
+  height: number;
+};
+
+/**
+ * Options object for processing styles with optional parameters
+ */
+export type TypeStyleProcessorOptions = {
+  filterEquation?: FilterNodeType[];
+
+  /** Indicates if we want to return the symbol even if the symbol visibility is false */
+  bypassVisibility?: boolean;
+
+  domainsLookup?: TypeLayerMetadataFields[];
+  aliasLookup?: TypeAliasLookup;
+  visualVariables?: TypeLayerStyleVisualVariable[];
+};
+
+// TODO: MINOR - Create a mechanism to have one counter by map if needed with a small class who reuse the getDefaultColor static function
+let colorCount = 0;
+
+export abstract class GeoviewRenderer {
+  /** The default filter expression when all features should be included */
+  static readonly DEFAULT_FILTER_1EQUALS1: string = '(1=1)';
+
+  /** The default filter expression when no features should be included */
+  static readonly DEFAULT_FILTER_1EQUALS0: string = '(1=0)';
+
+  /** Default value of the legend canvas width when the settings do not provide one. */
+  static readonly LEGEND_CANVAS_WIDTH = 50;
+
+  /** Default value of the legend canvas height when the settings do not provide one. */
+  static readonly LEGEND_CANVAS_HEIGHT = 50;
+
+  /** Unary operators for the featureRespectsFilterEquation function */
+  static readonly #UNARY_OPERATORS = new Set(['not', 'upper', 'lower']);
+
+  /** Arcade keywords and functions allowed in expression evaluation */
+  static readonly ALLOWED_ARCADE_KEYWORDS = ['upper', 'lower', 'if', 'else', 'return'];
+
+  /**
+   * Get the default color using the default color index.
+   *
+   * @param alpha - Alpha value to associate to the color
+   * @param increment - Optional true, if we want to skip to next color
+   * @returns The current default color string
+   */
+  static getDefaultColor(alpha: number, increment = false): string {
+    // get color then increment if needed
+    const color = asString(setAlphaColor(asArray(defaultColor[colorCount]), alpha));
+    if (increment) colorCount++;
+    return color;
+  }
+
+  /**
+   * Returns the type of geometry.
+   *
+   * It removes the Multi prefix because for the geoviewRenderer, a MultiPoint has
+   * the same behaviour than a Point.
+   *
+   * @param feature - The feature to check
+   * @param defaultLayerStyle - The default layer style config to use when the feature has no geometry
+   * @returns The type of geometry (Point, LineString, Polygon)
+   */
+  static readGeometryTypeSimplifiedFromFeature(feature: FeatureLike, defaultLayerStyle: TypeLayerStyleConfig): TypeStyleGeometry {
+    // Get the geometry type
+    const geometryType = feature.getGeometry()?.getType() ?? Object.keys(defaultLayerStyle)[0];
+
+    // Return the geometry type simplified
+    return this.readGeometryTypeSimplified(geometryType as TypeStyleGeometry);
+  }
+
+  /**
+   * Returns the type of geometry.
+   *
+   * It removes the Multi prefix because for the geoviewRenderer, a MultiPoint has
+   * the same behaviour than a Point.
+   *
+   * @param geometryType - The geometry type to check
+   * @returns The type of geometry (Point, LineString, Polygon)
+   */
+  static readGeometryTypeSimplified(geometryType: TypeStyleGeometry): TypeStyleGeometry {
+    return (geometryType.startsWith('Multi') ? geometryType.slice(5) : geometryType) as TypeStyleGeometry;
+  }
+
+  /**
+   * Decodes a base64-encoded SVG string and replaces parameterized placeholders.
+   *
+   * Placeholders like `param(fill)` or `param(outline)` are replaced with actual values
+   * provided as query parameters appended to the base64 string.
+   * This is particularly useful for decoding and normalizing SVG symbols
+   * exported from QGIS, which may include dynamic styling parameters such as
+   * `fill`, `stroke`, or `outline` values.
+   * The method also applies various cleanup steps to improve SVG compatibility:
+   * - Fixes QGIS-specific attribute spacing (e.g. `"stroke="` issues)
+   * - Corrects malformed opacity or width attributes
+   * - Removes extraneous `<title>`, `<desc>`, `<defs>` tags
+   * - Removes XML headers that can cause encoding errors
+   *
+   * @param base64 - The base64-encoded SVG string, optionally including
+   *   query parameters (e.g. `"base64:...?...fill=%23ff0000&outline=%23000000"`)
+   * @returns The decoded, cleaned, and parameter-substituted SVG XML string
+   */
+  static base64ToSVGString(base64: string): string {
+    if (!base64) return base64;
+
+    // Split the parameters (e.g. ?fill=...&outline=...)
+    const [basePart, queryString] = base64.split('?');
+    const b64 = basePart.replace(/^base64:/, '');
+    let svgText = window.atob(b64);
+
+    // Decode and parse the parameters
+    const params = new URLSearchParams(queryString ?? '');
+    for (const [key, value] of params.entries()) {
+      // For example: replace param(fill) with "#000000"
+      const decodedVal = decodeURIComponent(value);
+      svgText = svgText.replace(new RegExp(`param\\(${key}\\)`, 'g'), decodedVal);
+    }
+
+    // Fix QGIS stroke property not being spaced correctly...
+    svgText = svgText.replace('"stroke=', '" stroke=');
+
+    // Fix QGIS stroke-opacity/fill-opacity having wrong values...
+    svgText = svgText.replace(/(stroke-opacity|fill-opacity|stroke-width)="([\d.]+)\s+[\d.]+"/g, '$1="$2"');
+
+    // Replace extra QGIS meta stuff
+    svgText = svgText
+      .replace(/<title>.*?<\/title>/gi, '')
+      .replace(/<desc>.*?<\/desc>/gi, '')
+      .replace(/<defs>\s*<\/defs>/gi, '')
+      .replace(/\s{2,}/g, ' ');
+
+    // Remove XML header if present (can cause EncodingError)
+    svgText = svgText.replace(/<\?xml[^>]*>\s*/i, '');
+
+    // Return final
+    return svgText.trim();
+  }
+
+  /**
+   * Encodes an SVG XML string into a base64-encoded string.
+   *
+   * This is the inverse of {@link base64ToSVGString}, allowing you to safely
+   * embed or transmit SVG data in formats where raw XML is not permitted.
+   *
+   * @param svgXML - The raw SVG XML string to encode
+   * @returns A base64-encoded representation of the SVG string
+   */
+  static SVGStringToBase64(svgXML: string): string {
+    return window.btoa(svgXML);
+  }
+
+  /**
+   * Loads the image of an icon that compose the legend.
+   *
+   * @param src - Source information (base64 image) of the image to load
+   * @returns A promise that resolves with the loaded image, or null if loading fails
+   */
+  static loadImage(src: string): Promise<HTMLImageElement | null> {
+    const promisedImage = new Promise<HTMLImageElement | null>((resolve) => {
+      const image = new Image();
+      image.src = src;
+      image
+        .decode()
+        .then(() => resolve(image))
+        .catch((error: unknown) => {
+          logger.logError('this.loadImage(src) - Error while loading the src image =', src, error);
+          resolve(null);
+        });
+    });
+    return promisedImage;
+  }
+
+  /**
+   * Loads the image of an icon that compose the legend.
+   *
+   * This is an alternate method of loadImage because the latter had some issues? See the GV comments in the callers. Refactor them together?
+   *
+   * @param src - Source information (base64 image) of the image to load
+   * @returns A promise that resolves with the loaded image, or null if loading fails
+   */
+  static loadImageFromDataUrl(src: string): Promise<HTMLImageElement> {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = (): void => {
+        resolve(image);
+      };
+      image.onerror = (error): void => {
+        reject(error);
+      };
+      image.src = src;
+    });
+  }
+
+  /**
+   * Reads a blob as a data URL.
+   *
+   * @param blob - The blob to convert
+   * @returns A promise that resolves with the data URL or null if conversion fails
+   */
+  static readBlobAsDataUrl(blob: Blob): Promise<string | null> {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onloadend = (): void => {
+        resolve(typeof reader.result === 'string' ? reader.result : null);
+      };
+      reader.onerror = (): void => {
+        resolve(null);
+      };
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  /**
+   * Creates unique-value style infos from Esri legend entries.
+   *
+   * @param legendInfo - The legend entries returned by Esri legend endpoints
+   * @param visible - Default visibility value to assign to each entry
+   * @returns The unique-value style info array
+   */
+  static createUniqueValueStyleInfoFromEsriLegend(legendInfo: TypeEsriLegendItem[], visible = true): TypeLayerStyleConfigInfo[] {
+    return legendInfo.map((info) => {
+      return {
+        label: info.label,
+        visible,
+        values: info.label.split(','),
+        settings: {
+          type: 'iconSymbol',
+          mimeType: info.contentType,
+          src: info.imageData,
+          width: info.width,
+          height: info.height,
+        },
+      };
+    });
+  }
+
+  /**
+   * Creates a point style config from Esri legend entries.
+   *
+   * @param legendInfo - The legend entries returned by Esri legend endpoints
+   * @param visible - Default visibility value to assign to each entry
+   * @returns The point style configuration for legend rendering
+   */
+  static createPointStyleConfigFromEsriLegend(legendInfo: TypeEsriLegendItem[], visible = true): TypeLayerStyleConfig {
+    return {
+      Point: {
+        type: 'uniqueValue',
+        fields: ['default'],
+        hasDefault: false,
+        info: this.createUniqueValueStyleInfoFromEsriLegend(legendInfo, visible),
+      },
+    };
+  }
+
+  // #region CREATE CANVAS
+
+  /**
+   * Creates a canvas from a loaded image.
+   *
+   * @param image - The image to draw
+   * @returns The canvas containing the drawn image
+   */
+  static createCanvasFromImage(image: HTMLImageElement): HTMLCanvasElement {
+    const drawingCanvas = document.createElement('canvas');
+    drawingCanvas.width = image.width;
+    drawingCanvas.height = image.height;
+    const drawingContext = drawingCanvas.getContext('2d', { willReadFrequently: true })!;
+    drawingContext.drawImage(image, 0, 0);
+    return drawingCanvas;
+  }
+
+  /**
+   * Creates a canvas with the image of an icon that is defined in the point style.
+   *
+   * @param pointStyle - Optional style associated to the point symbol
+   * @returns A promise that resolves with the created canvas, or null if creation fails
+   */
+  static async createIconCanvas(pointStyle?: Style): Promise<HTMLCanvasElement | null> {
+    try {
+      const iconStyle = pointStyle?.getImage() as Icon;
+      const image = await this.loadImage(iconStyle.getSrc()!);
+      if (image) {
+        const size = iconStyle.getSize();
+        const width = Array.isArray(size) ? size[0] : image.width || this.LEGEND_CANVAS_WIDTH;
+        const height = Array.isArray(size) ? size[1] : image.height || this.LEGEND_CANVAS_HEIGHT;
+        const drawingCanvas = document.createElement('canvas');
+        drawingCanvas.width = width;
+        drawingCanvas.height = height;
+        const drawingContext = drawingCanvas.getContext('2d', { willReadFrequently: true })!;
+        drawingContext.globalAlpha = iconStyle.getOpacity();
+        drawingContext.drawImage(image, 0, 0);
+        return drawingCanvas;
+      }
+      return null;
+    } catch (error: unknown) {
+      logger.logError(`Error creating incon canvas for pointStyle`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Creates a canvas with the vector point settings that are defined in the point style.
+   *
+   * @param pointStyle - Optional style associated to the point symbol
+   * @returns The created canvas
+   */
+  static createPointCanvas(pointStyle?: Style): HTMLCanvasElement {
+    const size = pointStyle?.getImage()?.getSize();
+    const [width, height] = Array.isArray(size) ? size : [this.LEGEND_CANVAS_WIDTH, this.LEGEND_CANVAS_HEIGHT];
+    const drawingCanvas = document.createElement('canvas');
+    drawingCanvas.width = width + 4;
+    drawingCanvas.height = height + 4;
+    const drawingContext = toContext(drawingCanvas.getContext('2d', { willReadFrequently: true })!);
+    if (pointStyle) drawingContext.setStyle(pointStyle);
+    drawingContext.setTransform([1, 0, 0, 1, 0, 0]);
+    drawingContext.drawGeometry(new Point([drawingCanvas.width / 2, drawingCanvas.width / 2]));
+    return drawingCanvas;
+  }
+
+  /**
+   * Creates a canvas with the lineString settings that are defined in the style.
+   *
+   * @param lineStringStyle - Optional style associated to the lineString
+   * @returns The created canvas
+   */
+  static createLineStringCanvas(lineStringStyle?: Style): HTMLCanvasElement {
+    const drawingCanvas = document.createElement('canvas');
+    drawingCanvas.width = this.LEGEND_CANVAS_WIDTH;
+    drawingCanvas.height = this.LEGEND_CANVAS_HEIGHT;
+    const context = drawingCanvas.getContext('2d', { willReadFrequently: true })!;
+    const gradient = context.createLinearGradient(0, drawingCanvas.height, drawingCanvas.width, 0);
+    gradient.addColorStop(0, '#7f7f7f');
+    gradient.addColorStop(0.667, '#ffffff');
+    gradient.addColorStop(1, '#ffffff');
+    context.fillStyle = gradient;
+    context.fillRect(0, 0, drawingCanvas.width, drawingCanvas.height);
+    const drawingContext = toContext(context);
+    drawingContext.setStyle(lineStringStyle!);
+    drawingContext.setTransform([1, 0, 0, 1, 0, 0]);
+    drawingContext.drawGeometry(
+      new LineString([
+        [4, drawingCanvas.height - 4],
+        [drawingCanvas.width - 4, 4],
+      ])
+    );
+    return drawingCanvas;
+  }
+
+  /**
+   * Creates a canvas with the polygon settings that are defined in the style.
+   *
+   * @param polygonStyle - Optional style associated to the polygon
+   * @returns The created canvas
+   */
+  static createPolygonCanvas(polygonStyle?: Style): HTMLCanvasElement {
+    const drawingCanvas = document.createElement('canvas');
+    drawingCanvas.width = this.LEGEND_CANVAS_WIDTH;
+    drawingCanvas.height = this.LEGEND_CANVAS_HEIGHT;
+    const context = drawingCanvas.getContext('2d', { willReadFrequently: true })!;
+    const gradient = context.createLinearGradient(0, drawingCanvas.height, drawingCanvas.width, 0);
+    gradient.addColorStop(0, '#7f7f7f');
+    gradient.addColorStop(0.667, '#ffffff');
+    gradient.addColorStop(1, '#ffffff');
+    context.fillStyle = gradient;
+    context.fillRect(0, 0, drawingCanvas.width, drawingCanvas.height);
+    const drawingContext = toContext(context);
+    drawingContext.setStyle(polygonStyle!);
+    drawingContext.setTransform([1, 0, 0, 1, 0, 0]);
+    drawingContext.drawGeometry(
+      new Polygon([
+        [
+          [4, 4],
+          [drawingCanvas.width - 4, 4],
+          [drawingCanvas.width - 4, drawingCanvas.height - 4],
+          [4, drawingCanvas.height - 4],
+          [4, 4],
+        ],
+      ])
+    );
+
+    context.getImageData(0, 0, drawingCanvas.width, drawingCanvas.height);
+    return drawingCanvas;
+  }
+
+  /**
+   * Creates a polygon preview canvas after loading its fill pattern image.
+   *
+   * @param polygonStyle - Optional style associated to the polygon
+   * @returns A promise that resolves with the rendered polygon canvas
+   */
+  static async createPolygonCanvasAsync(polygonStyle?: Style): Promise<HTMLCanvasElement> {
+    await polygonStyle?.getFill()?.ready();
+    return this.createPolygonCanvas(polygonStyle);
+  }
+
+  /**
+   * Creates a canvas with the GeometryCollection settings defined in the style.
+   *
+   * @param geometryCollectionStyle - Optional style associated to the GeometryCollection
+   * @returns The created canvas
+   */
+  static createGeometryCollectionCanvas(geometryCollectionStyle?: Style): HTMLCanvasElement {
+    // Create canvas
+    const drawingCanvas = document.createElement('canvas');
+    drawingCanvas.width = this.LEGEND_CANVAS_WIDTH;
+    drawingCanvas.height = this.LEGEND_CANVAS_HEIGHT;
+
+    // Create a gradient background to better see the different geometries that compose the GeometryCollection symbol
+    const context = drawingCanvas.getContext('2d', { willReadFrequently: true })!;
+    const gradient = context.createLinearGradient(0, drawingCanvas.height, drawingCanvas.width, 0);
+    gradient.addColorStop(0, '#7f7f7f');
+    gradient.addColorStop(0.667, '#ffffff');
+    gradient.addColorStop(1, '#ffffff');
+    context.fillStyle = gradient;
+    context.fillRect(0, 0, drawingCanvas.width, drawingCanvas.height);
+    const drawingContext = toContext(context);
+
+    // Get the style to use for the GeometryCollection by cloning the one provided in parameter (if any) and setting the geometry to null.
+    const styleToUse = geometryCollectionStyle ? geometryCollectionStyle.clone() : undefined;
+    if (styleToUse) styleToUse.setGeometry(null);
+    drawingContext.setStyle(styleToUse!);
+    drawingContext.setTransform([1, 0, 0, 1, 0, 0]);
+
+    // Draw a combination of geometries to represent the GeometryCollection
+    drawingContext.drawGeometry(
+      new GeometryCollection([
+        new Polygon([
+          [
+            [6, 6],
+            [drawingCanvas.width - 6, 6],
+            [drawingCanvas.width - 6, drawingCanvas.height - 6],
+            [6, drawingCanvas.height - 6],
+            [6, 6],
+          ],
+        ]),
+        new LineString([
+          [8, drawingCanvas.height - 8],
+          [drawingCanvas.width - 8, 8],
+        ]),
+        new Point([drawingCanvas.width / 2, drawingCanvas.height / 2]),
+      ])
+    );
+
+    context.getImageData(0, 0, drawingCanvas.width, drawingCanvas.height);
+    return drawingCanvas;
+  }
+
+  // #endregion CREATE CANVAS
+
+  /**
+   * Create the stroke options using the specified settings.
+   *
+   * @param settings - Settings to use for the stroke options creation
+   * @returns The stroke options created
+   */
+  static createStrokeOptions(settings: TypeSimpleSymbolVectorConfig | TypeLineStringVectorConfig | TypePolygonVectorConfig): StrokeOptions {
+    // eslint-disable-next-line no-param-reassign
+    if (settings.stroke === undefined) settings.stroke = {};
+    if (settings.stroke.color === undefined) {
+      if ('color' in settings)
+        // eslint-disable-next-line no-param-reassign
+        settings.stroke.color = asString(setAlphaColor(asArray((settings as TypeSimpleSymbolVectorConfig).color!), 1));
+      // eslint-disable-next-line no-param-reassign
+      else settings.stroke.color = this.getDefaultColor(1, true);
+    }
+
+    const strokeOptions: StrokeOptions = {
+      color: settings.stroke?.color,
+      width: settings.stroke?.width,
+      lineCap: settings.stroke?.lineCap || 'round',
+      lineJoin: settings.stroke?.lineJoin || 'bevel',
+      lineDash:
+        settings.stroke?.lineDash || this.lineDashSettings[settings.stroke?.lineStyle !== undefined ? settings.stroke?.lineStyle : 'solid'],
+    };
+    return strokeOptions;
+  }
+
+  /**
+   * Execute an operator using the nodes on the data stack.
+   *
+   * The filter equation is evaluated using a postfix notation. The result
+   * is pushed back on the data stack. If a problem is detected, an error object is thrown with an explanatory message.
+   *
+   * @param operator - Operator to execute
+   * @param dataStack - Data stack to use for the operator execution
+   */
+  static executeOperator(operator: FilterNodeType, dataStack: FilterNodeType[]): void {
+    if (operator.nodeType === NodeType.binary) {
+      if (dataStack.length < 2 || dataStack[dataStack.length - 2].nodeValue === '(')
+        throw new Error(`binary operator error - operator = '${operator.nodeValue}'`);
+      else {
+        const operand2 = dataStack.pop()!;
+        const operand1 = dataStack.pop()!;
+        let valueToPush;
+        switch (operator.nodeValue) {
+          case 'is not':
+            if (operand2.nodeValue !== null) throw new Error(`Invalid is not null operator syntax`);
+            dataStack.push({ nodeType: NodeType.variable, nodeValue: operand1.nodeValue !== null });
+            break;
+          case 'is':
+            if (operand2.nodeValue !== null) throw new Error(`Invalid is null operator syntax`);
+            dataStack.push({ nodeType: NodeType.variable, nodeValue: operand1.nodeValue === null });
+            break;
+          case '=':
+            if (operand1.nodeValue === null || operand2.nodeValue === null)
+              dataStack.push({ nodeType: NodeType.variable, nodeValue: null });
+            else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand1.nodeValue === operand2.nodeValue });
+            break;
+          case '<':
+            if (operand1.nodeValue === null || operand2.nodeValue === null)
+              dataStack.push({ nodeType: NodeType.variable, nodeValue: null });
+            else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand1.nodeValue < operand2.nodeValue });
+            break;
+          case '>':
+            if (operand1.nodeValue === null || operand2.nodeValue === null)
+              dataStack.push({ nodeType: NodeType.variable, nodeValue: null });
+            else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand1.nodeValue > operand2.nodeValue });
+            break;
+          case '<=':
+            if (operand1.nodeValue === null || operand2.nodeValue === null)
+              dataStack.push({ nodeType: NodeType.variable, nodeValue: null });
+            else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand1.nodeValue <= operand2.nodeValue });
+            break;
+          case '>=':
+            if (operand1.nodeValue === null || operand2.nodeValue === null)
+              dataStack.push({ nodeType: NodeType.variable, nodeValue: null });
+            else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand1.nodeValue >= operand2.nodeValue });
+            break;
+          case '<>':
+            if (operand1.nodeValue === null || operand2.nodeValue === null)
+              dataStack.push({ nodeType: NodeType.variable, nodeValue: null });
+            else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand1.nodeValue !== operand2.nodeValue });
+            break;
+          case 'and':
+            if (
+              (operand1.nodeValue === null && (operand2.nodeValue === null || operand2.nodeValue === true)) ||
+              (operand1.nodeValue === true && operand2.nodeValue === null)
+            )
+              dataStack.push({ nodeType: NodeType.variable, nodeValue: null });
+            else if (
+              (operand1.nodeValue === null && operand2.nodeValue === false) ||
+              (operand1.nodeValue === false && operand2.nodeValue === null)
+            )
+              dataStack.push({ nodeType: NodeType.variable, nodeValue: false });
+            else if (typeof operand1.nodeValue !== 'boolean' || typeof operand2.nodeValue !== 'boolean')
+              throw new Error(`and operator error`);
+            else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand1.nodeValue && operand2.nodeValue });
+            break;
+          case 'or':
+            if (
+              (operand1.nodeValue === null && (operand2.nodeValue === null || operand2.nodeValue === false)) ||
+              (operand1.nodeValue === false && operand2.nodeValue === null)
+            )
+              dataStack.push({ nodeType: NodeType.variable, nodeValue: null });
+            else if (
+              (operand1.nodeValue === null && operand2.nodeValue === true) ||
+              (operand1.nodeValue === true && operand2.nodeValue === null)
+            )
+              dataStack.push({ nodeType: NodeType.variable, nodeValue: true });
+            else if (typeof operand1.nodeValue !== 'boolean' || typeof operand2.nodeValue !== 'boolean')
+              throw new Error(`or operator error`);
+            else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand1.nodeValue || operand2.nodeValue });
+            break;
+          case '+':
+            if (typeof operand1.nodeValue !== 'number' || typeof operand2.nodeValue !== 'number') throw new Error(`+ operator error`);
+            else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand1.nodeValue + operand2.nodeValue });
+            break;
+          case '-':
+            if (typeof operand1.nodeValue !== 'number' || typeof operand2.nodeValue !== 'number') throw new Error(`- operator error`);
+            else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand1.nodeValue - operand2.nodeValue });
+            break;
+          case '*':
+            if (typeof operand1.nodeValue !== 'number' || typeof operand2.nodeValue !== 'number') throw new Error(`* operator error`);
+            else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand1.nodeValue * operand2.nodeValue });
+            break;
+          case '/':
+            if (typeof operand1.nodeValue !== 'number' || typeof operand2.nodeValue !== 'number') throw new Error(`/ operator error`);
+            else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand1.nodeValue / operand2.nodeValue });
+            break;
+          case '||':
+            if ((typeof operand1.nodeValue !== 'string' && operand1.nodeValue !== null) || typeof operand2.nodeValue !== 'string')
+              throw new Error(`|| operator error`);
+            else
+              dataStack.push({
+                nodeType: NodeType.variable,
+                nodeValue: operand1.nodeValue === null ? null : `${operand1.nodeValue}${operand2.nodeValue}`,
+              });
+            break;
+          case 'like': {
+            // Pattern must be a string
+            if (typeof operand2.nodeValue !== 'string') throw new Error(`like operator error`);
+
+            // SQL: NULL LIKE ... => NULL
+            if (operand1.nodeValue === null) {
+              dataStack.push({ nodeType: NodeType.variable, nodeValue: null });
+              break;
+            }
+
+            // SQL implicit cast to text
+            const value = String(operand1.nodeValue);
+            const likePattern = operand2.nodeValue;
+
+            // Escape RegExp metacharacters except SQL wildcards
+            const escapedPattern = likePattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+            // Convert SQL LIKE wildcards to RegExp equivalents
+            const regexPattern = '^' + escapedPattern.replaceAll('%', '.*').replaceAll('_', '.') + '$';
+
+            // Case-insensitive match and multiline
+            const regex = new RegExp(regexPattern, 'is');
+
+            dataStack.push({
+              nodeType: NodeType.variable,
+              nodeValue: regex.test(value),
+            });
+            break;
+          }
+          case ',':
+            valueToPush = {
+              nodeType: NodeType.variable,
+              nodeValue: Array.isArray(operand2.nodeValue)
+                ? ([operand1.nodeValue].concat(operand2.nodeValue) as string[] | number[])
+                : ([operand1.nodeValue, operand2.nodeValue] as string[] | number[]),
+            };
+            if (typeof valueToPush.nodeValue[0] !== typeof valueToPush.nodeValue[1]) throw new Error(`IN clause can't mix types`);
+            dataStack.push(valueToPush);
+            break;
+          case 'in':
+            if (Array.isArray(operand2.nodeValue))
+              dataStack.push({
+                nodeType: NodeType.variable,
+                nodeValue: operand2.nodeValue.includes(operand1.nodeValue as never),
+              });
+            else
+              dataStack.push({
+                nodeType: NodeType.variable,
+                nodeValue: operand1.nodeValue === operand2.nodeValue,
+              });
+            break;
+          default:
+            throw new Error(`unknown operator error`);
+        }
+      }
+      return;
+    }
+
+    if (operator.nodeType === NodeType.unary) {
+      if (dataStack.length < 1 || dataStack[dataStack.length - 1].nodeValue === '(') throw new Error(`unary operator error`);
+      else {
+        const operand = dataStack.pop()!;
+        switch (operator.nodeValue) {
+          case 'not':
+            if (typeof operand.nodeValue !== 'boolean') throw new Error(`not operator error`);
+            dataStack.push({ nodeType: NodeType.variable, nodeValue: !operand.nodeValue });
+            break;
+          case 'u-':
+            if (typeof operand.nodeValue !== 'number') throw new Error(`unary - operator error`);
+            dataStack.push({ nodeType: NodeType.variable, nodeValue: -operand.nodeValue });
+            break;
+          case 'u+':
+            if (typeof operand.nodeValue !== 'number') throw new Error(`unary + operator error`);
+            dataStack.push({ nodeType: NodeType.variable, nodeValue: operand.nodeValue });
+            break;
+          case 'date':
+            if (operand.nodeValue === null) dataStack.push(operand);
+            else if (typeof operand.nodeValue !== 'string') throw new Error(`DATE operator error`);
+            else {
+              operand.nodeValue = DateMgt.convertToMilliseconds(operand.nodeValue);
+              dataStack.push({
+                nodeType: NodeType.variable,
+                nodeValue: operand.nodeValue,
+              });
+            }
+            break;
+          case 'upper':
+            if (operand.nodeValue === null) dataStack.push(operand);
+            else if (typeof operand.nodeValue !== 'string') throw new Error(`UPPER operator error`);
+            else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand.nodeValue.toUpperCase() });
+            break;
+          case 'lower':
+            if (operand.nodeValue === null) dataStack.push(operand);
+            else if (typeof operand.nodeValue !== 'string') throw new Error(`LOWER operator error`);
+            else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand.nodeValue.toLowerCase() });
+            break;
+          default:
+            throw new NotSupportedError(`unknown operator error`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Evaluates whether a feature satisfies a parsed filter equation.
+   *
+   * The filter equation is expected to be in infix order and is evaluated using
+   * a stack-based (shunting-yard–style) algorithm that respects operator
+   * precedence and grouping.
+   *
+   * @param feature - The feature whose attributes are used to resolve variable nodes
+   * @param filterEquation - Optional parsed filter expression tokens
+   * @returns True if the feature satisfies the filter, false otherwise
+   * @throws {Error} When the filter expression is invalid or cannot be evaluated
+   */
+  static featureRespectsFilterEquation(feature: Feature, filterEquation?: FilterNodeType[]): boolean {
+    // No filter means the feature is visible by default
+    if (!filterEquation?.length) return true;
+
+    // Operator stack (AND, OR, =, LIKE, etc.)
+    const operators: FilterNodeType[] = [];
+
+    // Value stack (resolved variables, literals, intermediate results)
+    const values: FilterNodeType[] = [];
+
+    try {
+      for (let i = 0; i < filterEquation.length; i++) {
+        const token = filterEquation[i];
+
+        switch (token.nodeType) {
+          case NodeType.variable: {
+            // Resolve variable against feature attributes
+            const fieldValue = feature.get(token.nodeValue as string);
+
+            // Use nullish coalescing to preserve valid falsy values (0, false, '')
+            values.push({
+              nodeType: NodeType.variable,
+              nodeValue: fieldValue ?? null,
+            });
+            break;
+          }
+
+          case NodeType.string:
+          case NodeType.number:
+            // Literal values are pushed directly to the value stack
+            values.push({ ...token });
+            break;
+
+          case NodeType.group:
+            // Handle opening and closing parentheses
+            this.#frfeHandleGroupToken(token, operators, values);
+            break;
+
+          default:
+            // Validate syntax for unary operators like UPPER() and LOWER()
+            this.#frfeValidateUnarySyntax(token, filterEquation, i);
+
+            // Push operator while respecting precedence rules
+            this.#frfePushOperator(token, operators, values);
+        }
+      }
+
+      // Drain any remaining operators once all tokens are processed
+      this.#frfeDrainOperators(operators, values);
+    } catch (err) {
+      // Normalize error messages and preserve readability
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Invalid vector layer filter (${message})`);
+    }
+
+    // A valid expression must result in exactly one value on the stack
+    if (values.length !== 1 || values[0].nodeType !== NodeType.variable) {
+      throw new Error(`Invalid vector layer filter (invalid structure)`);
+    }
+
+    // Final result must be boolean; Boolean() enforces truthiness semantics
+    return Boolean(values[0].nodeValue);
+  }
+
+  /**
+   * Handles opening and closing group tokens (parentheses).
+   *
+   * Opening parenthesis is pushed onto both stacks as a marker.
+   * Closing parenthesis triggers execution of operators until the
+   * matching opening parenthesis is encountered.
+   *
+   * @param token - The group token ('(' or ')')
+   * @param operators - Operator stack
+   * @param values - Value stack
+   */
+  static #frfeHandleGroupToken(token: FilterNodeType, operators: FilterNodeType[], values: FilterNodeType[]): void {
+    if (token.nodeValue === '(') {
+      // Parentheses are control tokens only
+      operators.push(token);
+      return;
+    }
+
+    // Execute until matching '('
+    while (operators.length && operators.at(-1)?.nodeValue !== '(') {
+      this.executeOperator(operators.pop()!, values);
+    }
+
+    // Remove '(' from operator stack
+    operators.pop();
+  }
+
+  /**
+   * Pushes an operator onto the operator stack while respecting precedence.
+   *
+   * Operators with higher precedence already on the stack are executed
+   * before pushing the new operator.
+   *
+   * @param token - Operator token to push
+   * @param operators - Operator stack
+   * @param values - Value stack
+   */
+  static #frfePushOperator(token: FilterNodeType, operators: FilterNodeType[], values: FilterNodeType[]): void {
+    // Unary operators are pushed directly
+    if (this.#UNARY_OPERATORS.has(token.nodeValue as string)) {
+      operators.push(token);
+      return;
+    }
+
+    // Binary operator precedence handling
+    while (
+      operators.length &&
+      operators.at(-1)?.nodeValue !== '(' &&
+      this.#frfeGetPriority(operators.at(-1)!) > this.#frfeGetPriority(token)
+    ) {
+      this.executeOperator(operators.pop()!, values);
+    }
+
+    operators.push(token);
+  }
+
+  /**
+   * Executes all remaining operators after token processing is complete.
+   *
+   * @param operators - Operator stack
+   * @param values - Value stack
+   */
+  static #frfeDrainOperators(operators: FilterNodeType[], values: FilterNodeType[]): void {
+    while (operators.length && operators.at(-1)?.nodeValue !== '(') {
+      this.executeOperator(operators.pop()!, values);
+    }
+
+    // Remove any leftover '(' marker
+    operators.pop();
+  }
+
+  /**
+   * Validates syntax rules for unary operators such as UPPER() and LOWER().
+   *
+   * These operators must be immediately followed by an opening parenthesis.
+   *
+   * @param token - The operator token
+   * @param equation - Full filter equation token list
+   * @param index - Index of the current token
+   * @throws {Error} When the syntax is invalid
+   */
+  static #frfeValidateUnarySyntax(token: FilterNodeType, equation: FilterNodeType[], index: number): void {
+    if (
+      ['upper', 'lower'].includes(token.nodeValue as string) &&
+      (!equation[index + 1] || equation[index + 1].nodeType !== NodeType.group || equation[index + 1].nodeValue !== '(')
+    ) {
+      throw new Error(`${String(token.nodeValue).toUpperCase()} syntax error`);
+    }
+  }
+
+  /**
+   * Returns the precedence priority of an operator.
+   *
+   * Higher numbers indicate higher precedence.
+   *
+   * @param token - Operator token
+   * @returns Operator priority, or -1 if not found
+   */
+  static #frfeGetPriority(token: FilterNodeType): number {
+    return operatorPriority.find((p) => p.key === token.nodeValue)?.priority ?? -1;
+  }
+
+  // #region PROCESS RENDERER
+
+  /**
+   * Process a circle symbol using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processCircleSymbol(settings: TypeSimpleSymbolVectorConfig): Style | undefined {
+    // eslint-disable-next-line no-param-reassign
+    if (settings.color === undefined) settings.color = this.getDefaultColor(0.25, true);
+    const fillOptions: FillOptions = { color: settings.color };
+    const strokeOptions: StrokeOptions = this.createStrokeOptions(settings);
+    const circleOptions: CircleOptions = { radius: settings.size !== undefined ? settings.size : 4 };
+    circleOptions.stroke = new Stroke(strokeOptions);
+    circleOptions.fill = new Fill(fillOptions);
+    if (settings.offset !== undefined) circleOptions.displacement = settings.offset;
+    if (settings.rotation !== undefined) circleOptions.rotation = settings.rotation;
+    return new Style({
+      image: new StyleCircle(circleOptions),
+      zIndex: settings.zIndex,
+    });
+  }
+
+  /**
+   * Process a star shape symbol using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @param points - Number of points needed to create the symbol
+   * @param angle - Angle to use for the symbol creation
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processStarShapeSymbol(settings: TypeSimpleSymbolVectorConfig, points: number, angle: number): Style | undefined {
+    // eslint-disable-next-line no-param-reassign
+    if (settings.color === undefined) settings.color = this.getDefaultColor(0.25, true);
+    const fillOptions: FillOptions = { color: settings.color };
+    const strokeOptions: StrokeOptions = this.createStrokeOptions(settings);
+    const regularShapeOptions: RegularShapeOptions = {
+      radius: settings.size !== undefined ? settings.size : 6,
+      radius2: settings.size !== undefined ? settings.size / 3 : 2,
+      angle,
+      points,
+    };
+    regularShapeOptions.stroke = new Stroke(strokeOptions);
+    regularShapeOptions.fill = new Fill(fillOptions);
+    if (settings.offset !== undefined) regularShapeOptions.displacement = settings.offset;
+    if (settings.rotation !== undefined) regularShapeOptions.rotation = settings.rotation;
+    return new Style({
+      image: new RegularShape(regularShapeOptions),
+      zIndex: settings.zIndex,
+    });
+  }
+
+  /**
+   * Process a star symbol using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processStarSymbol(settings: TypeSimpleSymbolVectorConfig): Style | undefined {
+    return this.processStarShapeSymbol(settings, 5, 0);
+  }
+
+  /**
+   * Process a X symbol using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processXSymbol(settings: TypeSimpleSymbolVectorConfig): Style | undefined {
+    return this.processStarShapeSymbol(settings, 4, Math.PI / 4);
+  }
+
+  /**
+   * Process a + symbol using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processPlusSymbol(settings: TypeSimpleSymbolVectorConfig): Style | undefined {
+    return this.processStarShapeSymbol(settings, 4, 0);
+  }
+
+  /**
+   * Process a regular shape using the settings, the number of points, the angle and the scale.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @param points - Number of points needed to create the symbol
+   * @param angle - Angle to use for the symbol creation
+   * @param scale - Scale to use for the symbol creation
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processRegularShape(
+    settings: TypeSimpleSymbolVectorConfig,
+    points: number,
+    angle: number,
+    scale: [number, number]
+  ): Style | undefined {
+    // eslint-disable-next-line no-param-reassign
+    if (settings.color === undefined) settings.color = this.getDefaultColor(0.25, true);
+    const fillOptions: FillOptions = { color: settings.color };
+    const strokeOptions: StrokeOptions = this.createStrokeOptions(settings);
+    const regularShapeOptions: RegularShapeOptions = {
+      radius: settings.size !== undefined ? settings.size : 6,
+      angle,
+      scale,
+      points,
+    };
+    regularShapeOptions.stroke = new Stroke(strokeOptions);
+    regularShapeOptions.fill = new Fill(fillOptions);
+    if (settings.offset !== undefined) regularShapeOptions.displacement = settings.offset;
+    if (settings.rotation !== undefined) regularShapeOptions.rotation = settings.rotation;
+    return new Style({
+      image: new RegularShape(regularShapeOptions),
+      zIndex: settings.zIndex,
+    });
+  }
+
+  /**
+   * Process a square symbol using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processSquareSymbol(settings: TypeSimpleSymbolVectorConfig): Style | undefined {
+    return this.processRegularShape(settings, 4, Math.PI / 4, [1, 1]);
+  }
+
+  /**
+   * Process a Diamond symbol using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processDiamondSymbol(settings: TypeSimpleSymbolVectorConfig): Style | undefined {
+    return this.processRegularShape(settings, 4, 0, [0.75, 1]);
+  }
+
+  /**
+   * Process a triangle symbol using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processTriangleSymbol(settings: TypeSimpleSymbolVectorConfig): Style | undefined {
+    return this.processRegularShape(settings, 3, 0, [1, 1]);
+  }
+
+  /**
+   * Resolves a configured image source to a URL consumable by OpenLayers.
+   *
+   * @param source - Image URL or base64-encoded image data
+   * @param mimeType - MIME type used for base64-encoded image data
+   * @returns The resolved image URL
+   */
+  static #getImageSource(source: string, mimeType: string): string {
+    const trimmedSource = source.trim();
+    return /^(data:|https?:\/\/|blob:|\/)/i.test(trimmedSource) ? trimmedSource : `data:${mimeType};base64,${trimmedSource}`;
+  }
+
+  /**
+   * Process an icon symbol using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processIconSymbol(settings: TypeIconSymbolVectorConfig): Style | undefined {
+    const iconOptions: IconOptions = {};
+    iconOptions.src = this.#getImageSource(settings.src, settings.mimeType);
+    if (settings.width !== undefined && settings.height !== undefined) iconOptions.size = [settings.width, settings.height];
+    if (settings.offset !== undefined) iconOptions.offset = settings.offset;
+    if (settings.rotation !== undefined) iconOptions.rotation = settings.rotation;
+    if (settings.opacity !== undefined) iconOptions.opacity = settings.opacity;
+    if (settings.scale !== undefined) iconOptions.scale = settings.scale;
+    return new Style({
+      image: new StyleIcon(iconOptions),
+      zIndex: settings.zIndex,
+    });
+  }
+
+  /**
+   * Process a simple point symbol using the settings.
+   *
+   * Simple point symbol may be an icon or a vector symbol.
+   *
+   * @param styleSettings - Settings to use for the Style creation
+   * @param feature - Optional feature. This method does not use it, it is there to have a homogeneous signature
+   * @param options - Optional processing options
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processSimplePoint(
+    styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
+    feature?: Feature,
+    options?: TypeStyleProcessorOptions
+  ): Style | undefined {
+    // Read options
+    const { filterEquation, bypassVisibility, visualVariables } = options || {};
+
+    // If feature doesn't respect filter, no style
+    if (feature && !this.featureRespectsFilterEquation(feature, filterEquation)) return undefined;
+
+    // If the simple style info is not visible and we're not bypassing visibility, no style
+    if (!bypassVisibility && styleSettings.type === 'simple' && styleSettings.info[0]?.visible === false) return undefined;
+
+    const settings = (styleSettings.type === 'simple' ? styleSettings.info[0].settings : styleSettings) as TypeKindOfVectorSettings;
+    let style: Style | undefined;
+    if (isSimpleSymbolVectorConfig(settings)) {
+      const { symbol } = settings;
+      style = this.#processSymbol[symbol](settings);
+    } else if (isIconSymbolVectorConfig(settings)) {
+      style = this.processIconSymbol(settings);
+    }
+
+    // Apply visual variables if feature and style exist
+    const visualVarsToApply = visualVariables || ('visualVariables' in styleSettings ? styleSettings.visualVariables : undefined);
+
+    if (feature && style && visualVarsToApply) {
+      style = this.#applyVisualVariables(style, feature, visualVarsToApply);
+    }
+
+    return style;
+  }
+
+  /**
+   * Process a simple lineString using the settings.
+   *
+   * @param styleSettings - Settings to use for the Style creation
+   * @param feature - Optional feature. This method does not use it, it is there to have a homogeneous signature
+   * @param options - Optional processing options
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processSimpleLineString(
+    styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
+    feature?: Feature,
+    options?: TypeStyleProcessorOptions
+  ): Style | undefined {
+    // Read options
+    const { filterEquation, bypassVisibility, visualVariables } = options || {};
+
+    // If feature doesn't respect filter, no style
+    if (feature && !this.featureRespectsFilterEquation(feature, filterEquation)) return undefined;
+
+    // If the simple style info is not visible and we're not bypassing visibility, no style
+    if (!bypassVisibility && styleSettings.type === 'simple' && styleSettings.info[0]?.visible === false) return undefined;
+
+    const settings = (styleSettings.type === 'simple' ? styleSettings.info[0].settings : styleSettings) as TypeKindOfVectorSettings;
+    const geometry = feature?.getGeometry() as Geometry;
+
+    let style: Style | undefined;
+    if (isLineStringVectorConfig(settings)) {
+      const strokeOptions: StrokeOptions = this.createStrokeOptions(settings);
+      style = new Style({
+        stroke: new Stroke(strokeOptions),
+        geometry,
+        zIndex: settings.zIndex,
+      });
+    }
+
+    // Apply visual variables if feature and style exist
+    const visualVarsToApply = visualVariables || ('visualVariables' in styleSettings ? styleSettings.visualVariables : undefined);
+
+    if (feature && style && visualVarsToApply) {
+      style = this.#applyVisualVariables(style, feature, visualVarsToApply);
+    }
+
+    return style;
+  }
+
+  /**
+   * Process a simple solid fill (polygon) using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @param geometry - Optional geometry to associate with the style
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processSolidFill(settings: TypePolygonVectorConfig, geometry?: Geometry): Style | undefined {
+    // eslint-disable-next-line no-param-reassign
+    if (settings.color === undefined && !settings.patternImage) settings.color = this.getDefaultColor(0.25, true);
+    const fillOptions: FillOptions = {
+      color: settings.patternImage
+        ? { src: this.#getImageSource(settings.patternImage.src, settings.patternImage.mimeType) }
+        : settings.color,
+    };
+    const strokeOptions: StrokeOptions = this.createStrokeOptions(settings);
+    return new Style({
+      stroke: new Stroke(strokeOptions),
+      fill: new Fill(fillOptions),
+      geometry,
+      zIndex: settings.zIndex,
+    });
+  }
+
+  /**
+   * Process a null fill (polygon with fill opacity = 0) using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @param geometry - Optional geometry to associate with the style
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processNullFill(settings: TypePolygonVectorConfig, geometry?: Geometry): Style | undefined {
+    // eslint-disable-next-line no-param-reassign
+    if (settings.color === undefined) settings.color = this.getDefaultColor(0, true);
+    const fillOptions: FillOptions = { color: settings.color };
+    const strokeOptions: StrokeOptions = this.createStrokeOptions(settings);
+    return new Style({
+      stroke: new Stroke(strokeOptions),
+      fill: new Fill(fillOptions),
+      geometry,
+      zIndex: settings.zIndex,
+    });
+  }
+
+  /**
+   * Process a pattern fill using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @param FillPatternLines - Fill pattern lines needed to create the fill
+   * @param geometry - Optional geometry to associate with the style
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processPatternFill(
+    settings: TypePolygonVectorConfig,
+    FillPatternLines: FillPatternLine[],
+    geometry?: Geometry
+  ): Style | undefined {
+    // Depending on the pattern
+    const patternSize = settings.patternSize ?? 8;
+    const patternWidth = settings.patternWidth ?? 16;
+
+    // eslint-disable-next-line no-param-reassign
+    if (settings.color === undefined) settings.color = this.getDefaultColor(0.25, true);
+    const fillOptions: FillOptions = { color: settings.color };
+    const strokeOptions: StrokeOptions = this.createStrokeOptions(settings);
+
+    // Canvas used to create the pattern fill. It is bigger to take into account the repeating aspect of the fill.
+    const drawingCanvas = document.createElement('canvas');
+    const context = drawingCanvas.getContext('2d', { willReadFrequently: true })!;
+
+    // If fill style is a dot
+    if (settings.fillStyle === 'dot') {
+      const tileSpace = patternSize + patternWidth;
+      drawingCanvas.width = tileSpace;
+      drawingCanvas.height = tileSpace;
+
+      // Draw the dot
+      context.fillStyle = settings.color!;
+      context.beginPath();
+      context.arc(tileSpace / 2, tileSpace / 2, patternSize / 2, 0, 2 * Math.PI);
+      context.fill();
+
+      fillOptions.color = context.createPattern(drawingCanvas, 'repeat')!;
+    } else {
+      // Set the canvas width/height
+      drawingCanvas.width = patternSize * 2;
+      drawingCanvas.height = patternSize * 2;
+
+      context.strokeStyle = settings.color;
+      context.lineCap = 'round';
+      context.lineWidth = settings.patternWidth ?? 1;
+      context.beginPath();
+      for (let i = 0; i < FillPatternLines.length; i++) {
+        const { moveTo, lineTo } = FillPatternLines[i];
+        context.moveTo(moveTo[0] * patternSize, moveTo[1] * patternSize);
+        context.lineTo(lineTo[0] * patternSize, lineTo[1] * patternSize);
+      }
+      context.stroke();
+
+      // extract the sub area that will define the pattern that will repeat properly.
+      const outputCanvas = document.createElement('canvas');
+      outputCanvas.width = patternSize;
+      outputCanvas.height = patternSize;
+      const outputContext = outputCanvas.getContext('2d', { willReadFrequently: true })!;
+      outputContext.putImageData(context.getImageData(patternSize / 2, patternSize / 2, patternSize, patternSize), 0, 0);
+
+      fillOptions.color = outputContext.createPattern(outputCanvas, 'repeat');
+    }
+
+    return new Style({
+      stroke: new Stroke(strokeOptions),
+      fill: new Fill(fillOptions),
+      geometry,
+      zIndex: settings.zIndex,
+    });
+  }
+
+  /**
+   * Process a backward diagonal fill using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @param geometry - Optional geometry to associate with the style
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processBackwardDiagonalFill(settings: TypePolygonVectorConfig, geometry?: Geometry): Style | undefined {
+    return this.processPatternFill(settings, this.FillPatternSettings.backwardDiagonal, geometry);
+  }
+
+  /**
+   * Process a forward diagonal fill using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @param geometry - Optional geometry to associate with the style
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processForwardDiagonalFill(settings: TypePolygonVectorConfig, geometry?: Geometry): Style | undefined {
+    return this.processPatternFill(settings, this.FillPatternSettings.forwardDiagonal, geometry);
+  }
+
+  /**
+   * Process a cross fill using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @param geometry - Optional geometry to associate with the style
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processCrossFill(settings: TypePolygonVectorConfig, geometry?: Geometry): Style | undefined {
+    return this.processPatternFill(settings, this.FillPatternSettings.cross, geometry);
+  }
+
+  /**
+   * Process a diagonal cross fill using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @param geometry - Optional geometry to associate with the style
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processDiagonalCrossFill(settings: TypePolygonVectorConfig, geometry?: Geometry): Style | undefined {
+    return this.processPatternFill(settings, this.FillPatternSettings.diagonalCross, geometry);
+  }
+
+  /**
+   * Process a horizontal fill using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @param geometry - Optional geometry to associate with the style
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processHorizontalFill(settings: TypePolygonVectorConfig, geometry?: Geometry): Style | undefined {
+    return this.processPatternFill(settings, this.FillPatternSettings.horizontal, geometry);
+  }
+
+  /**
+   * Process a vertical fill using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @param geometry - Optional geometry to associate with the style
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processVerticalFill(settings: TypePolygonVectorConfig, geometry?: Geometry): Style | undefined {
+    return this.processPatternFill(settings, this.FillPatternSettings.vertical, geometry);
+  }
+
+  /**
+   * Process a dot fill using the settings.
+   *
+   * @param settings - Settings to use for the Style creation
+   * @param geometry - Optional geometry to associate with the style
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processDotFill(settings: TypePolygonVectorConfig, geometry?: Geometry): Style | undefined {
+    return this.processPatternFill(settings, this.FillPatternSettings.dot, geometry);
+  }
+
+  /**
+   * Process a simple polygon using the settings.
+   *
+   * @param styleSettings - Settings to use for the Style creation
+   * @param feature - Optional feature. This method does not use it, it is there to have a homogeneous signature
+   * @param options - Optional processing options
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processSimplePolygon(
+    styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
+    feature?: Feature,
+    options?: TypeStyleProcessorOptions
+  ): Style | undefined {
+    // Read options
+    const { filterEquation, bypassVisibility, visualVariables } = options || {};
+
+    // If feature doesn't respect filter, no style
+    if (feature && !this.featureRespectsFilterEquation(feature, filterEquation)) return undefined;
+
+    // If the simple style info is not visible and we're not bypassing visibility, no style
+    if (!bypassVisibility && styleSettings.type === 'simple' && styleSettings.info[0]?.visible === false) return undefined;
+
+    const settings = (styleSettings.type === 'simple' ? styleSettings.info[0].settings : styleSettings) as TypeKindOfVectorSettings;
+    const geometry = feature?.getGeometry() as Geometry;
+    const isGeometryCollection = geometry instanceof GeometryCollection;
+
+    let style: Style | undefined;
+    if (isFilledPolygonVectorConfig(settings)) {
+      const { fillStyle } = settings;
+      if (geometry !== undefined) {
+        style = this.#processFillStyle[fillStyle](settings, geometry);
+      } else {
+        style = this.#processFillStyle[fillStyle](settings);
+      }
+
+      // GeometryCollection uses polygon settings as the base symbol and derives point rendering from that same base.
+      if (style && isGeometryCollection) {
+        style.setImage(this.#createGeometryCollectionPointSymbol(settings));
+      }
+    }
+
+    // Apply visual variables if feature and style exist
+    const visualVarsToApply = visualVariables || ('visualVariables' in styleSettings ? styleSettings.visualVariables : undefined);
+
+    if (feature && style && visualVarsToApply) {
+      style = this.#applyVisualVariables(style, feature, visualVarsToApply);
+    }
+
+    return style;
+  }
+
+  /**
+   * Creates a point symbol derived from polygon settings for GeometryCollection rendering.
+   *
+   * @param settings - Polygon settings used as base
+   * @returns The point symbol used for embedded points
+   */
+  static #createGeometryCollectionPointSymbol(settings: TypePolygonVectorConfig): StyleCircle {
+    const fillColor = settings.color ?? this.getDefaultColor(0.25);
+    const strokeColor = settings.stroke?.color ?? this.getDefaultColor(1);
+    const strokeWidth = settings.stroke?.width ?? 1;
+
+    const circleOptions: CircleOptions = {
+      fill: new Fill({ color: fillColor }),
+      radius: 5,
+      stroke: new Stroke({ color: strokeColor, width: strokeWidth }),
+    };
+
+    return new StyleCircle(circleOptions);
+  }
+
+  // #endregion PROCESS RENDERER
+
+  /**
+   * Processes the array of point styles as described in the pointStyleConfig.
+   *
+   * @param layerStyles - Object that will receive the created canvas
+   * @param arrayOfPointStyleConfig - Array of point style configuration
+   * @returns A promise that resolves with the vector layer style
+   */
+  static async processArrayOfPointStyleConfig(
+    layerStyles: TypeVectorLayerStyles,
+    arrayOfPointStyleConfig: TypeLayerStyleConfigInfo[]
+  ): Promise<TypeVectorLayerStyles> {
+    try {
+      // UniqueValue or ClassBreak point style configuration
+      const styleArray: (HTMLCanvasElement | null)[] = layerStyles.Point!.arrayOfCanvas ?? [];
+      const promiseOfCanvasCreated: Promise<HTMLCanvasElement | null>[] = [];
+      for (let i = 0; i < arrayOfPointStyleConfig.length; i++) {
+        if (isIconSymbolVectorConfig(arrayOfPointStyleConfig[i].settings))
+          // Icon symbol
+          promiseOfCanvasCreated.push(this.createIconCanvas(this.processSimplePoint(arrayOfPointStyleConfig[i].settings)));
+        // Simple vector symbol
+        else
+          promiseOfCanvasCreated.push(
+            new Promise<HTMLCanvasElement | null>((resolveSimpleVectorSymbol) => {
+              resolveSimpleVectorSymbol(this.createPointCanvas(this.processSimplePoint(arrayOfPointStyleConfig[i].settings)));
+            })
+          );
+      }
+      const listOfCanvasCreated = await Promise.all(promiseOfCanvasCreated);
+      listOfCanvasCreated.forEach((canvas) => {
+        styleArray.push(canvas);
+      });
+      return layerStyles;
+    } catch (error: unknown) {
+      logger.logError('Error processing array of point styles', error);
+      return {};
+    }
+  }
+
+  /**
+   * Private sub routine used by the getLegendStyles method to gets the style of the layer as specified by the style configuration.
+   *
+   * @param defaultSettings - Optional settings associated to simple styles or default style of
+   * unique value and class break styles. When undefined, no defaultCanvas is created
+   * @param arrayOfPointStyleConfig - Optional array of point style
+   * configuration associated to unique value and class break styles. When undefined, no arrayOfCanvas is created
+   * @returns A promise that resolves with the layer styles
+   */
+  static async #getPointStyleSubRoutine(
+    defaultSettings?: TypeKindOfVectorSettings,
+    arrayOfPointStyleConfig?: TypeLayerStyleConfigInfo[]
+  ): Promise<TypeVectorLayerStyles> {
+    try {
+      const layerStyles: TypeVectorLayerStyles = { Point: {} };
+      if (defaultSettings) {
+        if (isIconSymbolVectorConfig(defaultSettings)) {
+          // Icon symbol
+          const canvas = await this.createIconCanvas(this.processSimplePoint(defaultSettings));
+          layerStyles.Point!.defaultCanvas = canvas;
+          if (arrayOfPointStyleConfig) {
+            layerStyles.Point!.arrayOfCanvas = [];
+            const processedStyles = await this.processArrayOfPointStyleConfig(layerStyles, arrayOfPointStyleConfig);
+            processedStyles.Point?.arrayOfCanvas?.pop();
+            return processedStyles;
+          }
+          return layerStyles;
+        }
+
+        // Simple vector symbol
+        layerStyles.Point!.defaultCanvas = this.createPointCanvas(this.processSimplePoint(defaultSettings));
+        if (arrayOfPointStyleConfig) {
+          layerStyles.Point!.arrayOfCanvas = [];
+          const processedStyles = await this.processArrayOfPointStyleConfig(layerStyles, arrayOfPointStyleConfig);
+          processedStyles.Point?.arrayOfCanvas?.pop();
+          return processedStyles;
+        }
+        return layerStyles;
+      }
+
+      layerStyles.Point!.arrayOfCanvas = [];
+      return await this.processArrayOfPointStyleConfig(layerStyles, arrayOfPointStyleConfig!);
+    } catch (error: unknown) {
+      logger.logError('Error getPointStyle sub routine', error);
+      return {};
+    }
+  }
+
+  /**
+   * Gets the legend styles used by the layer as specified by the style configuration.
+   *
+   * @param styleConfig - The style configuration
+   * @returns A promise that resolves with the layer styles
+   */
+  static async getLegendStyles(styleConfig: TypeLayerStyleConfig | undefined): Promise<TypeVectorLayerStyles> {
+    try {
+      if (!styleConfig) return {};
+      const legendStyles: TypeVectorLayerStyles = {};
+
+      if (styleConfig.Point) {
+        // Point style configuration
+        if (styleConfig.Point.type === 'simple') {
+          const layerStyles = await this.#getPointStyleSubRoutine(styleConfig.Point.info[0].settings);
+          legendStyles.Point = layerStyles.Point;
+        } else {
+          const defaultSettings = styleConfig.Point.hasDefault
+            ? styleConfig.Point.info[styleConfig.Point.info.length - 1].settings
+            : undefined;
+          const layerStyles = await this.#getPointStyleSubRoutine(defaultSettings, styleConfig.Point.info);
+          legendStyles.Point = layerStyles.Point;
+        }
+      }
+
+      if (styleConfig.LineString) {
+        // LineString style configuration
+        const layerStyles: TypeVectorLayerStyles = { LineString: {} };
+        if (styleConfig.LineString.type === 'simple') {
+          layerStyles.LineString!.defaultCanvas = this.createLineStringCanvas(this.processSimpleLineString(styleConfig.LineString));
+        } else {
+          if (styleConfig.LineString.hasDefault)
+            layerStyles.LineString!.defaultCanvas = this.createLineStringCanvas(
+              this.processSimpleLineString(styleConfig.LineString.info[styleConfig.LineString.info.length - 1].settings)
+            );
+          const styleArray: HTMLCanvasElement[] = [];
+          styleConfig.LineString.info.forEach((styleInfo) => {
+            styleArray.push(this.createLineStringCanvas(this.processSimpleLineString(styleInfo.settings)));
+          });
+          if (styleConfig.LineString.hasDefault) styleArray.pop();
+          layerStyles.LineString!.arrayOfCanvas = styleArray;
+        }
+        legendStyles.LineString = layerStyles.LineString;
+      }
+
+      if (styleConfig.Polygon) {
+        // Polygon style configuration
+        const layerStyles: TypeVectorLayerStyles = { Polygon: {} };
+        if (styleConfig.Polygon.type === 'simple') {
+          layerStyles.Polygon!.defaultCanvas = await this.createPolygonCanvasAsync(
+            this.processSimplePolygon(styleConfig.Polygon.info[0].settings)
+          );
+        } else {
+          if (styleConfig.Polygon.hasDefault)
+            layerStyles.Polygon!.defaultCanvas = await this.createPolygonCanvasAsync(
+              this.processSimplePolygon(styleConfig.Polygon.info[styleConfig.Polygon.info.length - 1].settings)
+            );
+
+          const styleArray = await Promise.all(
+            styleConfig.Polygon.info.map((styleInfo) => this.createPolygonCanvasAsync(this.processSimplePolygon(styleInfo.settings)))
+          );
+          if (styleConfig.Polygon.hasDefault) styleArray.pop();
+          layerStyles.Polygon!.arrayOfCanvas = styleArray;
+        }
+
+        legendStyles.Polygon = layerStyles.Polygon;
+      }
+
+      if (styleConfig.GeometryCollection) {
+        // GeometryCollection style configuration
+        const layerStyles: TypeVectorLayerStyles = { GeometryCollection: {} };
+        if (styleConfig.GeometryCollection.type === 'simple') {
+          const { settings } = styleConfig.GeometryCollection.info[0];
+          const style = this.processSimplePolygon(settings);
+          if (style && isFilledPolygonVectorConfig(settings)) style.setImage(this.#createGeometryCollectionPointSymbol(settings));
+          layerStyles.GeometryCollection!.defaultCanvas = this.createGeometryCollectionCanvas(style);
+        } else {
+          if (styleConfig.GeometryCollection.hasDefault) {
+            const defaultSettings = styleConfig.GeometryCollection.info[styleConfig.GeometryCollection.info.length - 1].settings;
+            const defaultStyle = this.processSimplePolygon(defaultSettings);
+            if (defaultStyle && isFilledPolygonVectorConfig(defaultSettings)) {
+              defaultStyle.setImage(this.#createGeometryCollectionPointSymbol(defaultSettings));
+            }
+            layerStyles.GeometryCollection!.defaultCanvas = this.createGeometryCollectionCanvas(defaultStyle);
+          }
+
+          const styleArray: HTMLCanvasElement[] = [];
+          styleConfig.GeometryCollection.info.forEach((styleInfo) => {
+            const style = this.processSimplePolygon(styleInfo.settings);
+            if (style && isFilledPolygonVectorConfig(styleInfo.settings)) {
+              style.setImage(this.#createGeometryCollectionPointSymbol(styleInfo.settings));
+            }
+            styleArray.push(this.createGeometryCollectionCanvas(style));
+          });
+          if (styleConfig.GeometryCollection.hasDefault) styleArray.pop();
+          layerStyles.GeometryCollection!.arrayOfCanvas = styleArray;
+        }
+
+        legendStyles.GeometryCollection = layerStyles.GeometryCollection;
+      }
+      return legendStyles;
+    } catch (error: unknown) {
+      logger.logError('Error getLegendStyles', error);
+      return {};
+    }
+  }
+
+  /**
+   * Create a default style to use with a vector feature that has no style configuration.
+   *
+   * @param geometryType - Type of geometry (Point, LineString, Polygon)
+   * @param label - Label for the style
+   * @returns The Style configuration created, or undefined if unable to create it
+   */
+  static createDefaultStyle(geometryType: TypeStyleGeometry, label: string): TypeLayerStyleSettings | undefined {
+    if (geometryType === 'Point') {
+      const settings: TypeSimpleSymbolVectorConfig = {
+        type: 'simpleSymbol',
+        color: this.getDefaultColor(0.25),
+        stroke: {
+          color: this.getDefaultColor(1, true),
+          lineStyle: 'solid',
+          width: 1,
+        },
+        symbol: 'circle',
+      };
+      return { type: 'simple', hasDefault: false, fields: [], info: [{ visible: true, label, settings, values: [] }] };
+    }
+    if (geometryType === 'LineString') {
+      const settings: TypeLineStringVectorConfig = {
+        type: 'lineString',
+        stroke: { color: this.getDefaultColor(1, true) },
+      };
+      return { type: 'simple', hasDefault: false, fields: [], info: [{ visible: true, label, settings, values: [] }] };
+    }
+    if (geometryType === 'Polygon' || geometryType === 'GeometryCollection') {
+      const settings: TypePolygonVectorConfig = {
+        type: 'filledPolygon',
+        color: this.getDefaultColor(0.25),
+        stroke: { color: this.getDefaultColor(1, true) },
+        fillStyle: 'solid',
+      };
+      return { type: 'simple', hasDefault: false, fields: [], info: [{ visible: true, label, settings, values: [] }] };
+    }
+    logger.logError(`Geometry type ${geometryType} is not supported by the GeoView viewer.`);
+    return undefined;
+  }
+
+  /**
+   * Interpolate a value between two stops linearly.
+   *
+   * @param value - The data value to interpolate for
+   * @param value1 - The lower data value
+   * @param value2 - The upper data value
+   * @param output1 - The output at the lower value
+   * @param output2 - The output at the upper value
+   * @returns The interpolated output value
+   */
+  static interpolateValue(value: number, value1: number, value2: number, output1: number, output2: number): number {
+    if (value1 === value2) return output1;
+    const ratio = (value - value1) / (value2 - value1);
+    return output1 + ratio * (output2 - output1);
+  }
+
+  /**
+   * Interpolate a color between two hex colors.
+   *
+   * @param value - The data value to interpolate for
+   * @param value1 - The lower data value
+   * @param value2 - The upper data value
+   * @param color1 - The hex color at the lower value
+   * @param color2 - The hex color at the upper value
+   * @returns The interpolated color in rgba format
+   */
+  static interpolateColor(value: number, value1: number, value2: number, color1: string | number[], color2: string | number[]): string {
+    /**
+     * Parse a color input to [r, g, b, a] format where RGB are 0-255 and alpha is 0-1.
+     *
+     * @param color - Color as hex string, rgba string, or [r,g,b,a] array (a is 0-255)
+     * @returns Color as [r, g, b, alpha] where alpha is 0-1
+     */
+    const parseColor = (color: string | number[]): [number, number, number, number] => {
+      if (Array.isArray(color)) {
+        if (color.length < 3) {
+          logger.logWarning('Invalid color array length, expected at least 3 values [r,g,b]:', color);
+          return [255, 0, 0, 1];
+        }
+
+        // Safely get values that may be less then 0 or greater than 255
+        const r = Math.max(0, Math.min(255, color[0]));
+        const g = Math.max(0, Math.min(255, color[1]));
+        const b = Math.max(0, Math.min(255, color[2]));
+
+        // Alpha is optional, defaults to 255 (fully opaque), convert to 0-1 range
+        const a = color.length > 3 ? Math.max(0, Math.min(255, color[3])) / 255 : 1;
+
+        return [r, g, b, a];
+      }
+
+      if (color.startsWith('#')) {
+        const hex = color.slice(1);
+        const r = parseInt(hex.slice(0, 2), 16);
+        const g = parseInt(hex.slice(2, 4), 16);
+        const b = parseInt(hex.slice(4, 6), 16);
+        const a = hex.length === 8 ? parseInt(hex.slice(6, 8), 16) / 255 : 1;
+        return [r, g, b, a];
+      }
+      if (color.startsWith('rgba')) {
+        const matches = color.match(/^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})(?:\s*,\s*(1|0|0?\.\d+|1\.0+))?\s*\)$/);
+        if (matches) {
+          return [parseInt(matches[1], 10), parseInt(matches[2], 10), parseInt(matches[3], 10), parseFloat(matches[4] || '1')];
+        }
+      }
+      // Default to white if parsing fails
+      return [255, 255, 255, 1];
+    };
+
+    const [r1, g1, b1, a1] = parseColor(color1);
+    const [r2, g2, b2, a2] = parseColor(color2);
+
+    const r = Math.round(this.interpolateValue(value, value1, value2, r1, r2));
+    const g = Math.round(this.interpolateValue(value, value1, value2, g1, g2));
+    const b = Math.round(this.interpolateValue(value, value1, value2, b1, b2));
+    const a = this.interpolateValue(value, value1, value2, a1, a2);
+
+    return `rgba(${r}, ${g}, ${b}, ${a})`;
+  }
+
+  /**
+   * Evaluate an Arcade expression using feature data.
+   *
+   * Supports field references, conditional logic (if/else, ternary), comparison operators,
+   * logical operators, and basic string functions (upper, lower).
+   *
+   * @param expression - Arcade expression string (e.g., "if($feature.STATUS == 'Active') return 'A' else return 'B'")
+   * @param feature - Feature containing field data
+   * @returns The evaluated result (string, number, or boolean) or null if evaluation fails
+   */
+  static evaluateArcadeExpression(expression: string, feature: Feature): string | number | boolean | null {
+    try {
+      // Replace $feature.fieldName with actual values
+      let evaluableExpression = expression.replace(/\$feature\.([a-zA-Z_][\w]*)/g, (_match, fieldName) => {
+        const value = feature.get(fieldName);
+        if (value === undefined || value === null) return 'null';
+        // Escape backslashes and then wrap strings in quotes for JavaScript evaluation
+        if (typeof value === 'string') return "'" + value.replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
+        return String(value);
+      });
+
+      // Replace $feature["fieldName"] or $feature['fieldName'] with actual values
+      evaluableExpression = evaluableExpression.replace(/\$feature\[["']([^"']+)["']\]/g, (_match, fieldName) => {
+        const value = feature.get(fieldName);
+        if (value === undefined || value === null) return 'null';
+        // Escape backslashes and then wrap strings in quotes for JavaScript evaluation
+        if (typeof value === 'string') return "'" + value.replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
+        return String(value);
+      });
+
+      // Safety check: whitelist allowed characters and keywords
+      // Allow: alphanumeric, operators, parentheses, quotes, whitespace, keywords (if, else, return, upper, lower)
+      // GV Arcade function reference: https://developers.arcgis.com/arcade/function-reference/text_functions\
+      // GV This is VERY restrictive and may need to be expanded based on actual use cases
+      const allowedKeywords = this.ALLOWED_ARCADE_KEYWORDS.join('|');
+      const disallowedFunctionRegex = new RegExp(`\\b(?!${allowedKeywords})\\w+\\s*\\(`, 'i');
+      if (disallowedFunctionRegex.test(evaluableExpression)) {
+        logger.logWarning('Disallowed function call in expression');
+        return null;
+      }
+
+      // Handle upper and lower functions
+      evaluableExpression = evaluableExpression.replace(/\bupper\s*\(([^)]+)\)/gi, '($1).toString().toUpperCase()');
+      evaluableExpression = evaluableExpression.replace(/\blower\s*\(([^)]+)\)/gi, '($1).toString().toLowerCase()');
+
+      // Convert Arcade if/else statements to valid JavaScript
+      // Arcade: if (condition) return value else return value
+      // JavaScript: if (condition) { return value; } else { return value; }
+      const hasIfStatement = /\bif\s*\(/i.test(evaluableExpression);
+
+      let result;
+      if (hasIfStatement) {
+        // For if/else statements, wrap returns with braces and semicolons
+        const jsExpression = evaluableExpression
+          // Add braces around if-block: if (condition) return value -> if (condition) { return value; }
+          .replace(/\bif\s*\(([^)]+)\)\s*return\s+([^;]+?)(?=\s*else|\s*$)/gi, 'if ($1) { return $2; }')
+          // Add braces around else-block: else return value -> else { return value; }
+          .replace(/\belse\s+return\s+([^;]+?)(?=\s*$|;)/gi, 'else { return $1; }');
+
+        // Execute as function body (no outer return needed)
+        result = new Function(jsExpression)();
+      } else {
+        // For simple expressions or ternaries, use return wrapper
+        result = new Function(`return ${evaluableExpression}`)();
+      }
+
+      // Return the result (can be string, number, or boolean)
+      return result !== undefined && result !== null ? result : null;
+    } catch (error: unknown) {
+      logger.logWarning('Failed to evaluate Arcade expression:', expression, error);
+      return null;
+    }
+  }
+
+  /**
+   * Evaluate a simple value expression using feature data.
+   *
+   * Supports basic arithmetic operations and field references.
+   *
+   * @param expression - Expression string (e.g., "$feature[\"FIELD_NAME\"] + 90")
+   * @param feature - Feature containing field data
+   * @returns The evaluated result or null if evaluation fails
+   */
+  static evaluateValueExpression(expression: string, feature: Feature): number | null {
+    try {
+      // Check if expression is simple arithmetic or complex Arcade
+      const allowedKeywords = this.ALLOWED_ARCADE_KEYWORDS.join('|');
+      const arcadeKeywordRegex = new RegExp(`\\b(${allowedKeywords})\\b`, 'i');
+      const hasArcadeKeywords = arcadeKeywordRegex.test(expression);
+
+      if (hasArcadeKeywords) {
+        // Delegate to full Arcade evaluator, coerce result to number
+        const result = this.evaluateArcadeExpression(expression, feature);
+        return typeof result === 'number' ? result : Number(result);
+      }
+
+      // Replace $feature["fieldName"] or $feature['fieldName'] with actual values
+      const evaluableExpression = expression.replace(/\$feature\[["']([^"']+)["']\]/g, (_match, fieldName) => {
+        const value = feature.get(fieldName);
+        if (value === undefined || value === null) {
+          return 'null';
+        }
+        const numericValue = Number(value);
+        if (Number.isNaN(numericValue)) {
+          return value;
+        }
+        return String(numericValue);
+      });
+
+      // Safety check: only allow numbers, operators, and whitespace
+      if (!/^[\d+\-*/().%^ \t\r\n$[\]"'_\w]+$/i.test(evaluableExpression)) {
+        logger.logWarning('Invalid characters in expression:', expression);
+        return null;
+      }
+
+      // Evaluate the expression using Function constructor (safer than eval)
+      const result = new Function(`return ${evaluableExpression}`)();
+
+      return typeof result === 'number' && !Number.isNaN(result) ? result : null;
+    } catch (error: unknown) {
+      logger.logWarning('Failed to evaluate expression:', expression, error);
+      return null;
+    }
+  }
+
+  /**
+   * Apply visual variables to a style based on feature data.
+   *
+   * @param style - The base style to modify
+   * @param feature - Feature containing the data values
+   * @param visualVariables - Visual variable configurations
+   * @returns The modified style with visual variables applied
+   */
+  static #applyVisualVariables(style: Style, feature: Feature, visualVariables: TypeLayerStyleVisualVariable[]): Style {
+    if (!visualVariables || visualVariables.length === 0) return style;
+
+    const modifiedStyle = style.clone();
+
+    visualVariables.forEach((visualVar) => {
+      let dataValue: number;
+
+      if (visualVar.valueExpression) {
+        // Evaluate the expression
+        const expressionResult = this.evaluateValueExpression(visualVar.valueExpression, feature);
+        if (expressionResult === null) return; // Skip if expression evaluation failed
+        dataValue = expressionResult;
+      } else if (visualVar.field) {
+        // Get the field value from the feature
+        const rawValue = feature.get(visualVar.field);
+        if (rawValue === undefined || rawValue === null) return;
+
+        dataValue = typeof rawValue === 'number' ? rawValue : parseFloat(String(rawValue));
+        if (Number.isNaN(dataValue)) return;
+
+        // Handle normalization field if specified
+        if (visualVar.normalizationField) {
+          const normValue = feature.get(visualVar.normalizationField);
+          const normNumber = typeof normValue === 'number' ? normValue : parseFloat(String(normValue));
+          if (!Number.isNaN(normNumber) && normNumber !== 0) {
+            dataValue /= normNumber;
+          }
+        }
+      } else {
+        // Neither expression or field specified
+        return;
+      }
+
+      // Apply based on visual variable type
+      switch (visualVar.type) {
+        case 'colorInfo':
+          this.#applyColorVisualVariable(modifiedStyle, dataValue, visualVar);
+          break;
+        case 'sizeInfo':
+          this.#applySizeVisualVariable(modifiedStyle, dataValue, visualVar);
+          break;
+        case 'rotationInfo':
+          this.#applyRotationVisualVariable(modifiedStyle, dataValue, visualVar);
+          break;
+        case 'opacityInfo':
+          this.#applyOpacityVisualVariable(modifiedStyle, dataValue, visualVar);
+          break;
+        default:
+          break;
+      }
+    });
+
+    return modifiedStyle;
+  }
+
+  /**
+   * Apply color visual variable to a style.
+   *
+   * @param style - The style to modify
+   * @param dataValue - The data value from the feature
+   * @param visualVar - The visual variable configuration
+   */
+  static #applyColorVisualVariable(style: Style, dataValue: number, visualVar: TypeLayerStyleVisualVariable): void {
+    if (!visualVar.stops || visualVar.stops.length < 2) return;
+
+    // Find the two stops that bracket the data value
+    const sortedStops = [...visualVar.stops].sort((a, b) => Number(a.value) - Number(b.value));
+
+    let color: string | undefined;
+
+    // Check if value is below the first stop
+    if (dataValue <= Number(sortedStops[0].value)) {
+      const { color: stopColor } = sortedStops[0];
+      color = stopColor;
+    }
+    // Check if value is above the last stop
+    else if (dataValue >= Number(sortedStops[sortedStops.length - 1].value)) {
+      const { color: stopColor } = sortedStops[sortedStops.length - 1];
+      color = stopColor;
+    }
+    // Interpolate between stops
+    else {
+      for (let i = 0; i < sortedStops.length - 1; i++) {
+        const stop1 = sortedStops[i];
+        const stop2 = sortedStops[i + 1];
+        if (dataValue >= Number(stop1.value) && dataValue <= Number(stop2.value)) {
+          if (stop1.color && stop2.color) {
+            color = this.interpolateColor(dataValue, Number(stop1.value), Number(stop2.value), stop1.color, stop2.color);
+          }
+          break;
+        }
+      }
+    }
+
+    if (!color) return;
+
+    const image = style.getImage();
+    if (image instanceof Circle || image instanceof RegularShape) {
+      const fill = image.getFill();
+      fill?.setColor(color);
+    }
+
+    // Apply color to appropriate style component
+    const fill = style.getFill();
+    const stroke = style.getStroke();
+
+    if (fill) {
+      fill.setColor(color);
+    }
+    // Optionally update stroke color as well
+    if (stroke) {
+      stroke.setColor(color);
+    }
+  }
+
+  /**
+   * Apply size visual variable to a style.
+   *
+   * @param style - The style to modify
+   * @param dataValue - The data value from the feature
+   * @param visualVar - The visual variable configuration
+   */
+  static #applySizeVisualVariable(style: Style, dataValue: number, visualVar: TypeLayerStyleVisualVariable): void {
+    let size: number | undefined;
+
+    // Method 1: Using min/max data values and sizes
+    if (
+      visualVar.minDataValue !== undefined &&
+      visualVar.maxDataValue !== undefined &&
+      visualVar.minSize !== undefined &&
+      visualVar.maxSize !== undefined
+    ) {
+      size = this.interpolateValue(dataValue, visualVar.minDataValue, visualVar.maxDataValue, visualVar.minSize, visualVar.maxSize);
+    }
+    // Method 2: Using stops
+    else if (visualVar.stops && visualVar.stops.length >= 2) {
+      const sortedStops = [...visualVar.stops].sort((a, b) => Number(a.value) - Number(b.value));
+
+      // Check if value is below the first stop
+      if (dataValue <= Number(sortedStops[0].value)) {
+        const { size: stopSize } = sortedStops[0];
+        size = stopSize;
+      }
+      // Check if value is above the last stop
+      else if (dataValue >= Number(sortedStops[sortedStops.length - 1].value)) {
+        const { size: stopSize } = sortedStops[sortedStops.length - 1];
+        size = stopSize;
+      }
+      // Interpolate between stops
+      else {
+        for (let i = 0; i < sortedStops.length - 1; i++) {
+          const stop1 = sortedStops[i];
+          const stop2 = sortedStops[i + 1];
+          if (dataValue >= Number(stop1.value) && dataValue <= Number(stop2.value)) {
+            if (stop1.size !== undefined && stop2.size !== undefined) {
+              size = this.interpolateValue(dataValue, Number(stop1.value), Number(stop2.value), stop1.size, stop2.size);
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    if (size === undefined) return;
+
+    // Apply size to appropriate style component
+    const image = style.getImage();
+    if (image instanceof Circle) {
+      image.setRadius(size);
+    }
+
+    if (image instanceof RegularShape) {
+      const prevRadius = image.getRadius();
+      image.setScale(size / prevRadius);
+    }
+
+    // For line strings
+    const stroke = style.getStroke();
+    if (stroke && !image) {
+      stroke.setWidth(size);
+    }
+  }
+
+  /**
+   * Apply rotation visual variable to a style.
+   *
+   * @param style - The style to modify
+   * @param dataValue - The data value from the feature
+   * @param visualVar - The visual variable configuration
+   */
+  static #applyRotationVisualVariable(style: Style, dataValue: number, visualVar: TypeLayerStyleVisualVariable): void {
+    const image = style.getImage();
+    if (!image) return;
+
+    // Convert rotation based on type
+    let rotationRadians = dataValue;
+
+    if (visualVar.rotationType === 'geographic') {
+      // Geographic rotation: 0 degrees = North, clockwise
+      // Convert to mathematical rotation (counter-clockwise from East)
+      rotationRadians = ((90 - dataValue) * Math.PI) / 180;
+    } else {
+      // Arithmetic rotation: 0 degrees = East, counter-clockwise (default)
+      rotationRadians = (dataValue * Math.PI) / 180;
+    }
+
+    // Apply rotation
+    if (image.setRotation) {
+      image.setRotation(rotationRadians);
+    }
+  }
+
+  /**
+   * Apply opacity visual variable to a style.
+   *
+   * @param style - The style to modify
+   * @param dataValue - The data value from the feature
+   * @param visualVar - The visual variable configuration
+   */
+  static #applyOpacityVisualVariable(style: Style, dataValue: number, visualVar: TypeLayerStyleVisualVariable): void {
+    if (!visualVar.stops || visualVar.stops.length < 2) return;
+
+    const sortedStops = [...visualVar.stops].sort((a, b) => Number(a.value) - Number(b.value));
+
+    let opacity: number | undefined;
+
+    // Check if value is below the first stop
+    if (dataValue <= Number(sortedStops[0].value)) {
+      const { opacity: stopOpacity } = sortedStops[0];
+      opacity = stopOpacity;
+    }
+    // Check if value is above the last stop
+    else if (dataValue >= Number(sortedStops[sortedStops.length - 1].value)) {
+      const { opacity: stopOpacity } = sortedStops[sortedStops.length - 1];
+      opacity = stopOpacity;
+    }
+    // Interpolate between stops
+    else {
+      for (let i = 0; i < sortedStops.length - 1; i++) {
+        const stop1 = sortedStops[i];
+        const stop2 = sortedStops[i + 1];
+        if (dataValue >= Number(stop1.value) && dataValue <= Number(stop2.value)) {
+          if (stop1.opacity !== undefined && stop2.opacity !== undefined) {
+            opacity = this.interpolateValue(dataValue, Number(stop1.value), Number(stop2.value), stop1.opacity, stop2.opacity);
+          }
+          break;
+        }
+      }
+    }
+
+    if (opacity === undefined) return;
+
+    // Clamp opacity to [0, 1]
+    opacity = Math.max(0, Math.min(1, opacity));
+
+    // Apply opacity to all style components
+    const image = style.getImage();
+    if (image && image.setOpacity) {
+      image.setOpacity(opacity);
+      style.setImage(image);
+    }
+
+    if (image instanceof Circle || image instanceof RegularShape) {
+      const imgFill = image.getFill();
+      if (imgFill) {
+        const color = imgFill?.getColor();
+        if (typeof color === 'string') {
+          // Parse and modify alpha channel
+          const rgba = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+),?\s*([\d.]+)?\)/);
+          if (rgba) {
+            imgFill.setColor(`rgba(${rgba[1]}, ${rgba[2]}, ${rgba[3]}, ${opacity})`);
+          }
+        }
+      }
+    }
+
+    const fill = style.getFill();
+    if (fill) {
+      const color = fill.getColor();
+      if (typeof color === 'string') {
+        // Parse and modify alpha channel
+        const rgba = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+),?\s*([\d.]+)?\)/);
+        if (rgba) {
+          fill.setColor(`rgba(${rgba[1]}, ${rgba[2]}, ${rgba[3]}, ${opacity})`);
+        }
+      }
+    }
+
+    const stroke = style.getStroke();
+    if (stroke) {
+      const color = stroke.getColor();
+      if (typeof color === 'string') {
+        const rgba = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+),?\s*([\d.]+)?\)/);
+        if (rgba) {
+          stroke.setColor(`rgba(${rgba[1]}, ${rgba[2]}, ${rgba[3]}, ${opacity})`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Search the unique value entry using the field values stored in the feature.
+   *
+   * @param fields - Fields involved in the unique value definition
+   * @param uniqueValueStyleInfo - Unique value configuration
+   * @param feature - Optional feature used to test the unique value conditions
+   * @param domainsLookup - Optional lookup table to handle coded value domains
+   * @param aliasLookup - Optional lookup table to handle field name aliases
+   * @param valueExpression - Optional Arcade expression to evaluate instead of using fields
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static searchUniqueValueEntry(
+    fields: string[],
+    uniqueValueStyleInfo: TypeLayerStyleConfigInfo[],
+    feature?: Feature,
+    domainsLookup?: TypeLayerMetadataFields[],
+    aliasLookup?: TypeAliasLookup,
+    valueExpression?: string
+  ): TypeLayerStyleConfigInfo | undefined {
+    // If no feature
+    if (!feature) return undefined;
+
+    // If valueExpression is provided, evaluate it and match against values[0]
+    if (valueExpression) {
+      const evaluatedValue = this.evaluateArcadeExpression(valueExpression, feature);
+      if (evaluatedValue === null) return undefined;
+
+      // Match against uniqueValueStyleInfo[].values[0] (first value in array)
+      for (let i = 0; i < uniqueValueStyleInfo.length; i++) {
+        // eslint-disable-next-line eqeqeq
+        if (String(evaluatedValue) == String(uniqueValueStyleInfo[i].values[0])) {
+          return uniqueValueStyleInfo[i];
+        }
+      }
+      return undefined;
+    }
+
+    // Get the feature keys
+    const featureKeys = feature.getKeys();
+
+    // Start looping on the unique value style to find
+    for (let i = 0; i < uniqueValueStyleInfo.length; i++) {
+      // Start looping on the fields
+      let allFieldsMatched = true;
+      for (let j = 0; j < fields.length; j++) {
+        const field = fields[j];
+        const expectedValue = uniqueValueStyleInfo[i].values[j];
+
+        // Get the target field name: check case-insensitive match in feature keys
+        let fieldName = featureKeys.find((key) => key.toLowerCase() === field.toLowerCase());
+
+        // Try alias if no match found, then re-validate the alias key against feature keys
+        if (!fieldName && aliasLookup?.[field]) {
+          const alias = aliasLookup[field];
+          fieldName = featureKeys.find((key) => key.toLowerCase() === alias.toLowerCase());
+        }
+
+        if (!fieldName) {
+          logger.logWarning(`Renderer searchUniqueValueEntry: Cannot find field "${field}"`);
+          return undefined;
+        }
+
+        // Read the actual value
+        let actualValue = feature.get(fieldName);
+
+        // First try direct match
+        // eslint-disable-next-line eqeqeq
+        let matched = actualValue == expectedValue;
+
+        // If not matched, check coded domain
+        if (!matched) {
+          const fieldDomain = domainsLookup?.find((domain) => domain.name === fieldName)?.domain;
+          // Cast as codedvaluetype
+          const fieldDomainCasted = fieldDomain as codedValueType;
+          if (fieldDomainCasted?.codedValues) {
+            const codedValue = fieldDomainCasted.codedValues.find((dom) => dom.name === actualValue);
+            if (codedValue) {
+              actualValue = codedValue.code;
+              // eslint-disable-next-line eqeqeq
+              matched = actualValue == expectedValue;
+            }
+          }
+        }
+
+        // If this field did not match, mark the whole thing as a mismatch
+        if (!matched) {
+          allFieldsMatched = false;
+          break;
+        }
+      }
+
+      if (allFieldsMatched) {
+        return uniqueValueStyleInfo[i];
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Process the unique value settings using a point feature to get its Style.
+   *
+   * @param styleSettings - Style settings to use
+   * @param feature - Optional feature used to test the unique value conditions
+   * @param options - Optional processing options
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processUniqueValuePoint(
+    styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
+    feature?: Feature,
+    options?: TypeStyleProcessorOptions
+  ): Style | undefined {
+    // Read options
+    const { filterEquation, bypassVisibility, domainsLookup, aliasLookup, visualVariables } = options || {};
+
+    // If feature doesn't respect filter, no style
+    if (feature && !this.featureRespectsFilterEquation(feature, filterEquation)) return undefined;
+
+    if (styleSettings.type === 'uniqueValue') {
+      const { hasDefault, fields, info, valueExpression } = styleSettings;
+      const styleEntry = this.searchUniqueValueEntry(fields, info, feature, domainsLookup, aliasLookup, valueExpression);
+
+      if (styleEntry && (bypassVisibility || styleEntry.visible !== false))
+        return this.processSimplePoint(styleEntry.settings, feature, { visualVariables });
+
+      // When using hasDefault, the last position is determinant in figuring out the style of an unprocessed feature
+      // TODO: This should be changed, because some services will not have the 'others' in their last position
+      if (!styleEntry && hasDefault && (bypassVisibility || styleSettings.info[styleSettings.info.length - 1].visible !== false))
+        return this.processSimplePoint(styleSettings.info[styleSettings.info.length - 1].settings, feature, { visualVariables });
+    }
+    return undefined;
+  }
+
+  /**
+   * Process the unique value settings using a lineString feature to get its Style.
+   *
+   * @param styleSettings - Style settings to use
+   * @param feature - Optional feature used to test the unique value conditions
+   * @param options - Optional processing options
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processUniqueLineString(
+    styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
+    feature?: Feature,
+    options?: TypeStyleProcessorOptions
+  ): Style | undefined {
+    // Read options
+    const { filterEquation, bypassVisibility, domainsLookup, aliasLookup, visualVariables } = options || {};
+
+    // If feature doesn't respect filter, no style
+    if (feature && !this.featureRespectsFilterEquation(feature, filterEquation)) return undefined;
+
+    if (styleSettings.type === 'uniqueValue') {
+      const { hasDefault, fields, info, valueExpression } = styleSettings;
+      const styleEntry = this.searchUniqueValueEntry(fields, info, feature, domainsLookup, aliasLookup, valueExpression);
+
+      if (styleEntry && (bypassVisibility || styleEntry.visible !== false))
+        return this.processSimpleLineString(styleEntry.settings, feature, { visualVariables });
+
+      // When using hasDefault, the last position is determinant in figuring out the style of an unprocessed feature
+      // TODO: This should be changed, because some services will not have the 'others' in their last position
+      if (!styleEntry && hasDefault && (bypassVisibility || info[info.length - 1].visible !== false))
+        return this.processSimpleLineString(info[info.length - 1].settings, feature, { visualVariables });
+    }
+    return undefined;
+  }
+
+  /**
+   * Process the unique value settings using a polygon feature to get its Style.
+   *
+   * @param styleSettings - Style settings to use
+   * @param feature - Optional feature used to test the unique value conditions
+   * @param options - Optional processing options
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processUniquePolygon(
+    styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
+    feature?: Feature,
+    options?: TypeStyleProcessorOptions
+  ): Style | undefined {
+    // Read options
+    const { filterEquation, bypassVisibility, domainsLookup, aliasLookup, visualVariables } = options || {};
+
+    // If feature doesn't respect filter, no style
+    if (feature && !this.featureRespectsFilterEquation(feature, filterEquation)) return undefined;
+
+    if (styleSettings.type === 'uniqueValue') {
+      const { hasDefault, fields, info, valueExpression } = styleSettings;
+      const styleEntry = this.searchUniqueValueEntry(fields, info, feature, domainsLookup, aliasLookup, valueExpression);
+
+      if (styleEntry && (bypassVisibility || styleEntry.visible !== false))
+        return this.processSimplePolygon(styleEntry.settings, feature, { visualVariables });
+
+      // When using hasDefault, the last position is determinant in figuring out the style of an unprocessed feature
+      // TODO: This should be changed, because some services will not have the 'others' in their last position
+      if (!styleEntry && hasDefault && (bypassVisibility || info[info.length - 1].visible !== false))
+        return this.processSimplePolygon(info[info.length - 1].settings, feature, { visualVariables });
+    }
+    return undefined;
+  }
+
+  /**
+   * Search the class break entry using the field value stored in the feature.
+   *
+   * @param field - Optional field involved in the class break definition
+   * @param classBreakStyleInfo - Class break configuration
+   * @param feature - Feature used to test the class break conditions
+   * @param aliasLookup - Optional lookup table to handle field name aliases
+   * @param valueExpression - Optional Arcade expression to evaluate instead of using field
+   * @returns The matching entry, or undefined if unable to find it
+   */
+  static searchClassBreakEntry(
+    field: string | undefined,
+    classBreakStyleInfo: TypeLayerStyleConfigInfo[],
+    feature: Feature,
+    aliasLookup?: TypeAliasLookup,
+    valueExpression?: string
+  ): TypeLayerStyleConfigInfo | undefined {
+    let fieldValue: number;
+
+    // If valueExpression is provided, evaluate it
+    if (valueExpression) {
+      const evaluatedValue = this.evaluateArcadeExpression(valueExpression, feature);
+      if (evaluatedValue === null) return undefined;
+
+      fieldValue = Number(evaluatedValue);
+      if (Number.isNaN(fieldValue)) {
+        logger.logWarning('Class breaks valueExpression did not return a numeric value:', evaluatedValue);
+        return undefined;
+      }
+    } else if (field) {
+      // For obscure reasons, it seems that sometimes the field names in the feature do not have the same case as those in the
+      // class break definition.
+      const featureKey = feature.getKeys().filter((key) => {
+        return key.toLowerCase() === field.toLowerCase();
+      });
+
+      // Failed to find match: Attempt to find the alias key from the names
+      if (featureKey.length !== 1 && aliasLookup && Object.keys(aliasLookup).length > 0) {
+        if (field in Object.keys(aliasLookup)) {
+          featureKey.push(aliasLookup[field]);
+        }
+      }
+
+      if (featureKey.length !== 1) return undefined;
+
+      const fieldValueRaw = feature.get(featureKey[0]);
+
+      // Try to read it as a number, because we're in class break rendering mode, don't trust the service to sometimes return a string value like '1234' here..
+      fieldValue = Number(fieldValueRaw);
+    } else {
+      // Neither valueExpression nor field provided
+      return undefined;
+    }
+
+    // For each bucket
+    for (let i = 0; i < classBreakStyleInfo.length; i++) {
+      const minBreak = Number(classBreakStyleInfo[i].values[0]);
+      const maxBreak = Number(classBreakStyleInfo[i].values[1]);
+      let conditions = classBreakStyleInfo[i].valuesConditions;
+
+      // If no conditions simulate an Esri behavior supporting legacy mode - i.e: the first bucket is min <= value <= max and the other buckets are min < value <= max (note the <= vs <)
+      if (!conditions) {
+        // If this is the first break, use ['gte', 'lte']
+        if (i === 0) conditions = ['>=', '<='];
+        // If this is the other breaks, use ['gt', 'lte']
+        if (!conditions && i > 0) conditions = ['>', '<='];
+      } // Now, conditions is set
+
+      // Check the value vs the bounds and the conditions
+      if (this.searchClassBreakEntryCheck(fieldValue, minBreak, maxBreak, conditions!)) {
+        return classBreakStyleInfo[i];
+      }
+      // Continue searching the break class index
+    }
+
+    // Not found
+    return undefined;
+  }
+
+  /**
+   * Check whether a numeric value falls within a class-break interval using provided boundary conditions.
+   *
+   * The `conditions` parameter is expected to be a two-element array where:
+   * - conditions[0] is the lower-bound operator: 'gt' (>) or 'gte' (>=)
+   * - conditions[1] is the upper-bound operator: 'lt' (<) or 'lte' (<=)
+   * Examples:
+   * - ['gte','lte'] => min <= value <= max
+   * - ['gt','lte']  => min < value <= max
+   *
+   * @param value - The numeric value to test
+   * @param min - The lower bound of the interval
+   * @param max - The upper bound of the interval
+   * @param conditions - Two-element array describing the boundary operators
+   * @returns True if the value satisfies the interval according to the conditions, false otherwise
+   * @throws {NotSupportedError} When `conditions` contains an unsupported combination of operators
+   */
+  static searchClassBreakEntryCheck(value: number, min: number, max: number, conditions: TypeLayerStyleValueCondition[]): boolean {
+    // Depending on the conditions for minimum and maximum
+    if (conditions[0] === '>' && conditions[1] === '<') {
+      return min < value && value < max;
+    } else if (conditions[0] === '>' && conditions[1] === '<=') {
+      return min < value && value <= max;
+    } else if (conditions[0] === '>=' && conditions[1] === '<') {
+      return min <= value && value < max;
+    } else if (conditions[0] === '>=' && conditions[1] === '<=') {
+      return min <= value && value <= max;
+    }
+
+    // Unsupported
+    throw new NotSupportedError('Unsupported conditions to compare the values for the class break renderer');
+  }
+
+  /**
+   * Process the class break settings using a Point feature to get its Style.
+   *
+   * @param styleSettings - Style settings to use
+   * @param feature - Optional feature used to test the unique value conditions
+   * @param options - Optional processing options
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processClassBreaksPoint(
+    styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
+    feature?: Feature,
+    options?: TypeStyleProcessorOptions
+  ): Style | undefined {
+    // Read options
+    const { filterEquation, bypassVisibility, aliasLookup, visualVariables } = options || {};
+
+    // If feature doesn't respect filter, no style
+    if (feature && !this.featureRespectsFilterEquation(feature, filterEquation)) return undefined;
+
+    if (styleSettings.type === 'classBreaks') {
+      const { hasDefault, fields, info, valueExpression } = styleSettings;
+      const foundClassBreakInfo = feature && this.searchClassBreakEntry(fields[0], info, feature, aliasLookup, valueExpression);
+
+      // If found a class break renderer that works for the value of the feature
+      if (foundClassBreakInfo && (bypassVisibility || foundClassBreakInfo.visible !== false)) {
+        return this.processSimplePoint(foundClassBreakInfo.settings, feature, { visualVariables });
+      }
+
+      // When using hasDefault, the last position is determinant in figuring out the style of an unprocessed feature
+      // TODO: This should be changed, because some services will not have the 'others' in their last position
+      if (!foundClassBreakInfo && hasDefault && (bypassVisibility || info[info.length - 1].visible !== false)) {
+        return this.processSimplePoint(info[info.length - 1].settings, feature, { visualVariables });
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Process the class break settings using a lineString feature to get its Style.
+   *
+   * @param styleSettings - Style settings to use
+   * @param feature - Optional feature used to test the unique value conditions
+   * @param options - Optional processing options
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processClassBreaksLineString(
+    styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
+    feature?: Feature,
+    options?: TypeStyleProcessorOptions
+  ): Style | undefined {
+    // Read options
+    const { filterEquation, bypassVisibility, aliasLookup, visualVariables } = options || {};
+
+    // If feature doesn't respect filter, no style
+    if (feature && !this.featureRespectsFilterEquation(feature, filterEquation)) return undefined;
+
+    if (styleSettings.type === 'classBreaks') {
+      const { hasDefault, fields, info, valueExpression } = styleSettings;
+      const foundClassBreakInfo = feature && this.searchClassBreakEntry(fields[0], info, feature, aliasLookup, valueExpression);
+
+      // If found a class break renderer that works for the value of the feature
+      if (foundClassBreakInfo && (bypassVisibility || foundClassBreakInfo.visible !== false)) {
+        return this.processSimpleLineString(foundClassBreakInfo.settings, feature, { visualVariables });
+      }
+
+      // When using hasDefault, the last position is determinant in figuring out the style of an unprocessed feature
+      // TODO: This should be changed, because some services will not have the 'others' in their last position
+      if (!foundClassBreakInfo && hasDefault && (bypassVisibility || info[info.length - 1].visible !== false)) {
+        return this.processSimpleLineString(info[info.length - 1].settings, feature, { visualVariables });
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Process the class break settings using a Polygon feature to get its Style.
+   *
+   * @param styleSettings - Style settings to use
+   * @param feature - Optional feature used to test the unique value conditions
+   * @param options - Optional processing options
+   * @returns The Style created, or undefined if unable to create it
+   */
+  static processClassBreaksPolygon(
+    styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
+    feature?: Feature,
+    options?: TypeStyleProcessorOptions
+  ): Style | undefined {
+    // Read options
+    const { filterEquation, bypassVisibility, aliasLookup, visualVariables } = options || {};
+
+    // If feature doesn't respect filter, no style
+    if (feature && !this.featureRespectsFilterEquation(feature, filterEquation)) return undefined;
+
+    if (styleSettings.type === 'classBreaks') {
+      const { hasDefault, fields, info, valueExpression } = styleSettings;
+      const foundClassBreakInfo = feature && this.searchClassBreakEntry(fields[0], info, feature, aliasLookup, valueExpression);
+
+      // If found a class break renderer that works for the value of the feature
+      if (foundClassBreakInfo && (bypassVisibility || foundClassBreakInfo.visible !== false)) {
+        return this.processSimplePolygon(foundClassBreakInfo.settings, feature, { visualVariables });
+      }
+
+      // When using hasDefault, the last position is determinant in figuring out the style of an unprocessed feature
+      // TODO: This should be changed, because some services will not have the 'others' in their last position
+      if (!foundClassBreakInfo && hasDefault && (bypassVisibility || info[info.length - 1].visible !== false)) {
+        return this.processSimplePolygon(info[info.length - 1].settings, feature, { visualVariables });
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Gets the style of the feature using the layer entry config.
+   *
+   * If the style does not exist for the geometryType, create it using the default style strategy.
+   *
+   * @param feature - Feature that need its style to be defined
+   * @param layerStyle - The style to use
+   * @param label - The style label when one has to be created
+   * @param filterEquation - Optional filter equation associated to the layer
+   * @param callbackWhenCreatingStyle - Optional callback to execute when a new style had to be created
+   * @returns The style applied to the feature, or undefined if not found
+   */
+  static getAndCreateFeatureStyle(
+    feature: FeatureLike,
+    layerStyle: TypeLayerStyleConfig,
+    label: string,
+    filterEquation?: FilterNodeType[],
+    callbackWhenCreatingStyle?: (geometryType: TypeStyleGeometry, style: TypeLayerStyleConfigInfo) => void
+  ): Style | undefined {
+    // Determine geometry type, favoring the feature itself
+    const geometryType = this.readGeometryTypeSimplifiedFromFeature(feature, layerStyle);
+
+    // Ensure a style exists for this geometry type
+    let styleSettings = layerStyle?.[geometryType];
+
+    if (!styleSettings) {
+      const createdStyle = this.createDefaultStyle(geometryType, label);
+      if (!createdStyle) return undefined;
+
+      // Mutate layerStyle intentionally: we are extending configuration
+      // eslint-disable-next-line no-param-reassign
+      layerStyle[geometryType] = createdStyle;
+      styleSettings = createdStyle;
+
+      callbackWhenCreatingStyle?.(geometryType, createdStyle.info[0]);
+    }
+
+    // Prepare style processor options
+    const options: TypeStyleProcessorOptions = {
+      filterEquation,
+      visualVariables: styleSettings.visualVariables,
+    };
+
+    // Resolve style processor explicitly
+    const processor = this.processStyle[styleSettings.type]?.[geometryType];
+    if (!processor) return undefined;
+
+    // Create feature style
+    const featureStyle = processor(styleSettings, feature as Feature, options);
+    if (!featureStyle) return undefined;
+
+    return featureStyle;
+  }
+
+  /**
+   * Gets the image source from the style of the feature using the layer entry config.
+   *
+   * @param style - The style to use
+   * @param geometryType - The type of geometry
+   * @param styleSettings - The layer style settings
+   * @returns The icon source associated to the feature, or undefined
+   */
+  static getFeatureIconSource(
+    style: Style | undefined,
+    geometryType: TypeStyleGeometry,
+    styleSettings: TypeLayerStyleSettings | undefined
+  ): string | undefined {
+    // The image source that will be returned (if calculated successfully)
+    let imageSource: string | undefined;
+
+    // If style and style settings are defined
+    if (style && styleSettings) {
+      if (geometryType === 'Point') {
+        if (
+          (styleSettings.type === 'simple' && !(style.getImage() instanceof Icon)) ||
+          (styleSettings.type === 'uniqueValue' && !(style.getImage() instanceof Icon)) ||
+          (styleSettings.type === 'classBreaks' && !(style.getImage() instanceof Icon))
+        ) {
+          imageSource = this.createPointCanvas(style).toDataURL();
+        } else {
+          imageSource = (style.getImage() as Icon).getSrc() || undefined;
+        }
+      } else if (geometryType === 'LineString') {
+        imageSource = this.createLineStringCanvas(style).toDataURL();
+      } else if (geometryType === 'GeometryCollection') {
+        imageSource = this.createGeometryCollectionCanvas(style).toDataURL();
+      } else {
+        imageSource = this.createPolygonCanvas(style).toDataURL();
+      }
+    }
+
+    // Return the image source
+    return imageSource;
+  }
+
+  /**
+   * Classify the remaining nodes to complete the classification.
+   *
+   * The plus and minus can be a unary or a binary operator. It is
+   * only at the end that we can determine their node type. Nodes that start with a number are numbers, otherwise they are
+   * variables. If a problem is detected, an error object is thrown with an explanatory message.
+   *
+   * @param keywordArray - Array of keywords to process
+   * @returns The new keywords array with all nodes classified
+   */
+  static classifyUnprocessedNodes(keywordArray: FilterNodeType[]): FilterNodeType[] {
+    return keywordArray.map((node, i) => {
+      if (node.nodeType === NodeType.unprocessedNode) {
+        if (Number.isNaN(Number((node.nodeValue as string).slice(0, 1)))) {
+          if (['+', '-'].includes(node.nodeValue as string))
+            if (i !== 0 && [NodeType.number, NodeType.string, NodeType.variable].includes(keywordArray[i - 1].nodeType))
+              // eslint-disable-next-line no-param-reassign
+              node.nodeType = NodeType.binary;
+            else {
+              // eslint-disable-next-line no-param-reassign
+              node.nodeType = NodeType.unary;
+              // eslint-disable-next-line no-param-reassign
+              node.nodeValue = `u${node.nodeValue}`;
+            }
+          else if (typeof node.nodeValue === 'string' && node.nodeValue.toLowerCase() === 'null') {
+            // eslint-disable-next-line no-param-reassign
+            node.nodeType = NodeType.variable;
+            // eslint-disable-next-line no-param-reassign
+            node.nodeValue = null;
+          } else {
+            // eslint-disable-next-line no-param-reassign
+            node.nodeType = NodeType.variable;
+          }
+          return node;
+        }
+        // eslint-disable-next-line no-param-reassign
+        node.nodeType = NodeType.number;
+        // eslint-disable-next-line no-param-reassign
+        node.nodeValue = Number(node.nodeValue);
+        if (Number.isNaN(node.nodeValue)) throw new Error(`${node.nodeValue} is an invalid number`);
+        return node;
+      }
+      return node;
+    });
+  }
+
+  /**
+   * Extract the specified keyword and associate a node type to their nodes.
+   *
+   * In some cases, the extraction uses an optional regular expression.
+   *
+   * @param filterNodeArray - Array of keywords to process
+   * @param keyword - Keyword to extract
+   * @param regExp - Optional regular expression to use for the extraction
+   * @returns The new keywords array
+   */
+  static extractKeyword(filterNodeArray: FilterNodeType[], keyword: string, regExp?: RegExp): FilterNodeType[] {
+    const getNodeType = (keywordValue: string): NodeType => {
+      if (['+', '-'].includes(keywordValue)) return NodeType.unprocessedNode;
+      if (binaryKeywords.includes(keywordValue)) return NodeType.binary;
+      if (unaryKeywords.includes(keywordValue)) return NodeType.unary;
+      if (groupKeywords.includes(keywordValue)) return NodeType.group;
+      return NodeType.keyword;
+    };
+
+    return filterNodeArray.reduce((newKeywordArray, node) => {
+      if (node.nodeType !== NodeType.unprocessedNode) newKeywordArray.push(node);
+      else {
+        // eslint-disable-next-line no-param-reassign
+        newKeywordArray = newKeywordArray.concat(
+          (node.nodeValue as string)
+            .trim()
+            .split(regExp === undefined ? keyword : regExp)
+            .reduce((nodeArray, splitNode) => {
+              if (splitNode === '') {
+                nodeArray.push({ nodeType: getNodeType(keyword), nodeValue: keyword });
+                return nodeArray;
+              }
+              nodeArray.push({ nodeType: NodeType.unprocessedNode, nodeValue: splitNode.trim() });
+              nodeArray.push({ nodeType: getNodeType(keyword), nodeValue: keyword });
+              return nodeArray;
+            }, [] as FilterNodeType[])
+            .slice(0, -1)
+        );
+      }
+      return newKeywordArray;
+    }, [] as FilterNodeType[]);
+  }
+
+  /**
+   * Extract the string nodes from the keyword array.
+   *
+   * This operation is done at the beginning of the classification. This allows
+   * to consider keywords in a string as a normal word. If a problem is detected, an error object is thrown with an explanatory
+   * message.
+   *
+   * @param keywordArray - Array of keywords to process
+   * @returns The new keywords array with all string nodes classified
+   */
+  static extractStrings(keywordArray: FilterNodeType[]): FilterNodeType[] {
+    let stringNeeded = false;
+    let stringHasBegun = false;
+    let contiguousApostrophes = 0;
+    let stringValue = '';
+    const keywordArrayToReturn = keywordArray.reduce((newKeywordArray, node) => {
+      if (stringHasBegun) {
+        if (node.nodeType === NodeType.unprocessedNode) {
+          if (stringNeeded) {
+            stringValue = `${stringValue}${node.nodeValue}`;
+            stringNeeded = false;
+          } else {
+            newKeywordArray.push({ nodeType: NodeType.string, nodeValue: stringValue });
+            newKeywordArray.push(node);
+            stringValue = '';
+            stringHasBegun = false;
+            stringNeeded = false;
+            contiguousApostrophes = 0;
+          }
+        } else {
+          contiguousApostrophes += 1;
+          if (contiguousApostrophes === 2) {
+            stringValue = `${stringValue}'`;
+            stringNeeded = true;
+            contiguousApostrophes = 0;
+          }
+        }
+        return newKeywordArray;
+      }
+      if (node.nodeType === NodeType.keyword) {
+        stringHasBegun = true;
+        stringNeeded = true;
+      } else newKeywordArray.push(node);
+      return newKeywordArray;
+    }, [] as FilterNodeType[]);
+    if (stringHasBegun)
+      if (!stringNeeded && contiguousApostrophes === 1) keywordArrayToReturn.push({ nodeType: NodeType.string, nodeValue: stringValue });
+      else throw new Error(`string not closed`);
+    return keywordArrayToReturn;
+  }
+
+  /**
+   * Creates a filter equation from a filter string.
+   *
+   * @param filter - The filter string to convert
+   * @returns The filter equation as an array of FilterNodeType
+   */
+  static createFilterNodeFromFilter(filter: string): FilterNodeType[] {
+    // Redirect
+    return this.analyzeLayerFilter([{ nodeType: NodeType.unprocessedNode, nodeValue: filter }]);
+  }
+
+  /**
+   * Analyse the filter and split it in syntactic nodes.
+   *
+   * @param filterNodeArrayType - Node array to analyse
+   * @returns The new node array with all nodes classified
+   * @throws {Error} When the filter contains unbalanced parentheses or unclosed strings
+   */
+  static analyzeLayerFilter(filterNodeArrayType: FilterNodeType[]): FilterNodeType[] {
+    let resultingKeywordArray = filterNodeArrayType;
+    resultingKeywordArray[0].nodeValue = (resultingKeywordArray[0].nodeValue as string).replaceAll(/\s{2,}/g, ' ').trim();
+    resultingKeywordArray[0].nodeValue = resultingKeywordArray[0].nodeValue.split(/^date '|(?<=\s)date '/gi).join("date°'");
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, "'");
+    resultingKeywordArray = this.extractStrings(resultingKeywordArray);
+
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, '(');
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, ')');
+    if (
+      resultingKeywordArray.reduce((result, node) => {
+        return node.nodeType === NodeType.group ? result + 1 : result;
+      }, 0) % 2
+    )
+      throw new Error(`unbalanced parentheses`);
+
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, 'date', /^date°$|^date°|(?<=\s)date°/g);
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, 'upper', /^upper\b|(?<=\s)upper\b/gi);
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, 'lower', /^lower\b|(?<=\s)lower\b/gi);
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, 'is not', /^is\s+not\b|(?<=\s)is\s+not\b/gi);
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, 'is', /^is\b(?!\s*not\b)|(?<=\s)is\b(?!\s*not\b)/gi);
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, 'in', /^in\b|(?<=\s)in\b/gi);
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, ',');
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, 'not', /^not\b|(?<=\s)not\b/gi);
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, 'and', /^and\b|(?<=\s)and\b/gi);
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, 'or', /^or\b|(?<=\s)or\b/gi);
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, 'like', /^like\b|(?<=\s)like\b/gi);
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, '=', /(?<![><])=/g);
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, '<', /<(?![>=])/g);
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, '>', /(?<!<)>(?!=)/g);
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, '<>');
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, '<=');
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, '>=');
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, '+');
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, '-');
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, '*');
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, '/');
+    resultingKeywordArray = this.extractKeyword(resultingKeywordArray, '||');
+    resultingKeywordArray = this.classifyUnprocessedNodes(resultingKeywordArray);
+
+    return resultingKeywordArray;
+  }
+
+  /** Table used to define line symbology to use when drawing lineString and polygon perimeters */
+  static lineDashSettings: Record<TypeLineStyle, number[] | undefined> = {
+    dash: [16, 4],
+    'dash-dot': [16, 4, 2, 4],
+    'dash-dot-dot': [16, 4, 2, 4, 2, 4],
+    dot: [2, 2],
+    longDash: [25, 5],
+    'longDash-dot': [25, 5, 2, 5],
+    null: [0, 3],
+    shortDash: [7, 3],
+    'shortDash-dot': [7, 3, 2, 3],
+    'shortDash-dot-dot': [7, 3, 2, 3, 2, 3],
+    solid: undefined,
+  };
+
+  /** Table used to define line symbology to use when drawing polygon fill */
+  static FillPatternSettings: FillPatternSettings = {
+    null: [],
+    dot: [],
+    solid: [],
+    backwardDiagonal: [
+      { moveTo: [1, 0], lineTo: [2, 1] },
+      { moveTo: [0, 0], lineTo: [2, 2] },
+      { moveTo: [0, 1], lineTo: [1, 2] },
+    ],
+    cross: [
+      { moveTo: [1, 0], lineTo: [1, 2] },
+      { moveTo: [0, 1], lineTo: [2, 1] },
+    ],
+    diagonalCross: [
+      { moveTo: [0, 0], lineTo: [2, 2] },
+      { moveTo: [0, 2], lineTo: [2, 0] },
+    ],
+    forwardDiagonal: [
+      { moveTo: [0, 1], lineTo: [1, 0] },
+      { moveTo: [0, 2], lineTo: [2, 0] },
+      { moveTo: [2, 1], lineTo: [1, 2] },
+    ],
+    horizontal: [{ moveTo: [0, 1], lineTo: [2, 1] }],
+    vertical: [{ moveTo: [1, 0], lineTo: [1, 2] }],
+  };
+
+  /** Table of function to process simpleSymbol settings. */
+  static #processSymbol: Record<TypeSymbol, (settings: TypeSimpleSymbolVectorConfig) => Style | undefined> = {
+    circle: GeoviewRenderer.processCircleSymbol.bind(GeoviewRenderer),
+    '+': GeoviewRenderer.processPlusSymbol.bind(GeoviewRenderer),
+    diamond: GeoviewRenderer.processDiamondSymbol.bind(GeoviewRenderer),
+    square: GeoviewRenderer.processSquareSymbol.bind(GeoviewRenderer),
+    triangle: GeoviewRenderer.processTriangleSymbol.bind(GeoviewRenderer),
+    X: GeoviewRenderer.processXSymbol.bind(GeoviewRenderer),
+    star: GeoviewRenderer.processStarSymbol.bind(GeoviewRenderer),
+  };
+
+  /** Table of function to process polygon fill style settings. */
+  static #processFillStyle: Record<TypeFillStyle, (settings: TypePolygonVectorConfig, geometry?: Geometry) => Style | undefined> = {
+    null: GeoviewRenderer.processNullFill.bind(GeoviewRenderer),
+    solid: GeoviewRenderer.processSolidFill.bind(GeoviewRenderer),
+    backwardDiagonal: GeoviewRenderer.processBackwardDiagonalFill.bind(GeoviewRenderer),
+    cross: GeoviewRenderer.processCrossFill.bind(GeoviewRenderer),
+    diagonalCross: GeoviewRenderer.processDiagonalCrossFill.bind(GeoviewRenderer),
+    forwardDiagonal: GeoviewRenderer.processForwardDiagonalFill.bind(GeoviewRenderer),
+    horizontal: GeoviewRenderer.processHorizontalFill.bind(GeoviewRenderer),
+    vertical: GeoviewRenderer.processVerticalFill.bind(GeoviewRenderer),
+    dot: GeoviewRenderer.processDotFill.bind(GeoviewRenderer),
+  };
+
+  /** Table of function to process the style settings based on the feature geometry and the kind of style settings. */
+  static processStyle: Record<TypeLayerStyleConfigType, Record<TypeStyleGeometry, TypeStyleProcessor>> = {
+    simple: {
+      Point: GeoviewRenderer.processSimplePoint.bind(GeoviewRenderer),
+      MultiPoint: GeoviewRenderer.processSimplePoint.bind(GeoviewRenderer),
+      LineString: GeoviewRenderer.processSimpleLineString.bind(GeoviewRenderer),
+      MultiLineString: GeoviewRenderer.processSimpleLineString.bind(GeoviewRenderer),
+      Polygon: GeoviewRenderer.processSimplePolygon.bind(GeoviewRenderer),
+      MultiPolygon: GeoviewRenderer.processSimplePolygon.bind(GeoviewRenderer),
+      GeometryCollection: GeoviewRenderer.processSimplePolygon.bind(GeoviewRenderer),
+    },
+    uniqueValue: {
+      Point: GeoviewRenderer.processUniqueValuePoint.bind(GeoviewRenderer),
+      MultiPoint: GeoviewRenderer.processUniqueValuePoint.bind(GeoviewRenderer),
+      LineString: GeoviewRenderer.processUniqueLineString.bind(GeoviewRenderer),
+      MultiLineString: GeoviewRenderer.processUniqueLineString.bind(GeoviewRenderer),
+      Polygon: GeoviewRenderer.processUniquePolygon.bind(GeoviewRenderer),
+      MultiPolygon: GeoviewRenderer.processUniquePolygon.bind(GeoviewRenderer),
+      GeometryCollection: GeoviewRenderer.processUniquePolygon.bind(GeoviewRenderer),
+    },
+    classBreaks: {
+      Point: GeoviewRenderer.processClassBreaksPoint.bind(GeoviewRenderer),
+      MultiPoint: GeoviewRenderer.processClassBreaksPoint.bind(GeoviewRenderer),
+      LineString: GeoviewRenderer.processClassBreaksLineString.bind(GeoviewRenderer),
+      MultiLineString: GeoviewRenderer.processClassBreaksLineString.bind(GeoviewRenderer),
+      Polygon: GeoviewRenderer.processClassBreaksPolygon.bind(GeoviewRenderer),
+      MultiPolygon: GeoviewRenderer.processClassBreaksPolygon.bind(GeoviewRenderer),
+      GeometryCollection: GeoviewRenderer.processClassBreaksPolygon.bind(GeoviewRenderer),
+    },
+  };
+
+  /**
+   * Builds a filter string (SQL-like or OGC-compliant) for a given layer and style configuration.
+   *
+   * This method supports:
+   * - simple styles: returns the base layer filter or a default `(1=1)` condition.
+   * - unique value styles: builds an optimized filter for visible categories.
+   * - class breaks styles: builds numeric range filters based on visibility flags.
+   *
+   * @param outFields - The outfields information
+   * @param style - The style configuration (optional)
+   * @param styleSettings - The layer style settings
+   * @returns The filter expression, or undefined if not applicable
+   */
+  static getFilterFromStyle(
+    outFields: TypeOutfields[] | undefined,
+    style: TypeLayerStyleConfig | undefined,
+    styleSettings: TypeLayerStyleSettings | undefined
+  ): string | undefined {
+    // No style, no filter on style
+    if (!style) return undefined;
+
+    // No style settings, default filter
+    if (!styleSettings) return undefined;
+
+    switch (styleSettings.type) {
+      case 'simple':
+        return undefined;
+
+      case 'uniqueValue': {
+        // Check if any fields were retrieved
+        if (!outFields) {
+          // Log warning, so we know
+          logger.logWarning(
+            'A style with filter capabilities was set on the layer, but no fields were read from vector data. Make sure source.featureInfo?.outfields has values.'
+          );
+          return undefined;
+        }
+
+        this.#normalizeVisibility(styleSettings);
+        if (this.#allFeaturesVisible(styleSettings.info)) return undefined;
+
+        // Build query
+        return this.#buildQueryUniqueValue(styleSettings, outFields);
+      }
+
+      case 'classBreaks': {
+        // Check if any fields were retrieved
+        if (!outFields) {
+          // Log warning, so we know
+          logger.logWarning(
+            'A style with filter capabilities was set on the layer, but no fields were read from vector data. Make sure source.featureInfo?.outfields has values.'
+          );
+          return undefined;
+        }
+
+        this.#normalizeVisibility(styleSettings);
+        if (this.#allFeaturesVisible(styleSettings.info)) return undefined;
+        return this.#buildQueryClassBreaksFilter(styleSettings, outFields);
+      }
+
+      default:
+        return undefined;
+    }
+  }
+
+  /**
+   * Normalizes a style configuration by ensuring that all visibility flags are explicitly set.
+   *
+   * Any undefined `visible` properties are defaulted to `true` (meaning the feature is considered visible).
+   *
+   * @param styleConfig - The style configuration object to normalize
+   */
+  static #normalizeVisibility(styleConfig: TypeLayerStyleSettings): void {
+    styleConfig.info.forEach((s) => {
+      // eslint-disable-next-line no-param-reassign
+      if (s.visible === undefined) s.visible = true;
+    });
+  }
+
+  /**
+   * Determines whether all features in the style configuration are visible.
+   *
+   * This is used to skip building a filter expression when no filtering is needed.
+   *
+   * @param settings - The style configuration entries defining visibility
+   * @returns True if all features are visible; false if any are hidden or filtered
+   */
+  static #allFeaturesVisible(settings: TypeLayerStyleConfigInfo[]): boolean {
+    return settings.every((s) => s.visible);
+  }
+
+  /**
+   * Builds a filter expression for a unique value renderer based on the layer style configuration.
+   *
+   * If the style configuration defines a default renderer (`hasDefault === true`)
+   * AND the default renderer is visible, the function instead builds a
+   * negative filter (`NOT (...)`) from the unchecked non-default entries, since
+   * the default renderer represents an implicit catch-all.
+   *
+   * @param styleSettings - The layer style settings containing renderer definitions and visibility state
+   * @param outFields - Optional layer field metadata used to properly format field values (e.g., quoting strings, numeric handling)
+   * @param useExtraSpacingInFilter - When true, adds extra spacing and quotes to improve readability or compatibility with certain filter parsers
+   * @returns A filter expression string suitable for use in SQL-like or OGC filter contexts.
+   * Returns an always-true (`1=1`) if all features are visible, or an always-false (`1=0`) if no features are visible.
+   */
+  static #buildQueryUniqueValue(
+    styleSettings: TypeLayerStyleSettings,
+    outFields: TypeOutfields[],
+    useExtraSpacingInFilter = false
+  ): string {
+    // If valueExpression is used, skip server-side filter generation
+    if (styleSettings.valueExpression) {
+      logger.logDebug('Cannot generate server-side filter for valueExpression-based unique value renderer');
+      return this.DEFAULT_FILTER_1EQUALS1;
+    }
+
+    const spacing = useExtraSpacingInFilter ? ' ' : '';
+    const quote = useExtraSpacingInFilter ? '"' : '';
+
+    const fields = styleSettings.fields.map((f) => `${quote}${f}${quote}`);
+    const fieldCount = fields.length;
+
+    const { info, hasDefault } = styleSettings;
+
+    const defaultIndex = info.length - 1;
+    const defaultEntry = hasDefault ? info[defaultIndex] : undefined;
+    const defaultIsChecked = Boolean(defaultEntry?.visible);
+
+    // Decide strategy: include OR exclude
+    const useNotPattern = hasDefault && defaultIsChecked;
+
+    const relevantInfos = useNotPattern
+      ? // Exclude unchecked non-default styles
+        info.slice(0, defaultIndex).filter((i) => !i.visible)
+      : // Include checked non-default styles
+        info.slice(0, hasDefault ? defaultIndex : info.length).filter((i) => i.visible);
+
+    // Default checked and nothing to exclude → everything matches
+    if (useNotPattern && relevantInfos.length === 0) {
+      return this.DEFAULT_FILTER_1EQUALS1;
+    }
+
+    // Build predicate per entry
+    const predicates = relevantInfos.map((entry) => {
+      // Single-field => allow IN / =
+      if (fieldCount === 1) {
+        const value = this.#formatFieldValue(fields[0], entry.values[0], outFields);
+        return `${fields[0]} = ${value}`;
+      }
+
+      // Multi-field => tuple-style AND predicate
+      const parts = fields.map((field, idx) => {
+        const value = this.#formatFieldValue(field, entry.values[idx], outFields);
+        return `${field} = ${value}`;
+      });
+
+      return `(${parts.join(' AND ')})`;
+    });
+
+    // No predicates → nothing matches
+    if (predicates.length === 0) {
+      return this.DEFAULT_FILTER_1EQUALS0;
+    }
+
+    // Combine predicates
+    const combined = predicates.length === 1 ? predicates[0] : `(${spacing}${predicates.join(` OR `)}${spacing})`;
+
+    return useNotPattern ? `NOT ${combined}` : combined;
+  }
+
+  /**
+   * Builds a filter for classBreaks style types.
+   *
+   * @param styleSettings - The style configuration
+   * @param outfields - The feature info fields
+   * @returns A filter expression string suitable for use in SQL-like or OGC filter contexts.
+   * Returns an always-true (`1=1`) if all features are visible, or an always-false (`1=0`) if no features are visible.
+   */
+  static #buildQueryClassBreaksFilter(styleSettings: TypeLayerStyleSettings, outfields: TypeOutfields[]): string {
+    // If valueExpression is used (indicated by empty fields array), skip server-side filter generation
+    if (styleSettings.fields.length === 0 || styleSettings.valueExpression) {
+      logger.logDebug('Cannot generate server-side filter for valueExpression-based class breaks renderer');
+      return this.DEFAULT_FILTER_1EQUALS1;
+    }
+
+    const field = styleSettings.fields[0];
+    const { info } = styleSettings;
+    const { hasDefault } = styleSettings;
+    const featureInfo = outfields;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fmt = (value: any): string => this.#formatFieldValue(field, value, featureInfo);
+
+    const filterArray: string[] = [];
+    let visibleWhenGreaterIndex = -1;
+
+    for (let i = 0; i < info.length; i++) {
+      const entry = info[i];
+      const comparer0: TypeLayerStyleValueCondition = entry.valuesConditions?.[0] || '>=';
+      const comparer1: TypeLayerStyleValueCondition = entry.valuesConditions?.[1] || '<=';
+
+      // Determine even/odd based on filterArray length
+      if (filterArray.length % 2 === 0) {
+        // Even index logic (first half of a range)
+        if (i === 0) {
+          // First entry
+          if (entry.visible !== false && (!hasDefault || (hasDefault && info[info.length - 1].visible === false))) {
+            // visible, default not visible
+            filterArray.push(`${field} ${comparer0} ${fmt(entry.values[0])}`);
+          } else if (entry.visible === false && hasDefault && info[info.length - 1].visible !== false) {
+            // not visible, default visible
+            filterArray.push(`${field} ${comparer0} ${fmt(entry.values[0])}`);
+            visibleWhenGreaterIndex = i;
+          }
+        } else {
+          if (entry.visible !== false && (!hasDefault || (hasDefault && info[info.length - 1].visible === false))) {
+            filterArray.push(`${field} ${comparer0} ${fmt(entry.values[0])}`);
+            if (i + 1 === info.length) {
+              filterArray.push(`${field} ${comparer1} ${fmt(entry.values[1])}`);
+            }
+          } else if (entry.visible === false && hasDefault && info[info.length - 1].visible !== false) {
+            filterArray.push(`${field} ${comparer0} ${fmt(entry.values[0])}`);
+            visibleWhenGreaterIndex = i;
+          }
+        }
+      } else {
+        // Odd index logic (closing half of a range)
+        if (!hasDefault || (hasDefault && info[info.length - 1].visible === false)) {
+          if (entry.visible === false) {
+            filterArray.push(`${field} ${comparer1} ${fmt(info[i - 1].values[1])}`);
+          } else if (i + 1 === info.length) {
+            filterArray.push(`${field} ${comparer1} ${fmt(entry.values[1])}`);
+          }
+        } else if (hasDefault && entry.visible !== false) {
+          filterArray.push(`${field} ${comparer1} ${fmt(info[i - 1].values[1])}`);
+          visibleWhenGreaterIndex = -1;
+        } else {
+          visibleWhenGreaterIndex = i;
+        }
+      }
+    }
+
+    // Final "greater than" clause
+    if (visibleWhenGreaterIndex !== -1) {
+      filterArray.push(`${field} > ${fmt(info[visibleWhenGreaterIndex].values[1])}`);
+    }
+
+    // Return the filter
+    return this.#buildClassBreakExpression(filterArray, hasDefault, info);
+  }
+
+  /**
+   * Builds the final SQL-like boolean filter expression used for classBreaks style rules.
+   *
+   * This function takes the list of already-constructed range conditions (`filterArray`)
+   * and assembles them into a properly parenthesized logical expression. The structure
+   * of the expression depends on whether the style has a “default” class and whether
+   * that default class is visible or not.
+   *
+   * @param filterArray - The ordered list of base range expressions produced by
+   *   the classBreaks preprocessing logic (e.g., `["field >= 0", "field <= 10", "field > 10", "field <= 20"]`)
+   * @param hasDefault - Indicates whether the style definition includes a
+   *   default class (the implicit class beyond the listed break ranges). When `true` and the last
+   *   class is visible, the function constructs an `OR`-based expression mirroring the original
+   *   ArcGIS classBreaks logic
+   * @param info - The style configuration entries, used
+   *   primarily to determine visibility of the last class when `hasDefault` is true
+   * @returns A fully assembled boolean expression. Returns `(1=0)` when `filterArray` is empty.
+   *   When `hasDefault` is true and the last class is visible, returns an `OR`-based expression
+   *   (e.g., `(field >= 0 or (field > 10 and field <= 20))`).
+   *   Otherwise, returns a nested `AND`/`OR` expression
+   *   (e.g., `((field >= 0 and field <= 10) or (field > 10 and field <= 20))`)
+   */
+  static #buildClassBreakExpression(filterArray: string[], hasDefault: boolean, info: TypeLayerStyleConfigInfo[]): string {
+    if (filterArray.length === 0) return this.DEFAULT_FILTER_1EQUALS0;
+
+    // Default visible / has default AND last class visible
+    if (hasDefault && info[info.length - 1].visible !== false) {
+      const expr = `${filterArray.slice(0, -1).reduce((prev, node, i) => {
+        if (i === 0) return `(${node} or `;
+        if (i % 2 === 0) return `${prev} and ${node}) or `;
+        return `${prev}(${node}`;
+      }, '')}${filterArray.at(-1)})`;
+
+      return expr;
+    }
+
+    // Default not visible
+    return `${filterArray.reduce((prev, node, i) => {
+      if (i === 0) return `((${node} and `;
+      if (i % 2 === 0) return `${prev} or (${node} and `;
+      return `${prev}${node})`;
+    }, '')})`;
+  }
+
+  /**
+   * Formats the field value to use in the query.
+   *
+   * @param fieldName - The field name
+   * @param rawValue - The unformatted field value
+   * @param outFields - The outfields information that knows the field type
+   * @returns The resulting field value
+   */
+  static #formatFieldValue(fieldName: string, rawValue: unknown, outFields: TypeOutfields[] | undefined): string {
+    const fieldEntry = outFields?.find((outField) => outField.name === fieldName);
+    const fieldType = fieldEntry?.type;
+    switch (fieldType) {
+      case 'date':
+        return `date '${rawValue}'`;
+      case 'string': {
+        // Double the quotes
+        const value = `${rawValue}`.replaceAll("'", "''");
+        return `'${value}'`;
+      }
+      default: {
+        // Should be a number, check it in case...
+        const number = Number(rawValue);
+
+        // If is NaN
+        if (Number.isNaN(number)) return '0'; // We were tricked, it's not a numeric value, use 0 for now..
+        return `${number}`; // All good
+      }
+    }
+  }
+} // END CLASS

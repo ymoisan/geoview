@@ -1,0 +1,192 @@
+import { expose } from 'comlink';
+import proj4 from 'proj4';
+import { register } from 'ol/proj/proj4';
+import type { Coordinate } from 'ol/coordinate';
+
+import type { SerializedGeometry } from '@/api/types/map-schema-types';
+import { createWorkerLogger } from '@/core/workers/helper/logger-worker';
+
+/**
+ * This worker script is designed to be used with the JsonExportWorker class.
+ *
+ * It handles the transformation of GeoJSON features from one coordinate system to another.
+ * The main operations are:
+ * 1. Initialization: Set up the source and target coordinate reference systems.
+ * 2. Processing: Transform chunks of GeoJSON features, converting their geometries.
+ *
+ * The worker uses proj4 for coordinate transformations and includes a custom
+ * definition for the EPSG:3978 projection.
+ */
+
+/** Chunk data structure for JSON export containing geometry and properties. */
+export type TypeWorkerExportChunk = {
+  geometry: SerializedGeometry;
+  properties: {
+    [k: string]: unknown;
+  };
+};
+
+/** Projection information for coordinate transformation. */
+export type TypeWorkerExportProjectionInfo = {
+  sourceCRS: string;
+  targetCRS: string;
+};
+
+// Initialize the worker logger
+const logger = createWorkerLogger('json-export-worker');
+
+// Variables to store the source and target coordinate reference systems
+let sourceCRS: string;
+let targetCRS: string;
+
+// Register the EPSG:3978 projection. This is needed because wroker does not work on same thread as main
+// and do not have access to our already define proj4 version.
+proj4.defs(
+  'EPSG:3978',
+  '+proj=lcc +lat_1=49 +lat_2=77 +lat_0=49 +lon_0=-95 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs'
+);
+register(proj4);
+
+/**
+ * Transforms an array of points from the source CRS to the target CRS.
+ *
+ * @param points - Array of point coordinates to transform
+ * @returns Array of transformed point coordinates
+ */
+function transformPoints(points: Coordinate[]): Coordinate[] {
+  const converted: Array<Array<number>> = [];
+
+  if (Array.isArray(points) && points.length > 0) {
+    if (Array.isArray(points[0])) {
+      for (let i = 0; i < points.length; i++) {
+        const coords = proj4(sourceCRS, targetCRS, points[i]);
+        converted.push(coords);
+      }
+    }
+  }
+
+  return converted;
+}
+
+/**
+ * Transforms the geometry of a GeoJSON feature.
+ *
+ * @param geometry - The geometry to transform
+ * @returns The transformed geometry
+ */
+function transformGeometry(geometry: SerializedGeometry): SerializedGeometry {
+  if (geometry.type === 'Polygon') {
+    return {
+      type: 'Polygon',
+      coordinates: geometry.coordinates.map((coords: Coordinate[]) => {
+        return coords.map((coord: Coordinate) => transformPoints([coord])[0]);
+      }),
+    };
+  }
+
+  if (geometry.type === 'MultiPolygon') {
+    return {
+      type: 'MultiPolygon',
+      coordinates: geometry.coordinates.map((coords1: Coordinate[][]) => {
+        return coords1.map((coords2: Coordinate[]) => {
+          return coords2.map((coord: Coordinate) => transformPoints([coord])[0]);
+        });
+      }),
+    };
+  }
+
+  if (geometry.type === 'LineString') {
+    return {
+      type: 'LineString',
+      coordinates: geometry.coordinates.map((coord: Coordinate) => transformPoints([coord])[0]),
+    };
+  }
+
+  if (geometry.type === 'MultiLineString') {
+    return {
+      type: 'MultiLineString',
+      coordinates: geometry.coordinates.map((coords: Coordinate[]) => {
+        return coords.map((coord: Coordinate) => transformPoints([coord])[0]);
+      }),
+    };
+  }
+
+  if (geometry.type === 'Point') {
+    return { type: 'Point', coordinates: transformPoints([geometry.coordinates])[0] };
+  }
+
+  if (geometry.type === 'MultiPoint') {
+    return {
+      type: 'MultiPoint',
+      coordinates: geometry.coordinates.map((coord: Coordinate) => transformPoints([coord])[0]),
+    };
+  }
+
+  if (geometry.type === 'GeometryCollection') {
+    return {
+      type: 'GeometryCollection',
+      geometries: geometry.geometries.map((nestedGeometry: SerializedGeometry) => transformGeometry(nestedGeometry)),
+    };
+  }
+
+  throw new Error(`Unsupported geometry type for transformation: ${(geometry as { type: string }).type}`);
+}
+
+/** The main worker object containing methods for initialization and processing. */
+const worker = {
+  /**
+   * Initializes the worker with projection information.
+   *
+   * @param projectionInfo - The projection information
+   */
+  init(projectionInfo: TypeWorkerExportProjectionInfo) {
+    try {
+      ({ sourceCRS } = projectionInfo);
+      ({ targetCRS } = projectionInfo);
+      logger.logTrace('init worker', `Worker initialized with sourceCRS: ${sourceCRS}, targetCRS: ${targetCRS}`);
+    } catch (error: unknown) {
+      logger.logError('init worker', error);
+    }
+  },
+
+  /**
+   * Processes a chunk of GeoJSON features, transforming their geometries.
+   *
+   * @param chunk - The chunk of GeoJSON features to process
+   * @param isFirst - Whether this is the first chunk of the dataset
+   * @returns The processed features as a JSON string
+   */
+  process(chunk: TypeWorkerExportChunk[], isFirst: boolean): string {
+    try {
+      logger.logTrace('process worker', `Processing chunk of ${chunk.length} items`);
+      let result = '';
+      if (isFirst) {
+        result += '{"type":"FeatureCollection","features":[';
+      } else if (chunk.length > 0) {
+        result += ',';
+      }
+
+      const processedChunk = chunk.map((feature: TypeWorkerExportChunk) => {
+        const { geometry, properties } = feature;
+        const transformedGeometry = transformGeometry(geometry);
+        return JSON.stringify({
+          type: 'Feature',
+          geometry: transformedGeometry,
+          properties,
+        });
+      });
+
+      result += processedChunk.join(',');
+
+      logger.logTrace('process worker', `Finished processing`);
+      return result;
+    } catch (error: unknown) {
+      logger.logError('process worker', error);
+      return '';
+    }
+  },
+};
+
+// Expose the worker methods to be accessible from the main thread
+expose(worker);
+export default {} as typeof Worker & { new (): Worker };

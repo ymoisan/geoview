@@ -1,0 +1,2068 @@
+﻿import type BaseLayer from 'ol/layer/Base';
+
+import {
+  ConfigBaseClass,
+  type LayerStatusChangedDelegate,
+  type LayerStatusChangedEvent,
+} from '@/api/config/validation-classes/config-base-class';
+import type { Extent } from '@/api/types/map-schema-types';
+import { GroupLayerEntryConfig } from '@/api/config/validation-classes/group-layer-entry-config';
+import EventHelper, { type EventDelegateBase } from '@/api/events/event-helper';
+
+import type { TypeLayerStatus } from '@/api/types/layer-schema-types';
+import type { TypeLegendItem } from '@/core/components/layers/types';
+import { LayerConfigNotFoundError } from '@/core/exceptions/geoview-exceptions';
+import { LayerWrongTypeError, LayerNotFoundError } from '@/core/exceptions/layer-exceptions';
+import type {
+  AbstractBaseGVLayer,
+  LayerBaseDelegate,
+  LayerBaseEvent,
+  LayerNameChangedDelegate,
+  LayerNameChangedEvent,
+  LayerOpacityChangedDelegate,
+  LayerOpacityChangedEvent,
+  LayerVisibleChangedDelegate,
+  LayerVisibleChangedEvent,
+} from '@/geo/layer/gv-layers/abstract-base-layer';
+import {
+  GVGroupLayer,
+  type LayerGroupChildrenUpdatedDelegate,
+  type LayerGroupChildrenUpdatedEvent,
+} from '@/geo/layer/gv-layers/gv-group-layer';
+import { AbstractGVLayer } from '@/geo/layer/gv-layers/abstract-gv-layer';
+import { AbstractGVRaster, type ImageLoadRescueDelegate, type ImageLoadRescueEvent } from '@/geo/layer/gv-layers/raster/abstract-gv-raster';
+import type {
+  LayerErrorDelegate,
+  LayerErrorEvent,
+  LayerFilterAppliedDelegate,
+  LayerFilterAppliedEvent,
+  LayerHoverableChangedDelegate,
+  LayerHoverableChangedEvent,
+  LayerItemVisibilityChangedDelegate,
+  LayerItemVisibilityChangedEvent,
+  LayerMessageDelegate,
+  LayerMessageEvent,
+  LayerQueryableChangedDelegate,
+  LayerQueryableChangedEvent,
+} from '@/geo/layer/gv-layers/abstract-gv-layer';
+import { AbstractBaseLayerEntryConfig } from '@/api/config/validation-classes/abstract-base-layer-entry-config';
+import { GVWMS, type WMSStyleChangedDelegate, type WMSStyleChangedEvent } from '@/geo/layer/gv-layers/raster/gv-wms';
+import {
+  GVEsriImage,
+  type RasterFunctionChangedEvent,
+  type RasterFunctionChangedDelegate,
+  type MosaicRuleChangedEvent,
+  type MosaicRuleChangedDelegate,
+} from '@/geo/layer/gv-layers/raster/gv-esri-image';
+import { GeoUtilities } from '@/geo/utils/utilities';
+
+/**
+ * Domain class responsible for managing layer registrations and lifecycle.
+ *
+ * Owns the registries of layer entry configurations, GeoView layers, and
+ * OpenLayers layers. Emits domain events when layers are registered,
+ * unregistered, or when their properties change (status, name, queryable,
+ * hoverable).
+ */
+export class LayerDomain {
+  /** Layers with valid configuration for this map. */
+  #layerEntryConfigs: { [layerPath: string]: ConfigBaseClass } = {};
+
+  /** Dictionary holding all the new GVLayers */
+  #gvLayers: { [layerPath: string]: AbstractBaseGVLayer } = {};
+
+  /** Dictionary holding all the OpenLayers layers */
+  #olLayers: { [layerPath: string]: BaseLayer } = {};
+
+  /** Keep a bounded reference to the layer status changed handler */
+  #boundedHandleLayerStatusChanged: LayerStatusChangedDelegate;
+
+  /** Keep a bounded reference to the layer name changed handler */
+  #boundedHandleLayerNameChanged: LayerNameChangedDelegate;
+
+  /** Keep a bounded reference to the layer visible changed handler */
+  #boundedHandleLayerVisibleChanged: LayerVisibleChangedDelegate;
+
+  /** Keep a bounded reference to the handle layer opacity changed */
+  #boundedHandleLayerOpacityChanged: LayerOpacityChangedDelegate;
+
+  /** Keep a bounded reference to the handle layer loading */
+  #boundedHandleLayerLoading: LayerBaseDelegate;
+
+  /** Keep a bounded reference to the handle layer first loaded */
+  #boundedHandleLayerFirstLoaded: LayerBaseDelegate;
+
+  /** Keep a bounded reference to the handle layer loaded */
+  #boundedHandleLayerLoaded: LayerBaseDelegate;
+
+  /** Keep a bounded reference to the handle layer error */
+  #boundedHandleLayerError: LayerErrorDelegate;
+
+  /** Keep a bounded reference to the handle layer message */
+  #boundedHandleLayerMessage: LayerMessageDelegate;
+
+  /** Keep a bounded reference to the handle layer hoverable changed */
+  #boundedHandleLayerHoverableChanged: LayerHoverableChangedDelegate;
+
+  /** Keep a bounded reference to the handle layer queryable changed */
+  #boundedHandleLayerQueryableChanged: LayerQueryableChangedDelegate;
+
+  /** Keep a bounded reference to the handle layer item visibility changed */
+  #boundedHandleLayerItemVisibilityChanged: LayerItemVisibilityChangedDelegate;
+
+  /** Keep a bounded reference to the handle layer filter applied */
+  #boundedHandleLayerFilterApplied: LayerFilterAppliedDelegate;
+
+  /** Keep a bounded reference to the handle Group Layer Added Callbacks */
+  #boundedHandleLayerGroupLayerAdded: LayerGroupChildrenUpdatedDelegate;
+
+  /** Keep a bounded reference to the handle Group Layer Removed Callbacks */
+  #boundedHandleLayerGroupLayerRemoved: LayerGroupChildrenUpdatedDelegate;
+
+  /** Keep a bounded reference to the handle Layer Image Load Callbacks */
+  #boundedHandleLayerImageLoadRescue: ImageLoadRescueDelegate;
+
+  /** Keep a bounded reference to the handle WMS style changed */
+  #boundedHandleLayerWMSStyleChanged: WMSStyleChangedDelegate;
+
+  /** Keep a bounded reference to the handle layer raster function changed */
+  #boundedHandleLayerRasterFunctionChanged: RasterFunctionChangedDelegate;
+
+  /** Keep a bounded reference to the handle layer mosaic rule changed */
+  #boundedHandleLayerMosaicRuleChanged: MosaicRuleChangedDelegate;
+
+  /** Callback delegates for the layer entry config registered event. */
+  #onLayerEntryConfigRegisteredHandlers: DomainLayerStatusChangedDelegate[] = [];
+
+  /** Callback delegates for the layer entry config unregistered event. */
+  #onLayerEntryConfigUnregisteredHandlers: DomainLayerStatusChangedDelegate[] = [];
+
+  /** Callback delegates for the layer status changed event. */
+  #onLayerStatusChangedHandlers: DomainLayerStatusChangedDelegate[] = [];
+
+  /** Callback delegates for the layer registered event. */
+  #onLayerRegisteredHandlers: DomainLayerRegisteredDelegate[] = [];
+
+  /** Callback delegates for the layer unregistered event. */
+  #onLayerUnregisteredHandlers: DomainLayerRegisteredDelegate[] = [];
+
+  /** Callback delegates for the all layers loaded event. */
+  #onLayerAllLoadedHandlers: DomainLayerStatusChangedDelegate[] = [];
+
+  /** Callback delegates for the layer name changed event. */
+  #onLayerNameChangedHandlers: DomainLayerNameChangedDelegate[] = [];
+
+  /** Callback delegates for the layer visible changed event. */
+  #onLayerVisibleChangedHandlers: DomainLayerVisibleChangedDelegate[] = [];
+
+  /** Callback delegates for the layer opacity changed event. */
+  #onLayerOpacityChangedHandlers: DomainLayerOpacityChangedDelegate[] = [];
+
+  /** Callback delegates for the layer loading event. */
+  #onLayerLoadingHandlers: DomainLayerBaseDelegate[] = [];
+
+  /** Callback delegates for the layer first loaded event. */
+  #onLayerFirstLoadedHandlers: DomainLayerBaseDelegate[] = [];
+
+  /** Callback delegates for the layer loaded event. */
+  #onLayerLoadedHandlers: DomainLayerBaseDelegate[] = [];
+
+  /** Callback delegates for the layer error event. */
+  #onLayerErrorHandlers: DomainLayerErrorDelegate[] = [];
+
+  /** Callback delegates for the layer message event. */
+  #onLayerMessageHandlers: DomainLayerMessageDelegate[] = [];
+
+  /** Callback delegates for the layer hoverable changed event. */
+  #onLayerHoverableChangedHandlers: DomainLayerHoverableChangedDelegate[] = [];
+
+  /** Callback delegates for the layer queryable changed event. */
+  #onLayerQueryableChangedHandlers: DomainLayerQueryableChangedDelegate[] = [];
+
+  /** Callback delegates for the layer item visibility changed event. */
+  #onLayerItemVisibilityChangedHandlers: DomainLayerItemVisibilityChangedDelegate[] = [];
+
+  /** Callback delegates for the layer filter applied event. */
+  #onLayerFilterAppliedHandlers: DomainLayerFilterAppliedDelegate[] = [];
+
+  /** Callback delegates for the group layer added event. */
+  #onLayerGroupLayerAddedHandlers: DomainLayerGroupChildrenUpdatedDelegate[] = [];
+
+  /** Callback delegates for the group layer removed event. */
+  #onLayerGroupLayerRemovedHandlers: DomainLayerGroupChildrenUpdatedDelegate[] = [];
+
+  /** Callback delegates for the image load rescue event. */
+  #onLayerImageLoadRescueHandlers: DomainLayerImageLoadRescueDelegate[] = [];
+
+  /** Callback delegates for the WMS style changed event. */
+  #onLayerWMSStyleChangedHandlers: DomainLayerWMSStyleChangedDelegate[] = [];
+
+  /** Callback delegates for the layer raster function changed event. */
+  #onLayerRasterFunctionChangedHandlers: DomainLayerRasterFunctionChangedDelegate[] = [];
+
+  /** Callback delegates for the layer mosaic rule changed event. */
+  #onLayerMosaicRuleChangedHandlers: DomainLayerMosaicRuleChangedDelegate[] = [];
+
+  /**
+   * Constructs an instance of LayerDomain.
+   */
+  constructor() {
+    // Keep bounded references to the handlers
+    this.#boundedHandleLayerStatusChanged = this.#handleLayerStatusChanged.bind(this);
+    this.#boundedHandleLayerNameChanged = this.#handleLayerNameChanged.bind(this);
+    this.#boundedHandleLayerVisibleChanged = this.#handleLayerVisibleChanged.bind(this);
+    this.#boundedHandleLayerOpacityChanged = this.#handleLayerOpacityChanged.bind(this);
+    this.#boundedHandleLayerLoading = this.#handleLayerLoading.bind(this);
+    this.#boundedHandleLayerFirstLoaded = this.#handleLayerFirstLoaded.bind(this);
+    this.#boundedHandleLayerLoaded = this.#handleLayerLoaded.bind(this);
+    this.#boundedHandleLayerError = this.#handleLayerError.bind(this);
+    this.#boundedHandleLayerMessage = this.#handleLayerMessage.bind(this);
+    this.#boundedHandleLayerHoverableChanged = this.#handleLayerHoverableChanged.bind(this);
+    this.#boundedHandleLayerQueryableChanged = this.#handleLayerQueryableChanged.bind(this);
+    this.#boundedHandleLayerItemVisibilityChanged = this.#handleLayerItemVisibilityChanged.bind(this);
+    this.#boundedHandleLayerFilterApplied = this.#handleLayerFilterApplied.bind(this);
+    this.#boundedHandleLayerGroupLayerAdded = this.#handleLayerGroupLayerAdded.bind(this);
+    this.#boundedHandleLayerGroupLayerRemoved = this.#handleLayerGroupLayerRemoved.bind(this);
+    this.#boundedHandleLayerImageLoadRescue = this.#handleLayerImageLoadRescue.bind(this);
+    this.#boundedHandleLayerWMSStyleChanged = this.#handleLayerWmsStyleChanged.bind(this);
+    this.#boundedHandleLayerRasterFunctionChanged = this.#handleLayerRasterFunctionChanged.bind(this);
+    this.#boundedHandleLayerMosaicRuleChanged = this.#handleLayerMosaicRuleChanged.bind(this);
+  }
+
+  // #region PUBLIC LAYER GETTERS
+
+  /**
+   * Gets the GeoView Layer Ids / UUIDs.
+   *
+   * @returns The ids of the layers
+   */
+  getGeoviewLayerIds(): string[] {
+    const uniqueIds = new Set<string>();
+    for (const layerPath of this.getLayerEntryLayerPaths()) {
+      uniqueIds.add(layerPath.split('/')[0]);
+    }
+    return Array.from(uniqueIds);
+  }
+
+  /**
+   * Gets the Layer Entry layer paths.
+   *
+   * @returns The GeoView Layer Paths
+   */
+  getLayerEntryLayerPaths(): string[] {
+    return Object.keys(this.#layerEntryConfigs);
+  }
+
+  /**
+   * Gets the Layer Entry Configs.
+   *
+   * @returns The ConfigBaseClass Layer Entry configuration
+   */
+  getLayerEntryConfigs(): ConfigBaseClass[] {
+    return Object.values(this.#layerEntryConfigs);
+  }
+
+  /**
+   * Gets the layer configuration of the specified layer path.
+   *
+   * @param layerPath - The layer path
+   * @returns The ConfigBaseClass layer configuration
+   * @throws {LayerConfigNotFoundError} When the layer configuration couldn't be found at the given layer path
+   */
+  getLayerEntryConfig(layerPath: string): ConfigBaseClass {
+    // Get the layer config
+    const layerConfig = this.#layerEntryConfigs?.[layerPath];
+
+    // If not found
+    if (!layerConfig) throw new LayerConfigNotFoundError(layerPath);
+
+    // Return the layer config
+    return layerConfig;
+  }
+
+  /**
+   * Gets the layer configuration of the specified layer path.
+   *
+   * @param layerPath - The layer path
+   * @returns The ConfigBaseClass layer configuration or undefined if not found
+   */
+  getLayerEntryConfigIfExists(layerPath: string): ConfigBaseClass | undefined {
+    return this.#layerEntryConfigs?.[layerPath];
+  }
+
+  /**
+   * Gets the layer configuration of a regular layer (not a group) at the specified layer path.
+   *
+   * @param layerPath - The layer path
+   * @returns The AbstractBaseLayerEntryConfig layer configuration
+   * @throws {LayerConfigNotFoundError} When the layer configuration couldn't be found at the given layer path
+   * @throws {LayerWrongTypeError} When the layer configuration is of the wrong type at the given layer path
+   */
+  getLayerEntryConfigRegular(layerPath: string): AbstractBaseLayerEntryConfig {
+    // Get the layer entry config
+    const layerConfig = this.getLayerEntryConfig(layerPath);
+
+    // Check if wrong type
+    if (!(layerConfig instanceof AbstractBaseLayerEntryConfig)) throw new LayerWrongTypeError(layerPath, layerConfig.getLayerNameCascade());
+
+    // Return the layer config
+    return layerConfig;
+  }
+
+  /**
+   * Gets the layer configuration of a group layer (not a regular) at the specified layer path.
+   *
+   * @param layerPath - The layer path
+   * @returns The GroupLayerEntryConfig layer configuration
+   * @throws {LayerConfigNotFoundError} When the layer configuration couldn't be found at the given layer path
+   * @throws {LayerWrongTypeError} When the layer configuration is of the wrong type at the given layer path
+   */
+  getLayerEntryConfigGroup(layerPath: string): GroupLayerEntryConfig {
+    // Get the layer entry config
+    const layerConfig = this.getLayerEntryConfig(layerPath);
+
+    // Check if wrong type
+    if (!(layerConfig instanceof GroupLayerEntryConfig)) throw new LayerWrongTypeError(layerPath, layerConfig.getLayerNameCascade());
+
+    // Return the layer config
+    return layerConfig;
+  }
+
+  /**
+   * Gets the GeoView Layer Paths.
+   *
+   * @returns The layer paths of the GV Layers
+   */
+  getGeoviewLayerPaths(): string[] {
+    return Object.keys(this.#layerEntryConfigs);
+  }
+
+  /**
+   * Gets all GeoView Layers
+   *
+   * @returns The list of new Geoview Layers
+   */
+  getGeoviewLayers(): AbstractBaseGVLayer[] {
+    return Object.values(this.#gvLayers);
+  }
+
+  /**
+   * Gets all GeoView layers that are regular layers (not groups).
+   *
+   * This method filters the list returned by `getGeoviewLayers()` and
+   * returns only the layers that are instances of `AbstractGVLayer`.
+   *
+   * @returns An array containing only the regular layers from the current GeoView layer collection
+   */
+  getGeoviewLayersRegulars(): AbstractGVLayer[] {
+    return this.getGeoviewLayers().filter((l) => l instanceof AbstractGVLayer);
+  }
+
+  /**
+   * Gets all GeoView layers that are group layers.
+   *
+   * This method filters the list returned by `getGeoviewLayers()` and
+   * returns only the layers that are instances of `GVGroupLayer`.
+   *
+   * @returns An array containing only the group layers from the current GeoView layer collection
+   */
+  getGeoviewLayersGroups(): GVGroupLayer[] {
+    return this.getGeoviewLayers().filter((l) => l instanceof GVGroupLayer);
+  }
+
+  /**
+   * Gets all GeoView layers that are at the root.
+   *
+   * @returns An array containing only the layers at the root level of the registry
+   */
+  getGeoviewLayersRoot(): AbstractBaseGVLayer[] {
+    return this.getGeoviewLayers().filter((layer) => !layer.getParent());
+  }
+
+  /**
+   * Returns the GeoView instance associated to the layer path.
+   *
+   * @param layerPath - The layer path
+   * @returns The AbstractBaseGVLayer associated to the layer path
+   * @throws {LayerNotFoundError} When the layer couldn't be found at the given layer path
+   */
+  getGeoviewLayer(layerPath: string): AbstractBaseGVLayer {
+    // Get the layer
+    const layer = this.#gvLayers[layerPath];
+
+    // If not found
+    if (!layer) throw new LayerNotFoundError(layerPath);
+
+    // Return the layer
+    return layer;
+  }
+
+  /**
+   * Returns the GeoView Layer instance associated to the layer path.
+   *
+   * @param layerPath - The layer path
+   * @returns The AbstractBaseGVLayer or undefined when not found
+   */
+  getGeoviewLayerIfExists(layerPath: string): AbstractBaseGVLayer | undefined {
+    return this.#gvLayers[layerPath];
+  }
+
+  /**
+   * Returns the first GeoView layer registered under the given root id.
+   *
+   * A match is a layer whose path is exactly the root id or is nested under it (`${rootId}/...`). This is useful when
+   * only the root id is known — e.g. a GeoCore UUID whose sublayer structure (`uuid/<layerId>`) is only resolved at
+   * runtime — so callers holding the root id can still reach the resolved layer.
+   *
+   * Note: the root id is matched verbatim, so a bare UUID does not match a duplicate-UUID `:suffix` path (`uuid:xxx/...`).
+   *
+   * @param rootId - The root layer id (e.g. a GeoCore UUID)
+   * @returns The first AbstractBaseGVLayer under that root id
+   * @throws {LayerNotFoundError} When no layer is found under the given root id
+   */
+  getGeoviewLayerByRootId(rootId: string): AbstractBaseGVLayer {
+    // Get the layer if any
+    const layer = this.getGeoviewLayerByRootIdIfExists(rootId);
+
+    // If not found
+    if (!layer) throw new LayerNotFoundError(rootId);
+
+    // Return the layer
+    return layer;
+  }
+
+  /**
+   * Returns the first GeoView layer registered under the given root id, if one exists.
+   *
+   * A match is a layer whose path is exactly the root id or is nested under it (`${rootId}/...`). This is useful when
+   * only the root id is known — e.g. a GeoCore UUID whose sublayer structure (`uuid/<layerId>`) is only resolved at
+   * runtime — so callers holding the root id can still reach the resolved layer.
+   *
+   * Note: the root id is matched verbatim, so a bare UUID does not match a duplicate-UUID `:suffix` path (`uuid:xxx/...`).
+   *
+   * @param rootId - The root layer id (e.g. a GeoCore UUID)
+   * @returns The first AbstractBaseGVLayer under that root id, or undefined when none is found
+   */
+  getGeoviewLayerByRootIdIfExists(rootId: string): AbstractBaseGVLayer | undefined {
+    // The first key by insertion order is treated as the first layer under the root id
+    const layerPath = Object.keys(this.#gvLayers).find((path) => path === rootId || path.startsWith(`${rootId}/`));
+    return layerPath ? this.#gvLayers[layerPath] : undefined;
+  }
+
+  /**
+   * Returns the AbstractGVLayer instance associated to the layer path.
+   *
+   * This returns an actual AbstractGVLayer and throws a LayerWrongTypeError if the layerPath points to a GVGroupLayer object.
+   * An AbstractGVLayer is essentially a layer that's not a group layer.
+   *
+   * @param layerPath - The layer path
+   * @returns The AbstractGVLayer Layer
+   * @throws {LayerNotFoundError} When the layer couldn't be found at the given layer path
+   * @throws {LayerWrongTypeError} When the layer is of wrong type at the given layer path
+   */
+  getGeoviewLayerRegular(layerPath: string): AbstractGVLayer {
+    // Get the layer
+    const layer = this.getGeoviewLayer(layerPath);
+
+    // If wrong type
+    if (!(layer instanceof AbstractGVLayer)) throw new LayerWrongTypeError(layerPath, layer.getLayerName());
+
+    // Return the layer
+    return layer;
+  }
+
+  /**
+   * Returns the GeoView Layer instance associated to the layer path, if it exists.
+   *
+   * This returns an actual AbstractGVLayer (or undefined) and throws a LayerWrongTypeError if the layerPath points to a GVGroupLayer object.
+   * An AbstractGVLayer is essentially a layer that's not a group layer.
+   *
+   * @param layerPath - The layer path
+   * @returns The AbstractGVLayer or undefined when not found
+   * @throws {LayerWrongTypeError} When the layer is of wrong type at the given layer path
+   */
+  getGeoviewLayerRegularIfExists(layerPath: string): AbstractGVLayer | undefined {
+    // Get the layer if any
+    const layer = this.getGeoviewLayerIfExists(layerPath);
+
+    // If found, check if the right type
+    if (layer) {
+      // If wrong type
+      if (!(layer instanceof AbstractGVLayer)) throw new LayerWrongTypeError(layerPath, layer.getLayerName());
+    }
+
+    // Return the layer or undefined
+    return layer;
+  }
+
+  /**
+   * Sets the visibility of all style items for a regular layer.
+   *
+   * This delegates the batch mutation to the underlying GV layer so item visibility updates,
+   * class-filter regeneration, and optional render waiting remain owned by the layer/domain side.
+   *
+   * @param layerPath - The layer path
+   * @param visible - Whether all style items should be visible
+   * @param waitForRender - When `true`, waits for the next layer render to complete before resolving
+   * @returns A promise that resolves with the legend items whose visibility actually changed
+   * @throws {LayerNotFoundError} When the layer couldn't be found at the given layer path
+   * @throws {LayerWrongTypeError} When the layer is of wrong type at the given layer path
+   */
+  setAllLayerItemsVisibility(layerPath: string, visible: boolean, waitForRender: boolean): Promise<TypeLegendItem[]> {
+    return this.getGeoviewLayerRegular(layerPath).setAllStyleItemsVisibility(visible, waitForRender);
+  }
+
+  /**
+   * Waits for a layer entry config to be registered and returns it.
+   *
+   * Resolves immediately if the config is already registered; otherwise subscribes to the `onceLayerEntryConfigRegistered` event and resolves as soon as a config with the matching layer path is registered.
+   *
+   * @param layerPath - The layer path to the layer's configuration
+   * @param timeout - Optional timeout in milliseconds. When provided, the promise will reject if the layer is not registered within the specified time
+   * @returns A promise that resolves to the ConfigBaseClass associated to the layer path
+   */
+  async waitForLayerConfigRegistered(layerPath: string, timeout?: number): Promise<ConfigBaseClass> {
+    // Return a promise that resolves when the layer entry config is registered, or immediately if it already is
+    const existing = this.getLayerEntryConfigIfExists(layerPath);
+    if (existing) return Promise.resolve(existing);
+    const eventResponse = await this.onceLayerEntryConfigRegistered((event) => event.config.layerPath === layerPath, timeout);
+    return eventResponse.config;
+  }
+
+  /**
+   * Waits for a layer to be registered and returns the GeoView layer associated to a specific layer path.
+   *
+   * Resolves immediately if the layer is already registered; otherwise subscribes to the `onceLayerRegistered` event and resolves as soon as a layer with the matching path is registered.
+   *
+   * @param layerPath - The layer path to the layer's configuration
+   * @param timeout - Optional timeout in milliseconds. When provided, the promise will reject if the layer is not registered within the specified time
+   * @returns A promise that resolves to a GeoView layer associated to the layer path
+   */
+  async waitForLayerRegistered(layerPath: string, timeout?: number): Promise<AbstractBaseGVLayer> {
+    // Return a promise that resolves when the layer is registered, or immediately if it already is
+    const existing = this.getGeoviewLayerIfExists(layerPath);
+    if (existing) return Promise.resolve(existing);
+    const eventResponse = await this.onceLayerRegistered((event) => event.layer.getLayerPath() === layerPath, timeout);
+    return eventResponse.layer;
+  }
+
+  /**
+   * Asynchronously returns the OpenLayer layer associated to a specific layer path.
+   *
+   * Resolves immediately if the layer is already registered; otherwise subscribes to the
+   * `onceLayerRegistered` event and resolves as soon as a layer with the matching path is registered.
+   * Note this function uses the 'Async' suffix to differentiate it from 'getOLLayer'.
+   *
+   * @param layerPath - The layer path to the layer's configuration
+   * @returns A promise that resolves to an OpenLayer layer associated to the layer path
+   * @deprecated This method is deprecated and will be removed in future versions. Use `getGeoviewLayerRegular(layerPath).getOLLayer()` instead and
+   * make the waiting asynchronicity happening here more clear in the caller, as it's a bit risky (layer might never be registered).
+   */
+  async getOLLayerAsync(layerPath: string): Promise<BaseLayer> {
+    // Wait for the layer to be registered (or get it immediately if already registered)
+    const gvLayer = await this.waitForLayerRegistered(layerPath);
+    return gvLayer.getOLLayer();
+  }
+
+  // #endregion PUBLIC LAYER GETTERS
+
+  /**
+   * Registers a layer entry configuration.
+   *
+   * Keeps the layer configuration by its layer path and registers an internal handler
+   * to track layer status changes throughout the configuration lifecycle.
+   *
+   * @param layerConfig - The layer configuration to register
+   */
+  registerLayerEntryConfig(layerConfig: ConfigBaseClass): void {
+    // Keep it
+    this.#layerEntryConfigs[layerConfig.layerPath] = layerConfig;
+
+    // Register a handler when the config layer status changes (this allows catching the status >= registered, all the way to loaded/error)
+    layerConfig.onLayerStatusChanged(this.#boundedHandleLayerStatusChanged);
+
+    // Emit about it
+    this.#emitLayerEntryConfigRegistered({ config: layerConfig, status: layerConfig.layerStatus });
+  }
+
+  /**
+   * Unregisters a layer entry configuration.
+   *
+   * Emits the layer entry config unregistered event so that controllers
+   * can react to the removal.
+   *
+   * @param layerConfig - The layer configuration to unregister
+   */
+  unregisterLayerEntryConfig(layerConfig: ConfigBaseClass): void {
+    // Unregister the handler
+    this.#layerEntryConfigs[layerConfig.layerPath]?.offLayerStatusChanged(this.#boundedHandleLayerStatusChanged);
+
+    // Emit about it
+    this.#emitLayerEntryConfigUnregistered({ config: layerConfig, status: layerConfig.layerStatus });
+
+    // Delete it
+    delete this.#layerEntryConfigs[layerConfig.layerPath];
+  }
+
+  /**
+   * Registers a GeoView layer and its OpenLayers equivalent.
+   *
+   * Keeps both the GeoView layer wrapper and the underlying OpenLayers layer by path.
+   * For regular (non-group) layers, additionally registers a handler to track queryable state changes.
+   * If the layer entry config was deleted while the layer was being created (e.g. the user cancelled
+   * the process before the layer finished initializing), this method returns without registering.
+   *
+   * @param gvLayer - The GeoView layer to register
+   */
+  registerGVLayer(gvLayer: AbstractBaseGVLayer): void {
+    // Keep the log line commented, for debugging
+    // logger.logDebug('registerGVLayer', gvLayer.getLayerPath(), this.#layerEntryConfigs[gvLayer.getLayerPath()], gvLayer);
+
+    // Before registering the layer, validate if the layer entry is still there
+    // GV Maybe the user deleted/cancelled the process before the layer had a chance to get created
+    if (!this.#layerEntryConfigs[gvLayer.getLayerPath()]) return;
+
+    // Keep it
+    this.#gvLayers[gvLayer.getLayerPath()] = gvLayer;
+    this.#olLayers[gvLayer.getLayerPath()] = gvLayer.getOLLayer();
+
+    // Register a hook when a layer name is changed
+    gvLayer.onLayerNameChanged(this.#boundedHandleLayerNameChanged);
+
+    // Register a hook when a layer visibility is changed
+    gvLayer.onLayerVisibleChanged(this.#boundedHandleLayerVisibleChanged);
+
+    // Register a hook when a layer opacity is changed
+    gvLayer.onLayerOpacityChanged(this.#boundedHandleLayerOpacityChanged);
+
+    // If registering a regular layer
+    if (gvLayer instanceof AbstractGVLayer) {
+      // Register a hook when a layer is going into loading state
+      gvLayer.onLayerLoading(this.#boundedHandleLayerLoading);
+
+      // Register a hook when a layer is first loaded
+      gvLayer.onLayerFirstLoaded(this.#boundedHandleLayerFirstLoaded);
+
+      // Register a hook when a layer is loaded
+      gvLayer.onLayerLoaded(this.#boundedHandleLayerLoaded);
+
+      // Register a hook when a layer encounters an error
+      gvLayer.onLayerError(this.#boundedHandleLayerError);
+
+      // Add a handler on layer's message
+      gvLayer.onLayerMessage(this.#boundedHandleLayerMessage);
+
+      // Register a hook when a layer hoverable is changed
+      gvLayer.onLayerHoverableChanged(this.#boundedHandleLayerHoverableChanged);
+
+      // Register a hook when a layer queryable is changed
+      gvLayer.onLayerQueryableChanged(this.#boundedHandleLayerQueryableChanged);
+
+      // Register a hook when a layer style item visibility changed
+      gvLayer.onLayerItemVisibilityChanged(this.#boundedHandleLayerItemVisibilityChanged);
+
+      // Register a hook when a layer filter changed
+      gvLayer.onLayerFilterApplied(this.#boundedHandleLayerFilterApplied);
+
+      // For a raster layer, register a hook when the image fails to load so that we can try to rescue it
+      if (gvLayer instanceof AbstractGVRaster) gvLayer.onImageLoadRescue(this.#boundedHandleLayerImageLoadRescue);
+
+      // For a WMS, register a hook when the WMS style is changed so that we can update the layer accordingly
+      if (gvLayer instanceof GVWMS) gvLayer.onWmsStyleChanged(this.#boundedHandleLayerWMSStyleChanged);
+
+      // For an Esri Image, register a hook when the raster function is changed so that we can update the layer accordingly
+      if (gvLayer instanceof GVEsriImage) gvLayer.onRasterFunctionChanged(this.#boundedHandleLayerRasterFunctionChanged);
+
+      // For an Esri Image, register a hook when the mosaic rule is changed so that we can update the layer accordingly
+      if (gvLayer instanceof GVEsriImage) gvLayer.onMosaicRuleChanged(this.#boundedHandleLayerMosaicRuleChanged);
+    } else if (gvLayer instanceof GVGroupLayer) {
+      // It's a group layer
+
+      // Register a hook when a layer is added to the group layer
+      gvLayer.onLayerAdded(this.#boundedHandleLayerGroupLayerAdded);
+
+      // Register a hook when a layer is removed from the group layer
+      gvLayer.onLayerRemoved(this.#boundedHandleLayerGroupLayerRemoved);
+    }
+
+    // Emit about it
+    this.#emitLayerRegistered({ layer: gvLayer });
+  }
+
+  /**
+   * Deletes a GeoView layer and its OpenLayers equivalent.
+   *
+   * Removes the layer from internal registries. For regular (non-group) layers,
+   * unregisters the queryable state change handler before deletion.
+   *
+   * @param gvLayer - The GeoView layer to delete
+   * @throws {LayerNotFoundError} When the layer couldn't be found at the given layer path
+   */
+  deleteGVLayer(gvLayer: AbstractBaseGVLayer): void {
+    // Unregister handler on layer name changed
+    gvLayer.offLayerNameChanged(this.#boundedHandleLayerNameChanged);
+
+    // If deleting a regular layer
+    if (gvLayer instanceof AbstractGVLayer) {
+      // For an Esri Image, unregister the hook when the mosaic rule is changed
+      if (gvLayer instanceof GVEsriImage) gvLayer.offMosaicRuleChanged(this.#boundedHandleLayerMosaicRuleChanged);
+
+      // For an Esri Image, unregister the hook when the raster function is changed
+      if (gvLayer instanceof GVEsriImage) gvLayer.offRasterFunctionChanged(this.#boundedHandleLayerRasterFunctionChanged);
+
+      // For a WMS, unregister the hook when the WMS style is changed
+      if (gvLayer instanceof GVWMS) gvLayer.offWmsStyleChanged(this.#boundedHandleLayerWMSStyleChanged);
+
+      // For a raster layer, unregister the hook when the image fails to load
+      if (gvLayer instanceof AbstractGVRaster) gvLayer.offImageLoadRescue(this.#boundedHandleLayerImageLoadRescue);
+
+      // Unregister a hook when a layer style item visibility changes
+      gvLayer.offLayerItemVisibilityChanged(this.#boundedHandleLayerItemVisibilityChanged);
+
+      // Unregister handler on layer queryable changed
+      gvLayer.offLayerQueryableChanged(this.#boundedHandleLayerQueryableChanged);
+
+      // Unregister handler on layer hoverable changed
+      gvLayer.offLayerHoverableChanged(this.#boundedHandleLayerHoverableChanged);
+
+      // Unregister handler on layer's message
+      gvLayer.offLayerMessage(this.#boundedHandleLayerMessage);
+
+      // Unregister a hook when a layer encounters an error
+      gvLayer.offLayerError(this.#boundedHandleLayerError);
+
+      // Unregister handler on layers loaded
+      gvLayer.offLayerLoaded(this.#boundedHandleLayerLoaded);
+
+      // Unregister a hook when a layer is loaded on the map
+      gvLayer.offLayerFirstLoaded(this.#boundedHandleLayerFirstLoaded);
+
+      // Unregister a hook when a layer is going into loading state
+      gvLayer.offLayerLoading(this.#boundedHandleLayerLoading);
+    } else if (gvLayer instanceof GVGroupLayer) {
+      // Unregister a hook when a layer is removed from the group layer
+      gvLayer.offLayerRemoved(this.#boundedHandleLayerGroupLayerRemoved);
+
+      // Unregister a hook when a layer is added to the group layer
+      gvLayer.offLayerAdded(this.#boundedHandleLayerGroupLayerAdded);
+    }
+
+    // Unregister handler on layer opacity changed
+    gvLayer.offLayerOpacityChanged(this.#boundedHandleLayerOpacityChanged);
+
+    // Unregister a hook when a layer visibility is changed
+    gvLayer.offLayerVisibleChanged(this.#boundedHandleLayerVisibleChanged);
+
+    // Unregister handler on layer name changed
+    gvLayer.offLayerNameChanged(this.#boundedHandleLayerNameChanged);
+
+    // If the layer had a parent, make sure to remove it from said parent
+    gvLayer.getParent()?.removeLayer(gvLayer);
+
+    // Delete
+    delete this.#olLayers[gvLayer.getLayerPath()];
+    delete this.#gvLayers[gvLayer.getLayerPath()];
+
+    // Emit about it
+    this.#emitLayerUnregistered({ layer: gvLayer });
+  }
+
+  /**
+   * Checks if the layer statuses are all greater than or equal to the provided status
+   *
+   * @returns Indicates if all layers passed the callback and how many have passed the callback
+   */
+  checkLayerStatus(status: TypeLayerStatus, callbackNotGood?: (layerConfig: ConfigBaseClass) => void): [boolean, number] {
+    // If no layer entries at all or there are layer entries and there are geoview layers to check
+    let allGood = true;
+
+    // For each layer entry config
+    this.getLayerEntryConfigs().forEach((layerConfig) => {
+      const layerIsGood = ConfigBaseClass.allLayerStatusAreGreaterThanOrEqualTo(status, [layerConfig]);
+      if (!layerIsGood) {
+        // Callback about it
+        callbackNotGood?.(layerConfig);
+        allGood = false;
+      }
+    });
+
+    // Return if all good
+    return [allGood, this.getLayerEntryConfigs().length];
+  }
+
+  /**
+   * Checks if the layer statuses are loaded or error.
+   *
+   * @returns Indicates if all layers statuses are loaded or error
+   */
+  checkLayerStatusLoaded(): boolean {
+    // Get if all layers are loaded or error
+    const [allLoadedOrError] = this.checkLayerStatus('loaded');
+
+    // Return result
+    return allLoadedOrError;
+  }
+
+  /**
+   * Gets the max extent of all layers on the map, or of a provided subset of layers.
+   *
+   * Waits for each layer's bounds to be initialized before computing the union.
+   *
+   * @param layerIds - Identifiers or layerPaths of layers to get max extents from
+   * @returns A promise that resolves with the overall extent or undefined when no bounds are found
+   */
+  async getExtentOfMultipleLayers(layerIds: string[]): Promise<Extent | undefined> {
+    // Collect all layer paths to process
+    const layerPaths: string[] = [];
+    layerIds.forEach((layerId) => {
+      // Get sublayerpaths and layerpaths from layer IDs.
+      const subLayerPaths = this.getLayerEntryLayerPaths().filter(
+        (layerPath) => layerPath.startsWith(`${layerId}/`) || layerPath === layerId
+      );
+      layerPaths.push(...subLayerPaths);
+    });
+
+    // Wait for all layers' to be registered
+    const allLayers = await Promise.all(layerPaths.map((layerPath) => this.waitForLayerRegistered(layerPath)));
+
+    // Wait for all layers' bounds to be initialized
+    const allBounds = await Promise.all(allLayers.map((layer) => layer.waitForBounds()));
+
+    // Union all bounds together
+    let boundsUnion: Extent | undefined;
+    allBounds.forEach((bounds) => {
+      boundsUnion = GeoUtilities.getExtentUnion(boundsUnion, bounds);
+    });
+
+    // Return the final bounds
+    return boundsUnion;
+  }
+
+  // #region PRIVATE LAYER HANDLERS
+
+  /**
+   * Handles layer status changed events from registered configurations.
+   *
+   * Internal callback that is invoked when a layer configuration's status changes.
+   * Forwards the event to domain listeners via emitLayerStatusChanged.
+   *
+   * @param sender - The layer configuration whose status changed
+   * @param event - The layer status changed event
+   */
+  #handleLayerStatusChanged(sender: ConfigBaseClass, event: LayerStatusChangedEvent): void {
+    // Emit about it
+    this.#emitLayerStatusChanged({ config: sender, status: event.layerStatus });
+
+    // If the config is a layer entry (not a group)
+    if (sender instanceof AbstractBaseLayerEntryConfig) {
+      // Check if all layers are loaded/error right now
+      const allLoaded = this.checkLayerStatusLoaded();
+      if (allLoaded) {
+        // Emit about it
+        this.#emitLayerAllLoaded({ config: sender, status: event.layerStatus });
+      }
+    }
+  }
+
+  /**
+   * Handles layer name changed events from registered layers.
+   *
+   * Internal callback that is invoked when a layer's name changes.
+   * Forwards the event to domain listeners via emitLayerNameChanged.
+   *
+   * @param sender - The layer whose name changed
+   * @param event - The layer name changed event
+   */
+  #handleLayerNameChanged(sender: AbstractBaseGVLayer, event: LayerNameChangedEvent): void {
+    // Emit about it
+    this.#emitLayerNameChanged({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles layer visible state changes from registered layers.
+   *
+   * Internal callback that is invoked when a layer's visible state changes.
+   * Forwards the event to domain listeners via emitLayerVisibleChanged.
+   *
+   * @param sender - The layer whose visible state changed
+   * @param event - The layer visible changed event
+   */
+  #handleLayerVisibleChanged(sender: AbstractBaseGVLayer, event: LayerVisibleChangedEvent): void {
+    // Emit about it
+    this.#emitLayerVisibleChanged({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles layer loading events from registered layers.
+   *
+   * @param sender - The layer entering the loading state
+   * @param event - The layer base event
+   */
+  #handleLayerLoading(sender: AbstractBaseGVLayer, event: LayerBaseEvent): void {
+    // Emit about it
+    this.#emitLayerLoading({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles layer first loaded events from registered layers.
+   *
+   * @param sender - The layer that has been loaded for the first time
+   * @param event - The layer base event
+   */
+
+  #handleLayerFirstLoaded(sender: AbstractBaseGVLayer, event: LayerBaseEvent): void {
+    // Emit about it
+    this.#emitLayerFirstLoaded({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles layer loaded events from registered layers.
+   *
+   * @param sender - The layer that finished loading
+   * @param event - The layer base event
+   */
+
+  #handleLayerLoaded(sender: AbstractBaseGVLayer, event: LayerBaseEvent): void {
+    // Emit about it
+    this.#emitLayerLoaded({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles layer error events from registered layers.
+   *
+   * @param sender - The layer that encountered an error
+   * @param event - The layer error event
+   */
+  #handleLayerError(sender: AbstractGVLayer, event: LayerErrorEvent): void {
+    // Emit about it
+    this.#emitLayerError({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles layer message events from registered layers.
+   *
+   * @param sender - The layer that emitted a message
+   * @param event - The layer message event
+   */
+  #handleLayerMessage(sender: AbstractGVLayer, event: LayerMessageEvent): void {
+    // Emit about it
+    this.#emitLayerMessage({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles when a layer is added to a group layer.
+   *
+   * @param sender - The group layer that received the new child
+   * @param event - The layer event containing the added layer
+   */
+  #handleLayerGroupLayerAdded(sender: GVGroupLayer, event: LayerGroupChildrenUpdatedEvent): void {
+    // Emit about it
+    this.#emitLayerGroupLayerAdded({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles when a layer is removed from a group layer.
+   *
+   * @param sender - The group layer that lost a child
+   * @param event - The layer event containing the removed layer
+   */
+  #handleLayerGroupLayerRemoved(sender: GVGroupLayer, event: LayerGroupChildrenUpdatedEvent): void {
+    // Emit about it
+    this.#emitLayerGroupLayerRemoved({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles layer opacity state changes from registered layers.
+   *
+   * Internal callback that is invoked when a layer's opacity state changes.
+   * Forwards the event to domain listeners via emitLayerOpacityChanged.
+   *
+   * @param sender - The layer whose opacity state changed
+   * @param event - The layer opacity changed event
+   */
+  #handleLayerOpacityChanged(sender: AbstractBaseGVLayer, event: LayerOpacityChangedEvent): void {
+    // Emit about it
+    this.#emitLayerOpacityChanged({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles layer hoverable state changes from registered layers.
+   *
+   * Internal callback that is invoked when a layer's hoverable state changes.
+   * Forwards the event to domain listeners via emitLayerHoverableChanged.
+   *
+   * @param sender - The layer whose hoverable state changed
+   * @param event - The layer hoverable changed event
+   */
+  #handleLayerHoverableChanged(sender: AbstractGVLayer, event: LayerHoverableChangedEvent): void {
+    // Emit about it
+    this.#emitLayerHoverableChanged({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles layer queryable state changes from registered layers.
+   *
+   * Internal callback that is invoked when a layer's queryable state changes.
+   * Forwards the event to domain listeners via emitLayerQueryableChanged.
+   *
+   * @param sender - The layer whose queryable state changed
+   * @param event - The layer queryable changed event
+   */
+  #handleLayerQueryableChanged(sender: AbstractGVLayer, event: LayerQueryableChangedEvent): void {
+    // Emit about it
+    this.#emitLayerQueryableChanged({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles layer item visibility state changes from registered layers.
+   *
+   * Internal callback that is invoked when a layer's item visibility state changes.
+   * Forwards the event to domain listeners via emitLayerItemVisibilityChanged.
+   *
+   * @param sender - The layer whose item visibility state changed
+   * @param event - The layer item visibility changed event
+   */
+  #handleLayerItemVisibilityChanged(sender: AbstractGVLayer, event: LayerItemVisibilityChangedEvent): void {
+    // Emit about it
+    this.#emitLayerItemVisibilityChanged({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles layer filter applied events from registered layers.
+   *
+   * Internal callback that is invoked when a layer's filter is applied.
+   * Forwards the event to domain listeners via emitLayerFilterApplied.
+   *
+   * @param sender - The layer whose filter was applied
+   * @param event - The layer filter applied event
+   */
+  #handleLayerFilterApplied(sender: AbstractGVLayer, event: LayerFilterAppliedEvent): void {
+    // Emit about it
+    this.#emitLayerFilterApplied({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles raster layer image load rescue events.
+   *
+   * Forwards the rescue event to domain listeners and returns the first
+   * handler's result. Returns `undefined` (falsy) if no listener is
+   * registered, which causes the raster layer to fall through to its
+   * default error handling.
+   *
+   * @param sender - The raster layer whose image failed to load
+   * @param event - The image load rescue event
+   * @returns Whether the error was rescued by a listener
+   */
+  #handleLayerImageLoadRescue(sender: AbstractGVRaster, event: ImageLoadRescueEvent): Promise<boolean> {
+    // Emit about it
+    return this.#emitLayerImageLoadRescue({ layer: sender, layerEvent: event })?.[0];
+  }
+
+  /**
+   * Handles layer raster function changed events from registered layers.
+   *
+   * Forwards the event to domain listeners via emitLayerRasterFunctionChanged.
+   *
+   * @param sender - The layer whose raster function changed
+   * @param event - The raster function changed event
+   */
+  #handleLayerRasterFunctionChanged(sender: GVEsriImage, event: RasterFunctionChangedEvent): void {
+    // Emit about it
+    this.#emitLayerRasterFunctionChanged({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles layer mosaic rule changed events from registered layers.
+   *
+   * Forwards the event to domain listeners via emitLayerMosaicRuleChanged.
+   *
+   * @param sender - The layer whose mosaic rule changed
+   * @param event - The mosaic rule changed event
+   */
+  #handleLayerMosaicRuleChanged(sender: GVEsriImage, event: MosaicRuleChangedEvent): void {
+    // Emit about it
+    this.#emitLayerMosaicRuleChanged({ layer: sender, layerEvent: event });
+  }
+
+  /**
+   * Handles layer WMS style changed events from registered layers.
+   *
+   * Forwards the event to domain listeners via emitLayerWmsStyleChanged.
+   *
+   * @param sender - The layer whose WMS style changed
+   * @param event - The WMS style changed event
+   */
+  #handleLayerWmsStyleChanged(sender: GVWMS, event: WMSStyleChangedEvent): void {
+    // Emit about it
+    this.#emitLayerWmsStyleChanged({ layer: sender, layerEvent: event });
+  }
+
+  // #endregion PRIVATE LAYER HANDLERS
+
+  // #region EVENTS - LAYER ENTRY CONFIGS
+
+  /**
+   * Emits layer entry config registered event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerEntryConfigRegistered(event: DomainLayerStatusChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerEntryConfigRegisteredHandlers, event);
+  }
+
+  /**
+   * Returns a promise that resolves the next time a layer entry config registered event fires.
+   *
+   * @param filter - Optional filter predicate. When provided, only events passing the filter resolve the promise
+   * @param timeout - Optional timeout in milliseconds. When provided, the promise will reject if the layer is not registered within the specified time
+   * @returns A promise that resolves with the event payload when layer entry config registered fires (and passes the filter)
+   */
+  onceLayerEntryConfigRegistered(
+    filter?: (event: DomainLayerStatusChangedEvent) => boolean,
+    timeout?: number
+  ): Promise<DomainLayerStatusChangedEvent> {
+    // Register a one-shot event handler that resolves a promise
+    return EventHelper.onceEventPromise(this.#onLayerEntryConfigRegisteredHandlers, filter, timeout);
+  }
+
+  /**
+   * Registers a layer entry config registered handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerEntryConfigRegistered(callback: DomainLayerStatusChangedDelegate): DomainLayerStatusChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerEntryConfigRegisteredHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer entry config registered handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerEntryConfigRegistered(callback: DomainLayerStatusChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerEntryConfigRegisteredHandlers, callback);
+  }
+
+  /**
+   * Emits layer entry config unregistered event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerEntryConfigUnregistered(event: DomainLayerStatusChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerEntryConfigUnregisteredHandlers, event);
+  }
+
+  /**
+   * Registers a layer entry config unregistered handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerEntryConfigUnregistered(callback: DomainLayerStatusChangedDelegate): DomainLayerStatusChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerEntryConfigUnregisteredHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer entry config unregistered handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerEntryConfigUnregistered(callback: DomainLayerStatusChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerEntryConfigUnregisteredHandlers, callback);
+  }
+
+  /**
+   * Emits layer status changed event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerStatusChanged(event: DomainLayerStatusChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerStatusChangedHandlers, event);
+  }
+
+  /**
+   * Registers a one-shot layer status changed event handler that resolves a promise.
+   *
+   * @param filter - Optional filter predicate to skip non-matching events without unsubscribing
+   * @returns A promise that resolves with the layer status changed event
+   */
+  onceLayerStatusChanged(filter?: (event: DomainLayerStatusChangedEvent) => boolean): Promise<DomainLayerStatusChangedEvent> {
+    return EventHelper.onceEventPromise(this.#onLayerStatusChangedHandlers, filter);
+  }
+
+  /**
+   * Registers a layer status changed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerStatusChanged(callback: DomainLayerStatusChangedDelegate): DomainLayerStatusChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerStatusChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer status changed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerStatusChanged(callback: DomainLayerStatusChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerStatusChangedHandlers, callback);
+  }
+
+  /**
+   * Emits layer all loaded event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerAllLoaded(event: DomainLayerStatusChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerAllLoadedHandlers, event);
+  }
+
+  /**
+   * Registers a layer all loaded event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerAllLoaded(callback: DomainLayerStatusChangedDelegate): DomainLayerStatusChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerAllLoadedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer all loaded event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerAllLoaded(callback: DomainLayerStatusChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerAllLoadedHandlers, callback);
+  }
+
+  // #endregion EVENTS - LAYER ENTRY CONFIGS
+
+  // #region EVENTS - GV LAYERS
+
+  /**
+   * Emits layer registered event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerRegistered(event: DomainLayerRegisteredEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerRegisteredHandlers, event);
+  }
+
+  /**
+   * Returns a promise that resolves the next time a layer registered event fires.
+   *
+   * @param filter - Optional filter predicate. When provided, only events passing the filter resolve the promise
+   * @param timeout - Optional timeout in milliseconds. When provided, the promise will reject if the event does not fire within the specified time
+   * @returns A promise that resolves with the event payload when layer registered fires (and passes the filter)
+   */
+  onceLayerRegistered(filter?: (event: DomainLayerRegisteredEvent) => boolean, timeout?: number): Promise<DomainLayerRegisteredEvent> {
+    // Register a one-shot event handler that resolves a promise
+    return EventHelper.onceEventPromise(this.#onLayerRegisteredHandlers, filter, timeout);
+  }
+
+  /**
+   * Registers a layer registered handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerRegistered(callback: DomainLayerRegisteredDelegate): DomainLayerRegisteredDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerRegisteredHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer registered handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerRegistered(callback: DomainLayerRegisteredDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerRegisteredHandlers, callback);
+  }
+
+  /**
+   * Emits layer unregistered event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerUnregistered(event: DomainLayerRegisteredEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerUnregisteredHandlers, event);
+  }
+
+  /**
+   * Registers a layer unregistered handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerUnregistered(callback: DomainLayerRegisteredDelegate): DomainLayerRegisteredDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerUnregisteredHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer unregistered handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerUnregistered(callback: DomainLayerRegisteredDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerUnregisteredHandlers, callback);
+  }
+
+  /**
+   * Emits layer loading event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerLoading(event: DomainLayerBaseEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerLoadingHandlers, event);
+  }
+
+  /**
+   * Registers a layer loading event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerLoading(callback: DomainLayerBaseDelegate): DomainLayerBaseDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerLoadingHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer loading event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerLoading(callback: DomainLayerBaseDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerLoadingHandlers, callback);
+  }
+
+  /**
+   * Emits layer first loaded changed event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerFirstLoaded(event: DomainLayerBaseEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerFirstLoadedHandlers, event);
+  }
+
+  /**
+   * Registers a one-shot layer first loaded event handler that resolves a promise.
+   *
+   * @param filter - Optional filter predicate to skip non-matching events without unsubscribing
+   * @returns A promise that resolves with the layer first loaded event
+   */
+  onceLayerFirstLoaded(filter?: (event: DomainLayerBaseEvent) => boolean): Promise<DomainLayerBaseEvent> {
+    return EventHelper.onceEventPromise(this.#onLayerFirstLoadedHandlers, filter);
+  }
+
+  /**
+   * Registers a layer first loaded event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerFirstLoaded(callback: DomainLayerBaseDelegate): DomainLayerBaseDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerFirstLoadedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer first loaded event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerFirstLoaded(callback: DomainLayerBaseDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerFirstLoadedHandlers, callback);
+  }
+
+  /**
+   * Emits layer loaded event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerLoaded(event: DomainLayerBaseEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerLoadedHandlers, event);
+  }
+
+  /**
+   * Registers a layer loaded event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerLoaded(callback: DomainLayerBaseDelegate): DomainLayerBaseDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerLoadedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer loaded event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerLoaded(callback: DomainLayerBaseDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerLoadedHandlers, callback);
+  }
+
+  /**
+   * Emits layer error event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerError(event: DomainLayerErrorEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerErrorHandlers, event);
+  }
+
+  /**
+   * Registers a layer error event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerError(callback: DomainLayerErrorDelegate): DomainLayerErrorDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerErrorHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer error event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerError(callback: DomainLayerErrorDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerErrorHandlers, callback);
+  }
+
+  /**
+   * Emits layer name changed event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerNameChanged(event: DomainLayerNameChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerNameChangedHandlers, event);
+  }
+
+  /**
+   * Registers a layer name changed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerNameChanged(callback: DomainLayerNameChangedDelegate): DomainLayerNameChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerNameChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer name changed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerNameChanged(callback: DomainLayerNameChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerNameChangedHandlers, callback);
+  }
+
+  /**
+   * Emits layer visible changed event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerVisibleChanged(event: DomainLayerVisibleChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerVisibleChangedHandlers, event);
+  }
+
+  /**
+   * Registers a layer visible changed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerVisibleChanged(callback: DomainLayerVisibleChangedDelegate): DomainLayerVisibleChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerVisibleChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer visible changed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerVisibleChanged(callback: DomainLayerVisibleChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerVisibleChangedHandlers, callback);
+  }
+
+  /**
+   * Emits layer opacity changed event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerOpacityChanged(event: DomainLayerOpacityChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerOpacityChangedHandlers, event);
+  }
+
+  /**
+   * Registers a layer opacity changed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerOpacityChanged(callback: DomainLayerOpacityChangedDelegate): DomainLayerOpacityChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerOpacityChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer opacity changed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerOpacityChanged(callback: DomainLayerOpacityChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerOpacityChangedHandlers, callback);
+  }
+
+  /**
+   * Emits layer hoverable changed event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerHoverableChanged(event: DomainLayerHoverableChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerHoverableChangedHandlers, event);
+  }
+
+  /**
+   * Registers a layer hoverable changed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerHoverableChanged(callback: DomainLayerHoverableChangedDelegate): DomainLayerHoverableChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerHoverableChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer hoverable changed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerHoverableChanged(callback: DomainLayerHoverableChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerHoverableChangedHandlers, callback);
+  }
+
+  /**
+   * Emits layer queryable changed event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerQueryableChanged(event: DomainLayerQueryableChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerQueryableChangedHandlers, event);
+  }
+
+  /**
+   * Registers a layer queryable changed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerQueryableChanged(callback: DomainLayerQueryableChangedDelegate): DomainLayerQueryableChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerQueryableChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer queryable changed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerQueryableChanged(callback: DomainLayerQueryableChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerQueryableChangedHandlers, callback);
+  }
+
+  /**
+   * Emits layer message event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerMessage(event: DomainLayerMessageEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerMessageHandlers, event);
+  }
+
+  /**
+   * Registers a layer message event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerMessage(callback: DomainLayerMessageDelegate): DomainLayerMessageDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerMessageHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer message event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerMessage(callback: DomainLayerMessageDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerMessageHandlers, callback);
+  }
+
+  /**
+   * Emits layer item visibility changed event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerItemVisibilityChanged(event: DomainLayerItemVisibilityChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerItemVisibilityChangedHandlers, event);
+  }
+
+  /**
+   * Registers a layer item visibility changed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerItemVisibilityChanged(callback: DomainLayerItemVisibilityChangedDelegate): DomainLayerItemVisibilityChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerItemVisibilityChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer item visibility changed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerItemVisibilityChanged(callback: DomainLayerItemVisibilityChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerItemVisibilityChangedHandlers, callback);
+  }
+
+  /**
+   * Emits layer filter applied event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerFilterApplied(event: DomainLayerFilterAppliedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerFilterAppliedHandlers, event);
+  }
+
+  /**
+   * Registers a layer filter applied event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerFilterApplied(callback: DomainLayerFilterAppliedDelegate): DomainLayerFilterAppliedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerFilterAppliedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer filter applied event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerFilterApplied(callback: DomainLayerFilterAppliedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerFilterAppliedHandlers, callback);
+  }
+
+  /**
+   * Emits layer raster layer image load rescue event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerImageLoadRescue(event: DomainLayerImageLoadRescueEvent): Promise<boolean>[] {
+    // Emit the event for all handlers
+    return EventHelper.emitEvent(this, this.#onLayerImageLoadRescueHandlers, event);
+  }
+
+  /**
+   * Registers a raster layer image load rescue event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerImageLoadRescue(callback: DomainLayerImageLoadRescueDelegate): DomainLayerImageLoadRescueDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerImageLoadRescueHandlers, callback);
+  }
+
+  /**
+   * Unregisters a raster layer image load rescue event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerImageLoadRescue(callback: DomainLayerImageLoadRescueDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerImageLoadRescueHandlers, callback);
+  }
+
+  /**
+   * Emits layer raster function changed event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerRasterFunctionChanged(event: DomainLayerRasterFunctionChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerRasterFunctionChangedHandlers, event);
+  }
+
+  /**
+   * Registers a layer raster function changed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerRasterFunctionChanged(callback: DomainLayerRasterFunctionChangedDelegate): DomainLayerRasterFunctionChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerRasterFunctionChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer raster function changed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerRasterFunctionChanged(callback: DomainLayerRasterFunctionChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerRasterFunctionChangedHandlers, callback);
+  }
+
+  /**
+   * Emits layer mosaic rule changed event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerMosaicRuleChanged(event: DomainLayerMosaicRuleChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerMosaicRuleChangedHandlers, event);
+  }
+
+  /**
+   * Registers a layer mosaic rule changed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerMosaicRuleChanged(callback: DomainLayerMosaicRuleChangedDelegate): DomainLayerMosaicRuleChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerMosaicRuleChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer mosaic rule changed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerMosaicRuleChanged(callback: DomainLayerMosaicRuleChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerMosaicRuleChangedHandlers, callback);
+  }
+
+  /**
+   * Emits layer WMS style changed event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerWmsStyleChanged(event: DomainLayerWMSStyleChangedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerWMSStyleChangedHandlers, event);
+  }
+
+  /**
+   * Registers a layer WMS style changed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerWmsStyleChanged(callback: DomainLayerWMSStyleChangedDelegate): DomainLayerWMSStyleChangedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerWMSStyleChangedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer WMS style changed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerWmsStyleChanged(callback: DomainLayerWMSStyleChangedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerWMSStyleChangedHandlers, callback);
+  }
+
+  /**
+   * Emits layer group layer added event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerGroupLayerAdded(event: DomainLayerGroupChildrenUpdatedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerGroupLayerAddedHandlers, event);
+  }
+
+  /**
+   * Registers a layer group layer added event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerGroupLayerAdded(callback: DomainLayerGroupChildrenUpdatedDelegate): DomainLayerGroupChildrenUpdatedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerGroupLayerAddedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer group layer added event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerGroupLayerAdded(callback: DomainLayerGroupChildrenUpdatedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerGroupLayerAddedHandlers, callback);
+  }
+
+  /**
+   * Emits layer group layer removed event.
+   *
+   * @param event - The event to emit
+   */
+  #emitLayerGroupLayerRemoved(event: DomainLayerGroupChildrenUpdatedEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerGroupLayerRemovedHandlers, event);
+  }
+
+  /**
+   * Registers a layer group layer removed event handler.
+   *
+   * @param callback - The callback to be executed whenever the event is emitted
+   * @returns The callback registered, for chaining or unregistration purposes
+   */
+  onLayerGroupLayerRemoved(callback: DomainLayerGroupChildrenUpdatedDelegate): DomainLayerGroupChildrenUpdatedDelegate {
+    // Register the event handler
+    return EventHelper.onEvent(this.#onLayerGroupLayerRemovedHandlers, callback);
+  }
+
+  /**
+   * Unregisters a layer group layer removed event handler.
+   *
+   * @param callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerGroupLayerRemoved(callback: DomainLayerGroupChildrenUpdatedDelegate | undefined): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerGroupLayerRemovedHandlers, callback);
+  }
+
+  // #endregion EVENTS - GV LAYERS
+}
+
+/** Define a base event for layer entry events. */
+export interface DomainLayerEntryBaseEvent<T extends ConfigBaseClass = ConfigBaseClass> {
+  /** The layer entry configuration. */
+  config: T;
+}
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerStatusChangedEvent extends DomainLayerEntryBaseEvent {
+  /** The new layer status. */
+  status: TypeLayerStatus;
+}
+
+/**
+ * Define a delegate for the event handler function signature
+ */
+export type DomainLayerStatusChangedDelegate = EventDelegateBase<LayerDomain, DomainLayerStatusChangedEvent, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerRegisteredEvent {
+  /** The registered layer. */
+  layer: AbstractBaseGVLayer;
+}
+
+/**
+ * Define a delegate for the event handler function signature
+ */
+export type DomainLayerRegisteredDelegate = EventDelegateBase<LayerDomain, DomainLayerRegisteredEvent, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerBaseEvent<T extends AbstractBaseGVLayer = AbstractBaseGVLayer, U extends LayerBaseEvent = LayerBaseEvent> {
+  /** The layer included in the event payload. */
+  layer: T;
+
+  /** The layer event itself being redirected. */
+  layerEvent: U;
+}
+
+/** Define a delegate for the layer loading event handler function signature. */
+export type DomainLayerBaseDelegate = EventDelegateBase<LayerDomain, DomainLayerBaseEvent<AbstractBaseGVLayer, LayerBaseEvent>, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerErrorEvent extends DomainLayerBaseEvent<AbstractGVLayer, LayerErrorEvent> {}
+
+/** Define a delegate for the layer error event handler function signature. */
+export type DomainLayerErrorDelegate = EventDelegateBase<LayerDomain, DomainLayerErrorEvent, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerNameChangedEvent extends DomainLayerBaseEvent<AbstractBaseGVLayer, LayerNameChangedEvent> {}
+
+/** Define a delegate for the layer name changed event handler function signature. */
+export type DomainLayerNameChangedDelegate = EventDelegateBase<LayerDomain, DomainLayerNameChangedEvent, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerVisibleChangedEvent extends DomainLayerBaseEvent<AbstractBaseGVLayer, LayerVisibleChangedEvent> {}
+
+/** Define a delegate for the layer visible changed event handler function signature. */
+export type DomainLayerVisibleChangedDelegate = EventDelegateBase<LayerDomain, DomainLayerVisibleChangedEvent, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerOpacityChangedEvent extends DomainLayerBaseEvent<AbstractBaseGVLayer, LayerOpacityChangedEvent> {}
+
+/** Define a delegate for the layer opacity changed event handler function signature. */
+export type DomainLayerOpacityChangedDelegate = EventDelegateBase<LayerDomain, DomainLayerOpacityChangedEvent, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerHoverableChangedEvent extends DomainLayerBaseEvent<AbstractGVLayer, LayerHoverableChangedEvent> {}
+
+/** Define a delegate for the layer hoverable changed event handler function signature. */
+export type DomainLayerHoverableChangedDelegate = EventDelegateBase<LayerDomain, DomainLayerHoverableChangedEvent, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerQueryableChangedEvent extends DomainLayerBaseEvent<AbstractGVLayer, LayerQueryableChangedEvent> {}
+
+/** Define a delegate for the layer queryable changed event handler function signature. */
+export type DomainLayerQueryableChangedDelegate = EventDelegateBase<LayerDomain, DomainLayerQueryableChangedEvent, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerMessageEvent extends DomainLayerBaseEvent<AbstractGVLayer, LayerMessageEvent> {}
+
+/** Define a delegate for the layer message event handler function signature. */
+export type DomainLayerMessageDelegate = EventDelegateBase<LayerDomain, DomainLayerMessageEvent, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerItemVisibilityChangedEvent extends DomainLayerBaseEvent<AbstractGVLayer, LayerItemVisibilityChangedEvent> {}
+
+/** Define a delegate for the layer item visibility changed event handler function signature. */
+export type DomainLayerItemVisibilityChangedDelegate = EventDelegateBase<LayerDomain, DomainLayerItemVisibilityChangedEvent, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerFilterAppliedEvent extends DomainLayerBaseEvent<AbstractGVLayer, LayerFilterAppliedEvent> {}
+
+/** Define a delegate for the layer filter applied event handler function signature. */
+export type DomainLayerFilterAppliedDelegate = EventDelegateBase<LayerDomain, DomainLayerFilterAppliedEvent, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerImageLoadRescueEvent extends DomainLayerBaseEvent<AbstractGVRaster, ImageLoadRescueEvent> {}
+
+/**
+ * Define a delegate for the event handler function signature
+ */
+export type DomainLayerImageLoadRescueDelegate = EventDelegateBase<LayerDomain, DomainLayerImageLoadRescueEvent, Promise<boolean>>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerWMSStyleChangedEvent extends DomainLayerBaseEvent<GVWMS, WMSStyleChangedEvent> {}
+
+/**
+ * Define a delegate for the event handler function signature
+ */
+export type DomainLayerWMSStyleChangedDelegate = EventDelegateBase<LayerDomain, DomainLayerWMSStyleChangedEvent, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerRasterFunctionChangedEvent extends DomainLayerBaseEvent<AbstractGVLayer, RasterFunctionChangedEvent> {}
+
+/**
+ * Define a delegate for the event handler function signature
+ */
+export type DomainLayerRasterFunctionChangedDelegate = EventDelegateBase<LayerDomain, DomainLayerRasterFunctionChangedEvent, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerMosaicRuleChangedEvent extends DomainLayerBaseEvent<GVEsriImage, MosaicRuleChangedEvent> {}
+
+/**
+ * Define a delegate for the event handler function signature
+ */
+export type DomainLayerMosaicRuleChangedDelegate = EventDelegateBase<LayerDomain, DomainLayerMosaicRuleChangedEvent, void>;
+
+/**
+ * Define an event for the delegate
+ */
+export interface DomainLayerGroupChildrenUpdatedEvent extends DomainLayerBaseEvent<GVGroupLayer, LayerGroupChildrenUpdatedEvent> {}
+
+/**
+ * Define a delegate for the event handler function signature
+ */
+export type DomainLayerGroupChildrenUpdatedDelegate = EventDelegateBase<LayerDomain, DomainLayerGroupChildrenUpdatedEvent, void>;

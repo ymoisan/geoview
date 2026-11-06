@@ -1,0 +1,171 @@
+import React from 'react'; // GV This import is to validate that we're on the right React at the end of the file
+import { FooterPlugin } from 'geoview-core/api/plugin/footer-plugin';
+import type { TypeTabs } from 'geoview-core/ui/tabs/tabs';
+import { ChartIcon } from 'geoview-core/ui/icons';
+
+import schema from '../schema.json';
+import defaultConfig from '../default-config-geochart.json';
+import { GeoChartPanel } from './geochart-panel';
+import type { PluginGeoChartConfig } from './geochart-types';
+import { convertGeoViewGeoChartConfigToCore } from './geochart-types';
+import { logger } from 'geoview-core/core/utils/logger';
+
+/**
+ * The Chart Plugin which will be automatically instanciated during GeoView's initialization.
+ */
+class GeoChartFooterPlugin extends FooterPlugin {
+  /**
+   * Returns the package schema.
+   *
+   * @returns The package schema
+   */
+  override schema(): unknown {
+    return schema;
+  }
+
+  /**
+   * Returns the default config for this package.
+   *
+   * @returns The default config
+   */
+  override defaultConfig(): unknown {
+    return defaultConfig;
+  }
+
+  /** The callback used to redraw the GeoCharts in the GeoChartPanel. */
+  callbackRedraw?: () => void;
+
+  /**
+   * Overrides the default translations for the Plugin.
+   *
+   * @returns The translations object for the particular Plugin
+   */
+  override defaultTranslations(): Record<string, unknown> {
+    return {
+      en: {
+        geochart: {
+          title: 'Chart',
+          panel: {
+            feature: 'feature',
+            empty: 'No feature selected',
+            loadingUI: 'Loading the Chart panel',
+          },
+        },
+      },
+      fr: {
+        geochart: {
+          title: 'Graphique',
+          panel: {
+            feature: 'élément',
+            empty: 'Aucun élément sélectionné',
+            loadingUI: "Chargement de l'interface pour graphique",
+          },
+        },
+      },
+    };
+  }
+
+  /**
+   * Overrides the getConfig in order to return the right type.
+   *
+   * @returns The Geochart config
+   */
+  override getConfig(): PluginGeoChartConfig {
+    // Redirect
+    return super.getConfig() as PluginGeoChartConfig;
+  }
+
+  /**
+   * Overrides the addition of the GeoChart Footer Plugin to make sure to set the chart configs into the store.
+   */
+  override onAdd(): void {
+    // Call parent
+    super.onAdd();
+
+    // Initialize the store with geochart provided configuration if there is one
+    if (this.getConfig().charts) {
+      const configs = this.getConfig().charts.map((config) => convertGeoViewGeoChartConfigToCore(config));
+
+      // Init the charts to the store
+      this.controllerRegistry.geoChartController?.initCharts(configs);
+
+      // If there is charts, tab should be shown
+      if (configs.length) {
+        this.controllerRegistry.uiController.showTabButton('geochart');
+      }
+
+      // Log
+      logger.logInfo('Added GeoChart configs');
+    }
+
+    // Wire a handler using a custom hook on the window resize event
+    window.addEventListener('resize', this.handleWindowResize.bind(this));
+  }
+
+  /**
+   * Overrides the creation of the content properties of this GeoChart Footer Plugin.
+   *
+   * @returns The TypeTabs for the GeoChart Footer Plugin
+   */
+  override onCreateContentProps(): TypeTabs {
+    // Create element
+    const content = <GeoChartPanel mapId={this.mapViewer.mapId} provideCallbackRedraw={this.handleProvideCallbackRedraw.bind(this)} />;
+
+    return {
+      id: 'geochart',
+      value: this.value!,
+      label: 'geochart.title',
+      icon: <ChartIcon />,
+      content,
+    };
+  }
+
+  /**
+   * Handles when a redraw callback has been provided by GeoChartPanel.
+   *
+   * @param callbackRedraw - The callback to execute for redrawing
+   */
+  handleProvideCallbackRedraw(callbackRedraw: () => void): void {
+    // Keep it
+    this.callbackRedraw = callbackRedraw;
+  }
+
+  /**
+   * Handles when the window resizes.
+   */
+  handleWindowResize(): void {
+    // Redraw the chart
+    this.redrawChart();
+  }
+
+  /**
+   * Overrides when the plugin is selected in the Footer Bar.
+   */
+  override onSelect(): void {
+    // Call parent
+    super.onSelect();
+
+    // When the GeoChart Plugin in the Footer is selected, we redraw the GeoChart, in case
+    this.redrawChart();
+  }
+
+  /**
+   * Callable plugin function to redraw the GeoCharts on demand.
+   */
+  redrawChart(): void {
+    // Redraw the GeoChart Panel which will redraw the GeoCharts
+    this.callbackRedraw?.();
+  }
+}
+
+// Exports the GeoChartFooterPlugin
+export default GeoChartFooterPlugin;
+
+// GV This if condition took over 3 days to investigate. It was giving errors on the app.geo.ca website with
+// GV some conflicting reacts being loaded on the page for some obscure reason.
+// Check if we're on the right react
+if (React === window.cgpv.reactUtilities.react) {
+  // Keep a reference to the GeoChartPlugin as part of the geoviewPlugins property stored in the window object
+  window.geoviewPlugins = window.geoviewPlugins || {};
+  window.geoviewPlugins.geochart = GeoChartFooterPlugin;
+} // Else ignore, don't keep it on the window, wait for the right react load

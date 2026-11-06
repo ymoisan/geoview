@@ -1,0 +1,122 @@
+import type VectorSource from 'ol/source/Vector';
+import type { GeoJSONObject } from 'ol/format/GeoJSON';
+import type { Projection as OLProjection } from 'ol/proj';
+
+import type { GeoJSONLayerEntryConfig } from '@/api/config/validation-classes/vector-validation-classes/geojson-layer-entry-config';
+import { AbstractGVVector } from '@/geo/layer/gv-layers/vector/abstract-gv-vector';
+import { GeoUtilities } from '@/geo/utils/utilities';
+import { logger } from '@/core/utils/logger';
+
+/**
+ * Manages a GeoJSON layer.
+ */
+export class GVGeoJSON extends AbstractGVVector {
+  /** Custom source features */
+  #geoJsonSource: GeoJSONObject | undefined;
+
+  /**
+   * Constructs a GVGeoJSON layer to manage an OpenLayer layer.
+   *
+   * @param olSource - The OpenLayer source.
+   * @param layerConfig - The layer configuration.
+   */
+  // The constructor is not useless, it narrows down the accepted parameter type.
+  // eslint-disable-next-line @typescript-eslint/no-useless-constructor
+  constructor(olSource: VectorSource, layerConfig: GeoJSONLayerEntryConfig) {
+    super(olSource, layerConfig);
+  }
+
+  // #region OVERRIDES
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer configuration specific to this layer.
+   */
+  override getLayerConfig(): GeoJSONLayerEntryConfig {
+    // Call parent and cast
+    return super.getLayerConfig() as GeoJSONLayerEntryConfig;
+  }
+
+  /**
+   * Overrides the refresh to reload the Geojson object in the layer source once the refresh completes.
+   *
+   * @param projection - Optional projection to refresh to.
+   */
+  override onRefresh(projection: OLProjection | undefined): void {
+    // Sure
+    super.onRefresh(projection);
+
+    // If projection is defined
+    if (projection) {
+      // After a refresh, reload the Geojson Source if any
+      this.updateGeojsonSource(projection).catch((error: unknown) => {
+        // Log error
+        logger.logPromiseFailed('in updateGeojsonSource in GVGeoJSON.onRefresh', error);
+      });
+    }
+  }
+
+  // #endregion OVERRIDES
+
+  // #region METHODS
+
+  /**
+   * Loads a Geojson object as the layer source features, overriding the current features if any.
+   *
+   * @param geojson - The geoJSON object.
+   * @param projection - The output projection.
+   * @returns A promise that resolves once the source has been updated with the new features.
+   */
+  async setGeojsonSource(geojson: GeoJSONObject | string, projection: OLProjection): Promise<void> {
+    // Set the loading event manually, because we're not going through the 'loader' callback when features are added manually.
+    this.onLoading();
+
+    // Convert string to geoJSON if necessary
+    const geojsonObject = typeof geojson === 'string' ? JSON.parse(geojson) : geojson;
+
+    // Keep internally
+    this.#geoJsonSource = geojsonObject;
+
+    // Read the features (dataProjection can remain undefined here to let OpenLayers guess it via the GeoJSON reader)
+    const sourceFeaturesInfo = await GeoUtilities.readFeaturesFromGeoJSON(geojsonObject, this.getDataProjection(), projection);
+    const { features } = sourceFeaturesInfo;
+
+    // Update the source data projection
+    this.getOLSource().setDataProjection(sourceFeaturesInfo.dataProjection);
+
+    // Get the OL layer
+    const olLayer = this.getOLLayer();
+
+    // Remove current features and add new ones
+    olLayer.getSource()?.clear();
+
+    // If has features to add
+    if (features.length) {
+      olLayer.getSource()?.addFeatures(features);
+    }
+
+    // Refresh
+    olLayer.changed();
+
+    // Emit a loaded event manually, because we're not going through the 'loader' callback when features are added manually
+    // Therefore, the layer doesn't go through the 'loading' -> 'loaded' layer status
+    this.onLoaded();
+  }
+
+  /**
+   * Updates the Geojson object, if any, to reproject the features into the new provided projection.
+   *
+   * @param projection - The projection to project the geojson source features into.
+   * @returns A promise that resolves once the source has been updated with the reprojected features, or immediately if no geojson source is defined.
+   */
+  async updateGeojsonSource(projection: OLProjection): Promise<void> {
+    // If a custom geojson is defined
+    if (this.#geoJsonSource) {
+      // Redirect
+      await this.setGeojsonSource(this.#geoJsonSource, projection);
+    }
+  }
+
+  // #endregion METHODS
+}

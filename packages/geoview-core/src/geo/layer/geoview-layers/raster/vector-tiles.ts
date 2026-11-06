@@ -1,0 +1,360 @@
+import type { Options as SourceOptions } from 'ol/source/VectorTile';
+import type { Options as TileGridOptions } from 'ol/tilegrid/TileGrid';
+import type { Projection as OLProjection } from 'ol/proj';
+import VectorTileSource from 'ol/source/VectorTile';
+import TileGrid from 'ol/tilegrid/TileGrid';
+
+import { applyStyle } from 'ol-mapbox-style';
+
+import { MVT } from 'ol/format';
+import { AbstractGeoViewLayer } from '@/geo/layer/geoview-layers/abstract-geoview-layers';
+import { AbstractGeoViewRaster } from '@/geo/layer/geoview-layers/raster/abstract-geoview-raster';
+import type { TypeGeoviewLayerConfig, TypeTileGrid, TypeMetadataVectorTiles } from '@/api/types/layer-schema-types';
+import { CONST_LAYER_TYPES } from '@/api/types/layer-schema-types';
+import type { ConfigBaseClass, TypeLayerEntryShell } from '@/api/config/validation-classes/config-base-class';
+import { Projection } from '@/geo/utils/projection';
+import { VectorTilesLayerEntryConfig } from '@/api/config/validation-classes/raster-validation-classes/vector-tiles-layer-entry-config';
+import { logger } from '@/core/utils/logger';
+import { LayerEntryNotSupportingProjectionError } from '@/core/exceptions/layer-entry-config-exceptions';
+import { GVVectorTiles } from '@/geo/layer/gv-layers/vector/gv-vector-tiles';
+import type { DisplayDateMode } from '@/api/types/map-schema-types';
+import type { FetchWithProxyResult } from '@/geo/utils/utilities';
+
+// TODO: Implement method to validate Vector Tiles service
+// TODO: Add more customization (minZoom, maxZoom, TMS)
+
+export interface TypeVectorTilesConfig extends Omit<TypeGeoviewLayerConfig, 'listOfLayerEntryConfig'> {
+  geoviewLayerType: typeof CONST_LAYER_TYPES.VECTOR_TILES;
+  listOfLayerEntryConfig: VectorTilesLayerEntryConfig[];
+}
+
+/**
+ * A class to add vector-tiles layer
+ */
+export class VectorTiles extends AbstractGeoViewRaster {
+  /**
+   * Constructs a VectorTiles Layer configuration processor.
+   *
+   * @param layerConfig - The layer configuration
+   */
+  // eslint-disable-next-line @typescript-eslint/no-useless-constructor
+  constructor(layerConfig: TypeVectorTilesConfig) {
+    super(layerConfig);
+  }
+
+  // #region OVERRIDES
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed layer configuration specific to this layer.
+   */
+  override getGeoviewLayerConfig(): TypeVectorTilesConfig {
+    return super.getGeoviewLayerConfig() as TypeVectorTilesConfig;
+  }
+
+  /**
+   * Overrides the parent class's getter to provide a more specific return type (covariant return).
+   *
+   * @returns The strongly-typed metadata specific to this layer.
+   */
+  override getMetadata(): TypeMetadataVectorTiles | undefined {
+    return super.getMetadata() as TypeMetadataVectorTiles | undefined;
+  }
+
+  /**
+   * Overrides the way the metadata is fetched.
+   *
+   * @param abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process
+   * @returns A promise that resolves with the fetched metadata and proxy information
+   * @throws {LayerServiceMetadataUnableToFetchError} When the metadata fetch fails or contains an error
+   */
+  protected override onFetchServiceMetadata(abortSignal?: AbortSignal): Promise<FetchWithProxyResult<unknown>> {
+    // Redirect using default way of fetching service metadata which is to use the url with f=json parameter
+    return this.helperFetchServiceMetadataWithFJson(abortSignal);
+  }
+
+  /**
+   * Overrides the way a geoview layer config initializes its layer entries.
+   *
+   * @returns A promise that resolves once the layer entries have been initialized.
+   */
+  protected override onInitLayerEntries(): Promise<TypeGeoviewLayerConfig> {
+    // Redirect
+    return Promise.resolve(
+      VectorTiles.createGeoviewLayerConfig(
+        this.getGeoviewLayerId(),
+        this.getGeoviewLayerName(),
+        this.getMetadataAccessPath(),
+        this.getGeoviewLayerConfig().isTimeAware,
+        []
+      )
+    );
+  }
+
+  /**
+   * Overrides the way the layer metadata is processed.
+   *
+   * @param layerConfig - The layer entry configuration to process.
+   * @param displayDateMode - The display date mode to use for processing time dimensions in the metadata.
+   * @param mapProjection - Optional map projection.
+   * @param abortSignal - Optional {@link AbortSignal} used to cancel the layer creation process.
+   * @returns A promise that resolves once the layer entry configuration has gotten its metadata processed.
+   */
+  protected override async onProcessLayerMetadata(
+    layerConfig: VectorTilesLayerEntryConfig,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    displayDateMode: DisplayDateMode,
+    mapProjection?: OLProjection,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    abortSignal?: AbortSignal
+  ): Promise<VectorTilesLayerEntryConfig> {
+    // Get the metadata
+    const metadata = this.getMetadata();
+
+    let sourceProjection: number | undefined = undefined;
+    if (metadata) {
+      const { tileInfo, fullExtent, minScale, maxScale, minZoom, maxZoom } = metadata;
+      const newTileGrid: TypeTileGrid = {
+        extent: [fullExtent.xmin, fullExtent.ymin, fullExtent.xmax, fullExtent.ymax],
+        origin: [tileInfo.origin.x, tileInfo.origin.y],
+        resolutions: tileInfo.lods.map(({ resolution }) => resolution),
+        tileSize: [tileInfo.rows, tileInfo.cols],
+      };
+
+      // eslint-disable-next-line no-param-reassign
+      layerConfig.getSource().tileGrid = newTileGrid;
+
+      // If there's a spatial reference in the metadata
+      if (metadata.tileInfo?.spatialReference ?? fullExtent.spatialReference) {
+        await layerConfig.initProjectionFromMetadata(metadata.tileInfo?.spatialReference ?? fullExtent.spatialReference);
+        sourceProjection = Projection.readEPSGNumber(layerConfig.getMetadataProjection()?.getCode());
+      }
+
+      // Set zoom levels. Vector tiles may be unique as they can have both scale and zoom level properties
+      layerConfig.initMinScaleFromMetadata(minScale);
+      layerConfig.initMaxScaleFromMetadata(maxScale);
+
+      // Second, set the min/max zoom levels based on the service / config.
+      layerConfig.initInitialSettingsMinZoomFromMetadata(minZoom);
+      layerConfig.initInitialSettingsMaxZoomFromMetadata(maxZoom);
+
+      // If the style URL is not set in the layer entry config, set it to the default style provided in the metadata
+      if (!layerConfig.getStyleUrl()) {
+        // If the default style is a full URL, use it as is
+        if (metadata.defaultStyles.toLowerCase().startsWith('https://') || metadata.defaultStyles.toLowerCase().startsWith('http://')) {
+          layerConfig.setStyleUrl(metadata.defaultStyles);
+        } else {
+          // Otherwise, assume it's a relative path and construct the full URL using the metadata access path
+          layerConfig.setStyleUrl(`${this.getMetadataAccessPath()}/${metadata.defaultStyles}`);
+        }
+      }
+    }
+
+    // Default on the projection defined in the source when none could be determined
+    sourceProjection ??= layerConfig.getSource().projection;
+
+    // Validate the projection of the source is the same as the map projection, otherwise the the open layers vector tile will throw an uncatchable error
+    if (mapProjection && sourceProjection && sourceProjection !== Projection.readEPSGNumber(mapProjection)) {
+      // Error
+      throw new LayerEntryNotSupportingProjectionError(mapProjection.getCode(), layerConfig);
+    }
+
+    // Return the layer config
+    return layerConfig;
+  }
+
+  /**
+   * Overrides the way the layer entry is processed to generate an Open Layer Base Layer object.
+   *
+   * @param layerConfig - The layer entry config needed to create the Open Layer object.
+   * @returns A promise that resolves with the GeoView raster layer that has been created.
+   */
+  protected override async onProcessOneLayerEntry(layerConfig: VectorTilesLayerEntryConfig): Promise<GVVectorTiles> {
+    // Sure call parent
+    const layer = (await super.onProcessOneLayerEntry(layerConfig)) as GVVectorTiles;
+
+    // Get the style
+    let appliedStyle = layerConfig.getStyleUrl();
+
+    if (appliedStyle) {
+      // GV When viewing a style in AGOL, it will typically be given and shown to the user with f=pjson
+      if (!appliedStyle.endsWith('/root.json') && !appliedStyle.endsWith('f=pjson')) appliedStyle = `${appliedStyle}/root.json`;
+
+      // Get the tile grid resolutions
+      const resolutions = layer.getTileGridResolutions() ?? [];
+
+      // Apply the style with the resolutions
+      applyStyle(layer.getOLLayer(), appliedStyle, {
+        resolutions,
+      }).catch((error: unknown) => {
+        // Log
+        logger.logPromiseFailed('applyStyle in processOneLayerEntry in VectorTiles', error);
+
+        // Warn the user - the layer still renders, just with default styling instead of the configured style
+        this.emitMessage('warning.layer.styleUrlNotApplied', { layerName: layerConfig.getLayerNameCascade() }, 'warning');
+      });
+    }
+
+    // Return the layer
+    return layer;
+  }
+
+  /**
+   * Overrides the creation of the GV Layer
+   *
+   * @param layerConfig - The layer entry configuration.
+   * @returns The GV Layer
+   */
+  protected override onCreateGVLayer(layerConfig: VectorTilesLayerEntryConfig): GVVectorTiles {
+    // Create the source
+    const source = VectorTiles.createVectorTileSource(layerConfig);
+
+    // Create the GV Layer
+    const gvLayer = new GVVectorTiles(source, layerConfig);
+
+    // Return it
+    return gvLayer;
+  }
+
+  // #endregion OVERRIDES
+
+  // #region STATIC METHODS
+
+  /**
+   * Initializes a GeoView layer configuration for an Vector Tiles layer.
+   *
+   * This method creates a basic TypeGeoviewLayerConfig using the provided
+   * ID, name, and metadata access path URL. It then initializes the layer entries by calling
+   * `initGeoViewLayerEntries`, which may involve fetching metadata or sublayer info.
+   *
+   * @param geoviewLayerId - A unique identifier for the layer.
+   * @param geoviewLayerName - The display name of the layer.
+   * @param metadataAccessPath - The full service URL to the layer endpoint.
+   * @param isTimeAware - Indicates whether the layer supports time-based filtering.
+   * @returns A promise that resolves to an initialized GeoView layer configuration with layer entries.
+   */
+  static initGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string,
+    metadataAccessPath: string,
+    isTimeAware?: boolean
+  ): Promise<TypeGeoviewLayerConfig> {
+    // Create the Layer config
+    const myLayer = new VectorTiles({ geoviewLayerId, geoviewLayerName, metadataAccessPath, isTimeAware } as TypeVectorTilesConfig);
+    return myLayer.initGeoViewLayerEntries();
+  }
+
+  /**
+   * Creates a configuration object for a XYZTiles layer.
+   *
+   * This function constructs a `TypeVectorTilesConfig` object that describes an XYZTiles layer
+   * and its associated entry configurations based on the provided parameters.
+   *
+   * @param geoviewLayerId - A unique identifier for the GeoView layer.
+   * @param geoviewLayerName - The display name of the GeoView layer.
+   * @param metadataAccessPath - The URL or path to access metadata.
+   * @param isTimeAware - Indicates whether the layer supports time-based filtering.
+   * @param layerEntries - An array of layer entries objects to be included in the configuration.
+   * @returns The constructed configuration object for the XYZTiles layer.
+   */
+  static createGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string | undefined,
+    metadataAccessPath: string,
+    isTimeAware: boolean | undefined,
+    layerEntries: TypeLayerEntryShell[]
+  ): TypeVectorTilesConfig {
+    const geoviewLayerConfig: TypeVectorTilesConfig = {
+      geoviewLayerId,
+      geoviewLayerName,
+      metadataAccessPath,
+      geoviewLayerType: CONST_LAYER_TYPES.VECTOR_TILES,
+      isTimeAware,
+      listOfLayerEntryConfig: [],
+    };
+    geoviewLayerConfig.listOfLayerEntryConfig = layerEntries.map((layerEntry) => {
+      // TODO: REFACTOR IMPORTANT - This spreading should be rewritten like explained in GeoJSON file. Search id : 59026aa9
+
+      const layerEntryConfig = new VectorTilesLayerEntryConfig({
+        geoviewLayerConfig,
+        layerId: `${layerEntry.id}`,
+        ...(layerEntry.layerName && { layerName: `${layerEntry.layerName}` }),
+      });
+      return layerEntryConfig;
+    });
+
+    // Return it
+    return geoviewLayerConfig;
+  }
+
+  /**
+   * Processes a VectorTiles GeoviewLayerConfig and returns a promise
+   * that resolves to an array of `ConfigBaseClass` layer entry configurations.
+   *
+   * This method:
+   * 1. Creates a Geoview layer configuration using the provided parameters.
+   * 2. Instantiates a layer with that configuration.
+   * 3. Processes the layer configuration and returns the result.
+   *
+   * @param geoviewLayerId - The unique identifier for the GeoView layer.
+   * @param geoviewLayerName - The display name for the GeoView layer.
+   * @param url - The URL of the service endpoint.
+   * @param layerEntries - An array of layer entry shells to include in the configuration.
+   * @param isTimeAware - Indicates if the layer is time aware.
+   * @returns A promise that resolves to an array of layer configurations.
+   */
+  static processGeoviewLayerConfig(
+    geoviewLayerId: string,
+    geoviewLayerName: string,
+    url: string,
+    layerEntries: TypeLayerEntryShell[],
+    isTimeAware: boolean
+  ): Promise<ConfigBaseClass[]> {
+    // Create the Layer config
+    const layerConfig = VectorTiles.createGeoviewLayerConfig(geoviewLayerId, geoviewLayerName, url, isTimeAware, layerEntries);
+
+    // Create the class from geoview-layers package
+    const myLayer = new VectorTiles(layerConfig);
+
+    // Process it
+    return AbstractGeoViewLayer.processConfig(myLayer);
+  }
+
+  /**
+   * Creates a VectorTileSource from a layer config.
+   *
+   * This encapsulates projection, tileGrid, and format setup.
+   *
+   * @param layerConfig - Configuration object for the vector tile layer.
+   * @returns An initialized VectorTileSource ready for use in a layer.
+   * @throws {LayerDataAccessPathMandatoryError} When the Data Access Path was undefined, likely because initDataAccessPath wasn't called.
+   */
+  static createVectorTileSource(layerConfig: VectorTilesLayerEntryConfig): VectorTileSource {
+    // Create the source options
+    const sourceOptions: SourceOptions = {
+      url: layerConfig.getDataAccessPath(),
+      format: new MVT(),
+      projection: layerConfig.getMetadataProjection()?.getCode(), // Force the projection of the metadata (only one that'll work in a vector-tile case)
+    };
+
+    // Get the tile grid
+    const { tileGrid } = layerConfig.getSource();
+
+    // Create the tile grid options
+    const tileGridOptions: TileGridOptions = {
+      origin: tileGrid?.origin,
+      resolutions: tileGrid?.resolutions ?? [], // TODO: MINOR - Add a validation about the 'resolutions' property always existing?
+      tileSize: tileGrid?.tileSize,
+      extent: tileGrid?.extent,
+    };
+
+    // Assign the tile grid
+    sourceOptions.tileGrid = new TileGrid(tileGridOptions);
+
+    // Return the fully configured VectorTileSource instance
+    return new VectorTileSource(sourceOptions);
+  }
+
+  // #endregion STATIC METHODS
+}

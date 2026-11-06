@@ -1,0 +1,27 @@
+name: Deploy process on Pull Request
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "develop"
+
+# Allow one concurrent deployment
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  install-build:
+    name: Build demo files
+    uses: ./.github/workflows/build.yml
+    with:
+      cache_sha: ${{ github.sha }}
+
+  deploy-public:
+    name: Deploy public
+    needs: [install-build]
+    uses: ./.github/workflows/deploy.yml
+    with:
+      cache_sha: ${{ github.sha }}
+      folder: public
